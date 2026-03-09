@@ -1,0 +1,30 @@
+[package]
+name = "poulpy-chimera"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+readme = "README.md"
+description = "CHIMERA: inference-optimised FHE scheme for transformer neural networks, built on poulpy"
+repository = "https://github.com/phantomzone-org/poulpy"
+homepage = "https://github.com/phantomzone-org/poulpy"
+documentation = "https://docs.rs/poulpy-chimera"
+
+[features]
+enable-avx = []
+
+[dependencies]
+poulpy-cpu-avx = {workspace = true}
+poulpy-cpu-ref = {workspace = true}
+poulpy-hal = {workspace = true}
+poulpy-core = {workspace = true}
+poulpy-schemes = {workspace = true}
+rand = {workspace = true}
+itertools = {workspace = true}
+byteorder = {workspace = true}
+bytemuck = {workspace = true}
+paste = {workspace = true}
+criterion = {workspace = true}
+
+[[bench]]
+name = "chimera_ops"
+harness = false

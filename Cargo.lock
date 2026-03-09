@@ -464,6 +464,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "poulpy-chimera"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "byteorder",
+ "criterion",
+ "itertools 0.14.0",
+ "paste",
+ "poulpy-core",
+ "poulpy-cpu-avx",
+ "poulpy-cpu-ref",
+ "poulpy-hal",
+ "poulpy-schemes",
+ "rand",
+]
+
+[[package]]
 name = "poulpy-core"
 version = "0.4.4"
 dependencies = [

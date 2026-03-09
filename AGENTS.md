@@ -1,0 +1,266 @@
+# AGENTS.md: AI-Native FHE Scheme Design and Implementation
+
+## Background
+
+Fully Homomorphic Encryption (FHE) allows computation over encrypted data without
+decrypting it. Current FHE schemes (CKKS, TFHE, BGV, BFV) were designed for general
+purpose computation and are poorly matched to the specific arithmetic of neural network
+inference. The result is that private AI inference under FHE today is either impractically
+slow, impractically noisy, or both.
+
+The goal of this project is to design and implement a new FHE scheme — or a targeted
+specialisation of an existing scheme — that is purpose-built for transformer-style AI
+inference.
+
+This scheme will serve as the inference layer in a two-phase privacy-preserving
+participatory governance system:
+
+1. **Phase 1 (this project):** A user's AI proxy runs inference privately on a remote
+   provider's hardware. The provider learns nothing about the user's data, context, or
+   output.
+2. **Phase 2 (out of scope):** The encrypted inference output is decrypted locally by
+   the user, reviewed, and re-encrypted for private aggregation via a multi-party
+   computation protocol (e.g. Enclave: enclave.gg).
+
+The two phases are cryptographically decoupled. This project concerns Phase 1 only.
+
+---
+
+## Problem Statement
+
+### Why existing schemes fall short
+
+**CKKS** is the current best option for ML inference. It supports approximate arithmetic
+over real numbers and allows SIMD-style slot packing. However:
+
+- Noise accumulates with each multiplication, consuming the noise budget
+- Deep networks (e.g. transformers) require expensive *bootstrapping* to refresh the
+  noise budget mid-inference
+- Softmax, GELU, and LayerNorm are highly non-polynomial, making them very expensive
+  to evaluate under CKKS
+- The scheme operates at 50+ bit precision per coefficient — far more than the 8-16 bit
+  precision that quantized inference actually requires
+- The "wasted" precision headroom is enormous and directly translates to wasted compute
+
+**TFHE/FHEW** support fast gate bootstrapping but operate on individual bits or small
+integers. The per-operation cost is prohibitive for the billions of operations in a
+single transformer forward pass.
+
+**BGV/BFV** handle exact integer arithmetic but do not map naturally to floating point
+operations.
+
+### The core mismatch
+
+Existing FHE schemes were designed around security parameter requirements that dictate
+field sizes and noise parameters. The arithmetic of ML inference was not a design input.
+
+Modern inference workloads have well-understood arithmetic structure:
+- Typical precision: FP16 (10-bit mantissa), INT8, or FP8
+- Operations: matrix multiplication, attention (QKV projection, softmax, output
+  projection), layer normalisation, elementwise activations
+- Depth: fixed and known ahead of time for a given model architecture
+- Approximation tolerance: inference is already approximate; small bounded errors
+  indistinguishable from floating point rounding are acceptable
+
+A scheme co-designed with these properties in mind could eliminate much of the overhead
+that makes FHE inference impractical today.
+
+---
+
+## Desired Outcome
+
+Design and implement a new FHE scheme (or targeted specialisation) with the following
+properties, in rough priority order:
+
+### 1. Native low-precision arithmetic
+
+The scheme's prime field and noise parameters should be co-designed with 8-16 bit
+arithmetic, not adapted from schemes designed for higher precision applications.
+
+- Target: a prime field sized to match FP16 or INT8 arithmetic naturally, minimising
+  representational overhead
+- Inspired by the observation (credit: Jordi Baylina) that fitting the prime field to
+  the natural arithmetic size of the computation massively reduces overhead
+- Evaluate: what is the minimum field size that provides adequate noise headroom for a
+  single transformer forward pass at INT8 or FP16 precision?
+
+### 2. Nonlinearity-friendly evaluation
+
+Softmax and GELU are the two most expensive operations under current FHE schemes because
+they are not well-approximated by low-degree polynomials.
+
+- Investigate polynomial-friendly activation functions that preserve model quality while
+  being cheap to evaluate under FHE (e.g. degree-2 or degree-3 approximations)
+- Investigate lookup table (LUT) evaluation approaches for fixed-precision nonlinearities
+- The scheme should make an explicit design choice about how nonlinearities are handled,
+  rather than treating them as an afterthought
+- Acceptable to co-design the activation functions with the scheme if this yields
+  significant performance gains
+
+### 3. Single-budget inference (bootstrapping elimination or deferral)
+
+Bootstrapping is the dominant cost in deep network inference under CKKS. The ideal scheme
+eliminates the need for mid-inference bootstrapping entirely.
+
+- The noise growth rate should be low enough that a complete transformer forward pass
+  (for the target model size, see Target Workload) fits within a single noise budget
+- If bootstrapping cannot be eliminated, it should be deferred to occur at most once per
+  forward pass, and its cost should be minimised
+- The scheme may assume fixed-depth circuits (known model architecture) and exploit this
+  to tighten noise bounds
+
+### 4. SIMD packing aligned to model structure
+
+CKKS supports slot packing, but the native vector width is not designed to match
+transformer attention head dimensions.
+
+- The scheme's ciphertext packing structure should align naturally with the matrix
+  dimensions of the target model (e.g. attention head size, embedding dimension)
+- Goal: maximise utilisation of packed operations across a forward pass
+- For MoE models, packing should account for the sparse activation pattern — only a
+  subset of experts are active per token, and the scheme should not penalise this sparsity
+
+### 5. User-side output verification (nice to have)
+
+The aggregation layer (Phase 2) does not require publicly verifiable inference outputs —
+the user decrypts locally and re-encrypts for aggregation. However, a trust assumption
+remains: the user must trust that the inference provider actually ran the expected model
+on their encrypted input and did not tamper with or substitute the output.
+
+A desirable property is that the inference provider can produce a succinct proof of
+correct execution that the user can verify cheaply on their local device. This is
+distinct from public verifiability — only the user needs to verify, which allows for a
+much lighter-weight proof system.
+
+- Investigate ZK proof of correct inference attached to the encrypted output (prior art:
+  ezkl, zkCNN, and related zkML literature)
+- The proof need not be publicly verifiable, only user-verifiable; this may allow
+  significant proof size and verification cost reductions compared to fully public schemes
+- Acceptable for proof generation to be expensive on the provider side if verification
+  is cheap on the user side
+- Document the trust model in the absence of this feature (i.e. what the user must
+  assume if verification is not implemented) so that the tradeoff is explicit
+
+### 6. Relaxed correctness (approximate FHE)
+
+Unlike aggregation (which requires exact outputs for verifiability), inference is already
+approximate. The scheme may:
+
+- Introduce small bounded errors indistinguishable from floating point rounding
+- Relax noise management requirements that would otherwise demand larger parameters
+- Explicitly document the error model and its acceptability for inference use cases
+
+### 7. Security parameter targeting
+
+Current schemes target 128-bit post-quantum security. This project should:
+
+- Treat security level as a tunable parameter
+- Evaluate the performance-security tradeoff at 80-bit, 100-bit, and 128-bit security
+  levels
+- Document which security level is recommended for inference applications and why
+
+---
+
+## Explicit Non-Goals
+
+- **General purpose FHE.** This scheme is not intended to be competitive with CKKS or
+  TFHE for arbitrary computations. It is permitted to be entirely unsuitable for use
+  cases other than neural network inference.
+- **Public verifiability.** The aggregation layer handles verifiability after local
+  decryption. The scheme does not need to produce publicly verifiable outputs. User-side
+  verification is a nice-to-have (see above) but distinct from public verifiability.
+- **Phase 2 aggregation.** The scheme does not need to support multi-party computation,
+  threshold decryption, or publicly verifiable outputs. These are handled by a separate
+  aggregation layer (Enclave) after local decryption.
+- **Scheme interoperability.** The user decrypts locally before re-encrypting for
+  aggregation. There is no requirement for transciphering or cross-scheme compatibility.
+- **Training.** This scheme targets inference only. Encrypted training is out of scope.
+
+---
+
+## Target Workload
+
+Design decisions should be evaluated against a concrete target workload:
+
+- **Architecture:** Transformer decoder (GPT-style), either dense or Mixture of Experts
+  (MoE)
+- **Parameter count:** 20B-40B total parameters
+- **Active parameters:** For MoE models, target architectures with limited active
+  parameters per token (e.g. a 40B MoE model with 8B active parameters). FHE cost should
+  be evaluated against active parameter count, not total parameter count, as inactive
+  experts do not contribute to the forward pass computation
+- **Precision:** INT8 weights, FP16 activations (or fully INT8 if quantisation-friendly
+  activations are adopted)
+- **Sequence length:** 512-2048 tokens
+- **Batch size:** 1 (single user inference, not batched serving)
+- **Success metric:** A complete forward pass (single token generation step) completes
+  within a practical latency budget on commodity server hardware, with no mid-inference
+  bootstrapping
+
+Define "practical latency" explicitly as part of the design process. Current CKKS-based
+inference benchmarks should be used as the baseline to beat. Note that the 20B-40B
+parameter range represents the current sweet spot for high-quality local inference on
+consumer and prosumer hardware, and any scheme that performs well at this scale is likely
+to generalise usefully to smaller models.
+
+---
+
+## Implementation Deliverables
+
+1. **Scheme specification document:** formal description of the scheme, parameter choices,
+   noise analysis, and security argument
+2. **Reference implementation:** a correct (not necessarily optimised) implementation in
+   Python or Rust sufficient to validate the scheme's correctness on small inputs
+3. **Benchmark harness:** tooling to measure latency and noise budget consumption across
+   a representative subset of transformer operations (matmul, attention, layernorm,
+   activation), with separate benchmarks for dense and MoE routing
+4. **Comparison report:** quantitative comparison against CKKS on the target workload,
+   documenting performance gains and any tradeoffs accepted to achieve them
+5. **Security analysis:** argument for the scheme's security at the chosen parameter
+   levels, including any deviations from standard hardness assumptions
+6. **Verification analysis (if attempted):** design and cost analysis of a user-side
+   proof of correct inference, including proof size, generation cost on the provider
+   side, and verification cost on a typical user device
+
+---
+
+## References and Prior Art
+
+Agents should familiarise themselves with the following before beginning:
+
+- CKKS scheme (Cheon, Kim, Kim, Song 2017) and subsequent bootstrapping work
+- TFHE (Chillotti et al.) for comparison on gate-level bootstrapping cost
+- Microsoft SEAL and OpenFHE as reference implementations of existing schemes
+- Concrete ML (Zama) for prior work on ML inference under FHE
+- Literature on FHE-friendly neural network design (polynomial activations, low-degree
+  approximations)
+- ezkl, zkCNN, and related zkML literature for user-side verification approaches
+- Posit arithmetic as an analogy for questioning whether standard representations are
+  right for a given compute workload
+- HEaaN and lattigo for additional CKKS implementation references
+- Mixtral and similar open MoE architectures as concrete examples of the target workload
+
+---
+
+## Open Questions
+
+Agents should treat the following as active research questions and document findings:
+
+1. What is the minimum polynomial modulus degree that supports a full transformer forward
+   pass at INT8 precision without bootstrapping, at 128-bit security, for a 20B-40B
+   parameter model?
+2. Is there a polynomial activation function of degree <= 3 that is both FHE-cheap and
+   preserves model quality within acceptable bounds on standard benchmarks?
+3. Can attention's softmax be replaced entirely with a linear or low-degree approximation
+   without meaningful quality degradation for the governance use case (where inference
+   quality requirements may be lower than general-purpose LLM serving)?
+4. What is the right granularity of ciphertext packing for transformer attention — by
+   head, by layer, or by token?
+5. Does targeting a fixed known architecture (rather than a general circuit) unlock
+   meaningful parameter optimisations that a general-purpose scheme cannot exploit?
+6. For MoE models, does the sparse activation pattern (only a subset of experts active
+   per token) offer any FHE-specific optimisation opportunities, e.g. by reducing the
+   effective circuit depth or allowing cheaper noise management over inactive paths?
+7. What is the minimum proof size and verification cost achievable for user-side correct
+   inference verification, and is it practical on a typical user device (e.g. a modern
+   smartphone or laptop)?

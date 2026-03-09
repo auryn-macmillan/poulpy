@@ -104,8 +104,18 @@ impl NoiseTracker {
     ///
     /// This is the most expensive operation in terms of noise growth.
     /// σ²_out ≈ σ²_a · σ²_b · N + relinearisation noise
+    ///
+    /// The relinearisation noise depends on the tensor key parameters (dnum, dsize, base2k).
+    /// We approximate it as: N * dnum * σ²_fresh / 2^(2 * tsk_base2k)
+    /// This captures the key-switching noise from the tensor key.
     pub fn mul_ct(&mut self, other: &NoiseTracker, ring_degree: usize) {
-        let relin_noise = 1e-6; // Approximate relinearisation noise
+        // Approximate relinearisation noise based on typical CHIMERA parameters:
+        // dnum ≈ k / tsk_base2k ≈ 54 / 14 ≈ 4, tsk_base2k = 14
+        // relin_noise ≈ N * dnum * σ²_fresh / 2^(2 * tsk_base2k)
+        let dnum_approx = 4.0;
+        let tsk_base2k = 14.0;
+        let relin_noise = ring_degree as f64 * dnum_approx * (SIGMA_FRESH * SIGMA_FRESH)
+            / (2.0_f64).powf(2.0 * tsk_base2k);
         self.variance = self.variance * other.variance * ring_degree as f64 + relin_noise;
         self.num_ops += 1;
         self.depth = self.depth.max(other.depth) + 1;

@@ -100,13 +100,16 @@ where
     // The limb stores values in [-2^(base2k-1), 2^(base2k-1)).
     // scale_bits = base2k for FP16, so the quantised value maps
     // directly into the limb's range (shift = 0).
-    let scale = (1u64 << (params.scale_bits - 1)) as f32;
+    //
+    // Use f64 for the scale computation to match decode_fp16 and avoid
+    // asymmetric rounding errors for large values.
+    let scale = (1u64 << (params.scale_bits - 1)) as f64;
 
     let raw: &mut [u8] = pt.data.data.as_mut();
     let coeffs: &mut [i64] = bytemuck::cast_slice_mut(&mut raw[..n * 8]);
 
     for (i, &v) in values.iter().enumerate() {
-        let quantised = (v * scale).round() as i64;
+        let quantised = (v as f64 * scale).round() as i64;
         coeffs[i] = quantised;
     }
 
@@ -184,25 +187,37 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackingMode {
     /// Pack d_head values per ciphertext (for attention).
-    HeadAligned,
+    HeadAligned {
+        /// Attention head dimension (d_head), e.g. 128.
+        d_head: usize,
+    },
     /// Pack d_model values per ciphertext (for FFN).
-    EmbeddingAligned,
+    EmbeddingAligned {
+        /// Model embedding dimension (d_model), e.g. 4096.
+        d_model: usize,
+    },
     /// Pack d_expert values per ciphertext (for MoE expert FFN).
-    ExpertAligned,
+    ExpertAligned {
+        /// Expert FFN dimension, e.g. d_ffn / n_experts.
+        d_expert: usize,
+    },
     /// Pack arbitrary count values.
     Custom(usize),
 }
 
 impl PackingMode {
     /// Returns the number of active slots for this packing mode.
+    ///
+    /// The result is clamped to `params.slots` (the ring degree N) since
+    /// a single ciphertext cannot hold more values than the polynomial degree.
     pub fn active_slots(&self, params: &ChimeraParams) -> usize {
-        match self {
-            PackingMode::Custom(n) => (*n).min(params.slots),
-            // For the other modes, we use the full slot count.
-            // In practice, the caller should determine the actual count
-            // from ModelDims and pass it via Custom.
-            _ => params.slots,
-        }
+        let raw = match self {
+            PackingMode::HeadAligned { d_head } => *d_head,
+            PackingMode::EmbeddingAligned { d_model } => *d_model,
+            PackingMode::ExpertAligned { d_expert } => *d_expert,
+            PackingMode::Custom(n) => *n,
+        };
+        raw.min(params.slots)
     }
 }
 
@@ -253,8 +268,17 @@ mod tests {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         assert_eq!(PackingMode::Custom(64).active_slots(&params), 64);
         assert_eq!(
-            PackingMode::HeadAligned.active_slots(&params),
-            params.slots
+            PackingMode::HeadAligned { d_head: 128 }.active_slots(&params),
+            128,
+        );
+        assert_eq!(
+            PackingMode::EmbeddingAligned { d_model: 4096 }.active_slots(&params),
+            4096,
+        );
+        // ExpertAligned clamped to slots when dimension exceeds N
+        assert_eq!(
+            PackingMode::ExpertAligned { d_expert: 99999 }.active_slots(&params),
+            params.slots,
         );
     }
 }

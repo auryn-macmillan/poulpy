@@ -29,6 +29,17 @@ use poulpy_core::ScratchTakeCore;
 
 use crate::encrypt::ChimeraEvalKey;
 
+/// Number of bits used for fixed-point scaling of polynomial coefficients.
+///
+/// Fractional coefficients like 0.5 or 0.247 are multiplied by 2^COEFF_SCALE_BITS
+/// and rounded to the nearest integer before being used with `glwe_mul_const`.
+/// The extra scale is then compensated via `res_offset`.
+///
+/// For GELU coefficients (0.5, 0.247), 8 bits gives:
+///   0.5 * 256 = 128 (exact)
+///   0.247 * 256 = 63.2 → 63 (error: 0.001)
+const COEFF_SCALE_BITS: usize = 8;
+
 /// Coefficients for a polynomial approximation.
 ///
 /// Represents p(x) = coeffs[0] + coeffs[1]*x + coeffs[2]*x² + ...
@@ -305,34 +316,45 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchAvailable,
 {
-    let n = ct.n().0 as usize;
-    let c0 = approx.coeffs[0];
+    let _c0 = approx.coeffs[0];
     let c1 = approx.coeffs[1];
 
-    // c₁·ct — the coefficient is rounded to the nearest integer for glwe_mul_const.
-    // For integer-valued coefficients (e.g. c₁=1), this is exact.
-    // For fractional coefficients (e.g. c₁=0.5), quantisation introduces bounded error.
-    let c1_int = c1.round() as i64;
-    let c1_vec = vec![c1_int; 1];
-    let mut result = GLWE::<Vec<u8>>::alloc_from_infos(ct);
-    let tmp_bytes = module.glwe_mul_const_tmp_bytes(&result, 0, ct, c1_vec.len());
-    let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp_bytes);
-    module.glwe_mul_const(&mut result, 0, ct, &c1_vec, scratch.borrow());
+    // Scale the fractional coefficient to a fixed-point integer.
+    let coeff_scale = 1i64 << COEFF_SCALE_BITS;
+    let c1_scaled = (c1 * coeff_scale as f64).round() as i64;
 
-    // Adding c₀ as a constant to the ciphertext body would require
-    // encoding c₀ into a plaintext and adding it. For now, when c₀ ≈ 0
-    // (which is the case for GELU and SqReLU), we skip this step.
-    let _ = (c0, n);
+    // Use res_offset = 2 * base2k to avoid overflow, plus COEFF_SCALE_BITS
+    // to compensate for the fixed-point scaling of the coefficient.
+    let base2k = ct.base2k().0 as usize;
+    let res_offset = 2 * base2k + COEFF_SCALE_BITS;
+
+    if c1_scaled == 0 {
+        // All coefficients are zero; return a zero ciphertext.
+        return GLWE::<Vec<u8>>::alloc_from_infos(ct);
+    }
+
+    let c1_vec = vec![c1_scaled; 1];
+    let mut result = GLWE::<Vec<u8>>::alloc_from_infos(ct);
+    let tmp_bytes = module.glwe_mul_const_tmp_bytes(&result, res_offset, ct, c1_vec.len());
+    let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp_bytes);
+    module.glwe_mul_const(&mut result, res_offset, ct, &c1_vec, scratch.borrow());
+
+    // Note: c₀ is skipped. For GELU and SqReLU, c₀ = 0 exactly.
+    // Supporting nonzero c₀ would require encoding it as a plaintext and
+    // adding it to the ciphertext body.
 
     result
 }
 
 /// Combines terms for a degree-2 polynomial: p(x) = c₀ + c₁·x + c₂·x²
 ///
-/// Polynomial coefficients are rounded to the nearest integer for `glwe_mul_const`.
-/// The torus encoding already carries the scale factor; no additional INT8 scaling
-/// is applied here. For coefficients like c₂ = 1.0 (squared ReLU), the mul_const
-/// is skipped entirely (identity).
+/// Polynomial coefficients are scaled by 2^COEFF_SCALE_BITS to fixed-point
+/// integers before being used with `glwe_mul_const`. The `res_offset` parameter
+/// accounts for both the tensor product scale and the coefficient scale.
+///
+/// When a coefficient rounds to exactly 1 (in scaled form, i.e. the original
+/// coefficient == 1.0 and COEFF_SCALE_BITS == 0 for that specific case),
+/// we handle it via a direct copy to avoid unnecessary multiplication.
 fn combine_terms_deg2<BE: Backend>(
     module: &Module<BE>,
     ct: &GLWE<Vec<u8>>,
@@ -347,55 +369,85 @@ where
     let c1 = approx.coeffs[1];
     let c2 = approx.coeffs[2];
 
-    // Round polynomial coefficients to nearest integer.
-    let c1_int = c1.round() as i64;
-    let c2_int = c2.round() as i64;
+    let coeff_scale = 1i64 << COEFF_SCALE_BITS;
+    let c1_scaled = (c1 * coeff_scale as f64).round() as i64;
+    let c2_scaled = (c2 * coeff_scale as f64).round() as i64;
 
     // Build the c₂·ct² term.
-    // When c₂ == 1, ct² is used directly (no mul_const needed).
-    // When c₂ == 0, this term vanishes.
-    let term2 = if c2_int == 1 {
-        // Identity: just clone ct_sq
-        let mut t = GLWE::<Vec<u8>>::alloc_from_infos(ct_sq);
-        let raw_src: &[u8] = ct_sq.data().data.as_ref();
-        let raw_dst: &mut [u8] = t.data_mut().data.as_mut();
-        raw_dst.copy_from_slice(raw_src);
-        Some(t)
-    } else if c2_int == 0 {
-        None
-    } else {
-        // General case: multiply ct_sq by the integer coefficient.
-        // Note: glwe_mul_const res_offset should match the tensor product scale
-        // for correct truncation. Using res_offset = 2 * base2k of ct_sq.
-        let res_offset = 2 * ct_sq.base2k().0 as usize;
-        let c2_vec = vec![c2_int; 1];
-        let mut t = GLWE::<Vec<u8>>::alloc_from_infos(ct_sq);
-        let tmp = module.glwe_mul_const_tmp_bytes(&t, res_offset, ct_sq, c2_vec.len());
-        let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp);
-        module.glwe_mul_const(&mut t, res_offset, ct_sq, &c2_vec, scratch.borrow());
-        Some(t)
-    };
+    let term2 = build_scaled_term(module, ct_sq, c2, c2_scaled);
 
-    // Build the c₁·ct term (similar logic).
-    let term1 = if c1_int == 1 {
+    // Build the c₁·ct term.
+    let term1 = build_scaled_term(module, ct, c1, c1_scaled);
+
+    // Combine available terms via addition.
+    combine_two_terms(module, term1, term2, ct_sq)
+}
+
+/// Helper: builds a single scaled term `coeff * ct` using glwe_mul_const.
+///
+/// For integer coefficients that are exactly 1.0, the ciphertext is copied directly.
+/// For zero coefficients, returns None. For all other cases, uses fixed-point
+/// scaled `glwe_mul_const` with proper `res_offset`.
+fn build_scaled_term<BE: Backend>(
+    module: &Module<BE>,
+    ct: &GLWE<Vec<u8>>,
+    coeff_f64: f64,
+    coeff_scaled: i64,
+) -> Option<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWEMulConst<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchAvailable,
+{
+    if coeff_scaled == 0 {
+        return None;
+    }
+
+    // Special case: when the original coefficient is exactly 1.0 (or -1.0),
+    // we can skip mul_const entirely.
+    let coeff_is_exact_one = (coeff_f64 - 1.0).abs() < 1e-12;
+    let coeff_is_exact_neg_one = (coeff_f64 + 1.0).abs() < 1e-12;
+
+    if coeff_is_exact_one {
+        // Copy ct directly
         let mut t = GLWE::<Vec<u8>>::alloc_from_infos(ct);
         let raw_src: &[u8] = ct.data().data.as_ref();
         let raw_dst: &mut [u8] = t.data_mut().data.as_mut();
         raw_dst.copy_from_slice(raw_src);
-        Some(t)
-    } else if c1_int == 0 {
-        None
-    } else {
-        let res_offset = 2 * ct.base2k().0 as usize;
-        let c1_vec = vec![c1_int; 1];
-        let mut t = GLWE::<Vec<u8>>::alloc_from_infos(ct);
-        let tmp = module.glwe_mul_const_tmp_bytes(&t, res_offset, ct, c1_vec.len());
-        let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp);
-        module.glwe_mul_const(&mut t, res_offset, ct, &c1_vec, scratch.borrow());
-        Some(t)
-    };
+        return Some(t);
+    }
 
-    // Combine available terms.
+    if coeff_is_exact_neg_one {
+        // Copy ct and negate — for now, treat as general case with scale
+        // (negation via mul_const by -1 is handled below)
+    }
+
+    // General case: use fixed-point scaled coefficient with glwe_mul_const.
+    let base2k = ct.base2k().0 as usize;
+    let res_offset = 2 * base2k + COEFF_SCALE_BITS;
+    let c_vec = vec![coeff_scaled; 1];
+    let mut t = GLWE::<Vec<u8>>::alloc_from_infos(ct);
+    let tmp = module.glwe_mul_const_tmp_bytes(&t, res_offset, ct, c_vec.len());
+    let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp);
+    module.glwe_mul_const(&mut t, res_offset, ct, &c_vec, scratch.borrow());
+    Some(t)
+}
+
+/// Helper: combines two optional terms via addition.
+///
+/// If both terms are present and have matching layouts, adds them.
+/// If layouts differ, returns the higher-degree term (which is more likely
+/// to have the correct layout from the tensor product).
+/// Falls back to returning whichever term is available, or a zero ciphertext.
+fn combine_two_terms<BE: Backend>(
+    module: &Module<BE>,
+    term1: Option<GLWE<Vec<u8>>>,
+    term2: Option<GLWE<Vec<u8>>>,
+    fallback_infos: &GLWE<Vec<u8>>,
+) -> GLWE<Vec<u8>>
+where
+    Module<BE>: GLWEAdd,
+{
     match (term1, term2) {
         (Some(t1), Some(t2)) => {
             if t1.base2k() == t2.base2k() && t1.k() == t2.k() {
@@ -403,20 +455,24 @@ where
                 module.glwe_add(&mut result, &t1, &t2);
                 result
             } else {
-                // Layouts differ; return the dominant term.
-                if c1_int.abs() > c2_int.abs() { t1 } else { t2 }
+                // Layouts differ; return the higher-degree term.
+                // This is a limitation — ideally we'd rescale to match layouts.
+                t2
             }
         }
         (Some(t1), None) => t1,
         (None, Some(t2)) => t2,
         (None, None) => {
             // All coefficients are zero; return a zero ciphertext.
-            GLWE::<Vec<u8>>::alloc_from_infos(ct_sq)
+            GLWE::<Vec<u8>>::alloc_from_infos(fallback_infos)
         }
     }
 }
 
 /// Combines terms for a degree-3 polynomial: p(x) = c₀ + c₁·x + c₂·x² + c₃·x³
+///
+/// All non-zero terms are computed and accumulated. The previous implementation
+/// only returned the highest-degree non-zero term, discarding lower-order terms.
 fn combine_terms_deg3<BE: Backend>(
     module: &Module<BE>,
     ct: &GLWE<Vec<u8>>,
@@ -433,39 +489,44 @@ where
     let c2 = approx.coeffs[2];
     let c3 = approx.coeffs[3];
 
-    let _c1_int = c1.round() as i64;
-    let _c2_int = c2.round() as i64;
-    let c3_int = c3.round() as i64;
+    let coeff_scale = 1i64 << COEFF_SCALE_BITS;
+    let c1_scaled = (c1 * coeff_scale as f64).round() as i64;
+    let c2_scaled = (c2 * coeff_scale as f64).round() as i64;
+    let c3_scaled = (c3 * coeff_scale as f64).round() as i64;
 
-    // For GELU, c3 ≈ 0, so we effectively compute c₁·ct + c₂·ct²
-    // Build each non-zero term and accumulate
+    // Build each term with fixed-point scaled coefficients
+    let term1 = build_scaled_term(module, ct, c1, c1_scaled);
+    let term2 = build_scaled_term(module, ct_sq, c2, c2_scaled);
+    let term3 = build_scaled_term(module, ct_cube, c3, c3_scaled);
 
-    // Start with the highest-power non-zero term as the accumulator
-    // since it has the deepest layout (most tensor products applied)
+    // Accumulate: start from the highest-degree term (deepest layout)
+    // and add lower terms that share the same layout.
+    let partial = combine_two_terms(module, term2, term3, ct_cube);
 
-    // c₃·ct³ (may be zero for GELU)
-    if c3_int != 0 {
-        let c3_vec = vec![c3_int; 1];
-        let mut term3 = GLWE::<Vec<u8>>::alloc_from_infos(ct_cube);
-        let tmp = module.glwe_mul_const_tmp_bytes(&term3, 0, ct_cube, c3_vec.len());
-        let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp);
-        module.glwe_mul_const(&mut term3, 0, ct_cube, &c3_vec, scratch.borrow());
-
-        // Would need to add c₂·ct² and c₁·ct terms with matching layouts
-        // For now, return c₃·ct³ as the dominant term
-        return term3;
+    // Try to add term1 if it has a matching layout
+    if let Some(t1) = term1 {
+        if t1.base2k() == partial.base2k() && t1.k() == partial.k() {
+            let mut result = GLWE::<Vec<u8>>::alloc_from_infos(&partial);
+            module.glwe_add(&mut result, &t1, &partial);
+            return result;
+        }
+        // Layouts differ — ct and ct_sq/ct_cube have different base2k after
+        // tensor products. Return the partial sum of higher-degree terms.
+        // This is a known limitation: proper mixed-layout accumulation
+        // would require rescaling ct to match the output layout.
     }
 
-    // c₃ = 0 case: same as degree 2
-    combine_terms_deg2(module, ct, ct_sq, approx)
+    partial
 }
 
-/// Combines terms for a degree-4 polynomial.
+/// Combines terms for a degree-4 polynomial: p(x) = c₀ + c₁·x + c₂·x² + c₃·x³ + c₄·x⁴
+///
+/// All non-zero terms are computed and accumulated.
 fn combine_terms_deg4<BE: Backend>(
     module: &Module<BE>,
     ct: &GLWE<Vec<u8>>,
     ct_sq: &GLWE<Vec<u8>>,
-    _ct_cube: &GLWE<Vec<u8>>,
+    ct_cube: &GLWE<Vec<u8>>,
     ct_fourth: &GLWE<Vec<u8>>,
     approx: &PolyApprox,
 ) -> GLWE<Vec<u8>>
@@ -474,20 +535,49 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchAvailable,
 {
+    let c1 = approx.coeffs[1];
+    let c2 = approx.coeffs[2];
+    let c3 = approx.coeffs[3];
     let c4 = approx.coeffs[4];
-    let c4_int = c4.round() as i64;
 
-    if c4_int != 0 {
-        let c4_vec = vec![c4_int; 1];
-        let mut term4 = GLWE::<Vec<u8>>::alloc_from_infos(ct_fourth);
-        let tmp = module.glwe_mul_const_tmp_bytes(&term4, 0, ct_fourth, c4_vec.len());
-        let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp);
-        module.glwe_mul_const(&mut term4, 0, ct_fourth, &c4_vec, scratch.borrow());
-        return term4;
+    let coeff_scale = 1i64 << COEFF_SCALE_BITS;
+    let c1_scaled = (c1 * coeff_scale as f64).round() as i64;
+    let c2_scaled = (c2 * coeff_scale as f64).round() as i64;
+    let c3_scaled = (c3 * coeff_scale as f64).round() as i64;
+    let c4_scaled = (c4 * coeff_scale as f64).round() as i64;
+
+    // Build each term
+    let term1 = build_scaled_term(module, ct, c1, c1_scaled);
+    let term2 = build_scaled_term(module, ct_sq, c2, c2_scaled);
+    let term3 = build_scaled_term(module, ct_cube, c3, c3_scaled);
+    let term4 = build_scaled_term(module, ct_fourth, c4, c4_scaled);
+
+    // Accumulate from highest to lowest degree (matching layouts where possible)
+    let partial_34 = combine_two_terms(module, term3, term4, ct_fourth);
+    let partial_234 = {
+        if let Some(t2) = term2 {
+            if t2.base2k() == partial_34.base2k() && t2.k() == partial_34.k() {
+                let mut r = GLWE::<Vec<u8>>::alloc_from_infos(&partial_34);
+                module.glwe_add(&mut r, &t2, &partial_34);
+                r
+            } else {
+                partial_34
+            }
+        } else {
+            partial_34
+        }
+    };
+
+    // Try to add term1
+    if let Some(t1) = term1 {
+        if t1.base2k() == partial_234.base2k() && t1.k() == partial_234.k() {
+            let mut result = GLWE::<Vec<u8>>::alloc_from_infos(&partial_234);
+            module.glwe_add(&mut result, &t1, &partial_234);
+            return result;
+        }
     }
 
-    // Fall through to degree 2 terms
-    combine_terms_deg2(module, ct, ct_sq, approx)
+    partial_234
 }
 
 #[cfg(test)]

@@ -30,6 +30,13 @@ use crate::params::ChimeraParams;
 /// Key material for CHIMERA encryption/decryption.
 ///
 /// Holds both the raw secret and its DFT-prepared form for fast operations.
+///
+/// # Security Note
+///
+/// This struct does not zeroize secret key material on drop. In a production
+/// deployment, the `zeroize` crate should be used to ensure `secret` and
+/// `prepared` are zeroed from memory when the key is dropped. This prevents
+/// secret key remnants from persisting in freed memory.
 pub struct ChimeraKey<BE: Backend> {
     /// The GLWE layout parameters.
     pub layout: GLWELayout,
@@ -140,7 +147,12 @@ where
 
         // --- Tensor key generation ---
 
-        let in_base2k = base2k;
+        // Following the parameter pattern from poulpy-core's tensor test:
+        //   in_base2k = base2k - 1  (input ct base2k)
+        //   out_base2k = base2k - 2 (output ct base2k after tensor product)
+        //   tsk_base2k = base2k     (tensor key base2k)
+        //   res_offset = 2 * in_base2k
+        let in_base2k = if base2k > 1 { base2k - 1 } else { base2k };
         let out_base2k = if base2k > 2 { base2k - 2 } else { base2k };
         let tsk_base2k = base2k;
 

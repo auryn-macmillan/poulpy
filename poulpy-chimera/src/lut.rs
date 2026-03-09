@@ -153,14 +153,25 @@ impl NonlinearLUT {
     /// Converts entries to scaled i64 values for encoding into a Poulpy LUT polynomial.
     ///
     /// The output values are scaled to the torus: entry * 2^(64 - output_bits).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `output_bits` is 0 or greater than 62 (to avoid overflow).
     pub fn to_i64_entries(&self) -> Vec<i64> {
+        assert!(
+            self.output_bits > 0 && self.output_bits <= 62,
+            "output_bits must be in [1, 62], got {}",
+            self.output_bits,
+        );
         let shift = 64 - self.output_bits;
         self.entries
             .iter()
             .map(|&v| {
                 let scale = (1u64 << self.output_bits) as f64;
-                let quantised = (v * scale).round() as i64;
-                quantised << shift
+                let quantised = (v * scale).round().clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+                // Use wrapping_shl to avoid UB if shift is exactly 64
+                // (which can't happen given the assert, but is defensive)
+                quantised.wrapping_shl(shift)
             })
             .collect()
     }

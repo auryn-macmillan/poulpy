@@ -60,6 +60,8 @@ where
 {
     assert_eq!(a.n(), b.n());
     assert_eq!(a.rank(), b.rank());
+    assert_eq!(a.k(), b.k());
+    assert_eq!(a.base2k(), b.base2k());
 
     let mut res = GLWE::<Vec<u8>>::alloc_from_infos(a);
     module.glwe_sub(&mut res, a, b);
@@ -89,10 +91,13 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchAvailable,
 {
+    // res_offset = 2 * base2k prevents overflow from the product's
+    // double-precision intermediate representation.
+    let res_offset = 2 * ct.base2k().0 as usize;
     let mut res = GLWE::<Vec<u8>>::alloc_from_infos(ct);
-    let tmp_bytes = module.glwe_mul_const_tmp_bytes(&res, 0, ct, constants.len());
+    let tmp_bytes = module.glwe_mul_const_tmp_bytes(&res, res_offset, ct, constants.len());
     let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp_bytes);
-    module.glwe_mul_const(&mut res, 0, ct, constants, scratch.borrow());
+    module.glwe_mul_const(&mut res, res_offset, ct, constants, scratch.borrow());
     res
 }
 
@@ -148,17 +153,25 @@ where
         let mut res_mut = res.to_mut();
         let dst: &mut [u8] = res_mut.data_mut().data;
 
-        // Copy column by column, limb by limb
+        // VecZnx memory layout is limb-major, column-minor:
+        //   limb j of column i starts at scalar offset: n * (j * cols + i)
+        //   which is byte offset: n * (j * cols + i) * 8
+        //
+        // To drop the lowest limb(s), we copy the upper `new_size` limbs
+        // (indices 0..new_size) from the old ciphertext to the new one.
+        // Since old_size >= new_size and both share the same (n, cols),
+        // we can copy limb-by-limb.
         let limb_bytes = n * 8; // Each limb is N i64 coefficients
-        for col in 0..cols {
-            let src_col_offset = col * old_size * limb_bytes;
-            let dst_col_offset = col * new_size * limb_bytes;
-            let copy_bytes = new_size * limb_bytes;
-            if src_col_offset + copy_bytes <= src.len()
-                && dst_col_offset + copy_bytes <= dst.len()
-            {
-                dst[dst_col_offset..dst_col_offset + copy_bytes]
-                    .copy_from_slice(&src[src_col_offset..src_col_offset + copy_bytes]);
+        for j in 0..new_size {
+            for col in 0..cols {
+                let src_offset = (j * cols + col) * limb_bytes;
+                let dst_offset = (j * cols + col) * limb_bytes;
+                if src_offset + limb_bytes <= src.len()
+                    && dst_offset + limb_bytes <= dst.len()
+                {
+                    dst[dst_offset..dst_offset + limb_bytes]
+                        .copy_from_slice(&src[src_offset..src_offset + limb_bytes]);
+                }
             }
         }
     }

@@ -471,8 +471,8 @@ mod integration {
             params.base2k.0 as usize - 2,
         );
 
-        // res_offset should be 2 * base2k
-        assert_eq!(eval_key.res_offset, 2 * params.base2k.0 as usize);
+        // res_offset should be 2 * in_base2k where in_base2k = base2k - 1
+        assert_eq!(eval_key.res_offset, 2 * (params.base2k.0 as usize - 1));
 
         // Automorphism keys should be generated for trace (log2(N) keys)
         assert!(

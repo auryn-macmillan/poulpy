@@ -551,6 +551,12 @@ pub struct TransformerBlockWeights {
     pub attention: AttentionWeights,
     /// FFN layer weights (W1, W2, and optionally W3 for SwiGLU).
     pub ffn: FFNWeights,
+    /// Pre-attention RMSNorm gamma weights (one per d_model slot).
+    /// If `None`, uses unit gamma (no learnable scale).
+    pub pre_attn_norm_gamma: Option<Vec<i64>>,
+    /// Pre-FFN RMSNorm gamma weights (one per d_model slot).
+    /// If `None`, uses unit gamma (no learnable scale).
+    pub pre_ffn_norm_gamma: Option<Vec<i64>>,
 }
 
 impl TransformerBlockWeights {
@@ -559,6 +565,8 @@ impl TransformerBlockWeights {
         TransformerBlockWeights {
             attention: AttentionWeights::zeros(dims),
             ffn: FFNWeights::zeros_standard(dims),
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
         }
     }
 
@@ -567,6 +575,8 @@ impl TransformerBlockWeights {
         TransformerBlockWeights {
             attention: AttentionWeights::zeros(dims),
             ffn: FFNWeights::zeros_swiglu(dims),
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
         }
     }
 }

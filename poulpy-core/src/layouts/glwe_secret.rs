@@ -44,6 +44,12 @@ pub struct GLWESecret<D: Data> {
     pub(crate) dist: Distribution,
 }
 
+impl<D: DataRef> GLWESecret<D> {
+    pub fn data(&self) -> &ScalarZnx<D> {
+        &self.data
+    }
+}
+
 impl<D: Data> LWEInfos for GLWESecret<D> {
     fn base2k(&self) -> Base2K {
         Base2K(0)

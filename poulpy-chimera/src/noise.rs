@@ -157,6 +157,24 @@ impl NoiseTracker {
     pub fn is_valid(&self, params: &ChimeraParams) -> bool {
         self.budget_bits(params) > 0.0
     }
+
+    /// Resets the noise tracker to its fresh state after a bootstrapping operation.
+    ///
+    /// Bootstrapping refreshes the noise budget by re-encrypting the plaintext
+    /// value through a blind rotation. The resulting ciphertext has noise
+    /// comparable to a fresh encryption, so this resets the variance, depth,
+    /// and operation count accordingly. A "bootstrap_reset" event is recorded
+    /// in the history.
+    pub fn bootstrap_reset(&mut self) {
+        self.variance = SIGMA_FRESH * SIGMA_FRESH;
+        self.depth = 0;
+        self.num_ops = 0;
+        self.history.push(NoiseEvent {
+            op: "bootstrap_reset".to_string(),
+            variance_after: self.variance,
+            depth_after: self.depth,
+        });
+    }
 }
 
 /// Estimates total noise growth for a sequence of transformer operations.

@@ -61,6 +61,14 @@ impl<D: Data> LWEInfos for LWESecret<D> {
 }
 
 impl<D: DataMut> LWESecret<D> {
+    pub fn data_mut(&mut self) -> &mut ScalarZnx<D> {
+        &mut self.data
+    }
+
+    pub fn set_dist(&mut self, dist: Distribution) {
+        self.dist = dist;
+    }
+
     pub fn fill_ternary_prob(&mut self, prob: f64, source: &mut Source) {
         self.data.fill_ternary_prob(0, prob, source);
         self.dist = Distribution::TernaryProb(prob);

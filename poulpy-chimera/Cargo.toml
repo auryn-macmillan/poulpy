@@ -17,11 +17,15 @@ poulpy-cpu-avx = {workspace = true}
 poulpy-cpu-ref = {workspace = true}
 poulpy-hal = {workspace = true}
 poulpy-core = {workspace = true}
+poulpy-schemes = {workspace = true}
 rand = {workspace = true}
 itertools = {workspace = true}
 byteorder = {workspace = true}
 bytemuck = {workspace = true}
 paste = {workspace = true}
+safetensors = {workspace = true}
+memmap2 = {workspace = true}
+half = {workspace = true}
 
 [dev-dependencies]
 criterion = {workspace = true}

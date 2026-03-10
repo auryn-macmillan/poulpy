@@ -1424,6 +1424,8 @@ mod integration {
                 w2: vec![vec![1i64]],
                 w3: None,
             },
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
         };
 
         // Encrypt input: single value [5]
@@ -1500,6 +1502,8 @@ mod integration {
                     w2: vec![vec![1i64]],
                     w3: None,
                 },
+                pre_attn_norm_gamma: None,
+                pre_ffn_norm_gamma: None,
             },
             TransformerBlockWeights {
                 attention: AttentionWeights {
@@ -1513,6 +1517,8 @@ mod integration {
                     w2: vec![vec![1i64]],
                     w3: None,
                 },
+                pre_attn_norm_gamma: None,
+                pre_ffn_norm_gamma: None,
             },
         ];
 
@@ -1527,5 +1533,172 @@ mod integration {
         assert!(result.n() > 0, "output ciphertext N should be > 0");
         assert!(result.base2k() > 0, "output ciphertext base2k should be > 0");
         assert!(result.k() > 0, "output ciphertext k should be > 0");
+    }
+
+    /// Tests a transformer block with d_model=4, d_ffn=4, demonstrating that
+    /// the pipeline works with multi-element polynomial weight vectors.
+    ///
+    /// The input ciphertext encodes 4 INT8 values [1, 2, 3, 4] as polynomial
+    /// coefficients. Weight "rows" are 4-element polynomials. The ring
+    /// multiplication (negacyclic convolution) computes the inner product
+    /// structure that the transformer relies on.
+    #[test]
+    fn test_end_to_end_transformer_block_d4() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [100u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [101u8; 32], [102u8; 32],
+        );
+
+        // d_model=4, d_ffn=4, 1 head with d_head=4
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 4,
+            n_heads: 1,
+            d_ffn: 4,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(4),
+            pre_ffn_norm: LayerNormConfig::rms_norm(4),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        // Weights: 4×4 identity-like (each row = [1, 0, 0, 0])
+        let id_row = vec![1i64, 0, 0, 0];
+        let weights = TransformerBlockWeights {
+            attention: AttentionWeights {
+                w_q: vec![id_row.clone(); 4],
+                w_k: vec![id_row.clone(); 4],
+                w_v: vec![id_row.clone(); 4],
+                w_o: vec![id_row.clone(); 4],
+            },
+            ffn: FFNWeights {
+                w1: vec![id_row.clone(); 4],
+                w2: vec![id_row.clone(); 4],
+                w3: None,
+            },
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
+        };
+
+        // Encrypt input: 4 values [1, 2, 3, 4]
+        let vals: Vec<i8> = vec![1, 2, 3, 4];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [110u8; 32], [111u8; 32]);
+
+        // Run the full transformer block with d_model=4
+        let result = chimera_transformer_block(&module, &eval_key, &ct, &config, &weights);
+
+        use poulpy_core::layouts::LWEInfos;
+        assert!(result.n() > 0, "output ciphertext N should be > 0");
+        assert!(result.base2k() > 0, "output ciphertext base2k should be > 0");
+        assert!(result.k() > 0, "output ciphertext k should be > 0");
+    }
+
+    /// Tests matmul with d_model=4 to verify multi-coefficient polynomial
+    /// multiplication produces sensible results.
+    #[test]
+    fn test_matmul_d4() {
+        use crate::arithmetic::chimera_matmul_single_ct;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [120u8; 32]);
+
+        // Encrypt [1, 0, 0, 0] — a monomial
+        let vals: Vec<i8> = vec![1, 0, 0, 0];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [121u8; 32], [122u8; 32]);
+
+        // Weight rows: [[1,0,0,0], [0,1,0,0]] — identity-like rows
+        let weight_rows = vec![
+            vec![1i64, 0, 0, 0],
+            vec![0i64, 1, 0, 0],
+        ];
+
+        let result = chimera_matmul_single_ct(&module, &ct, &weight_rows);
+        assert_eq!(result.len(), 2, "matmul should produce 2 output ciphertexts");
+
+        // Decrypt the first output: should be close to [1, 0, 0, 0] * [1, 0, 0, 0]
+        // In polynomial ring: 1·1 = 1 → coefficient 0 = 1, rest = 0
+        let pt_out = chimera_decrypt(&module, &key, &result[0], &params);
+        let decoded = decode_int8(&module, &params, &pt_out, 4);
+        // First coefficient should be close to 1 (with some noise)
+        assert!(
+            (decoded[0] as i16 - 1).unsigned_abs() <= 2,
+            "first output coeff should be ~1, got {}", decoded[0]
+        );
+    }
+
+    /// Tests the FFN with d_model=2, d_ffn=2 to exercise the weight application
+    /// with non-trivial polynomial dimensions.
+    #[test]
+    fn test_ffn_standard_d2() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [130u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [131u8; 32], [132u8; 32],
+        );
+
+        // Encrypt [2, 3]
+        let vals: Vec<i8> = vec![2, 3];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [133u8; 32], [134u8; 32]);
+
+        // W1 = [[1,0],[0,1]] (identity-like), W2 = [[1,0],[0,1]]
+        let weights = FFNWeights {
+            w1: vec![vec![1, 0], vec![0, 1]],
+            w2: vec![vec![1, 0], vec![0, 1]],
+            w3: None,
+        };
+
+        let result = chimera_ffn_standard(
+            &module,
+            &eval_key,
+            &ct,
+            &weights,
+            &ActivationChoice::SquaredReLU,
+        );
+        assert_eq!(result.len(), 2, "FFN d2 should produce 2 output ciphertexts");
+    }
+
+    /// Tests SwiGLU FFN with d_model=2, d_ffn=2.
+    #[test]
+    fn test_ffn_swiglu_d2() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [140u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [141u8; 32], [142u8; 32],
+        );
+
+        // Encrypt [4, 5]
+        let vals: Vec<i8> = vec![4, 5];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [143u8; 32], [144u8; 32]);
+
+        let weights = FFNWeights {
+            w1: vec![vec![1, 0], vec![0, 1]],    // W_gate
+            w2: vec![vec![1, 0], vec![0, 1]],    // W_down
+            w3: Some(vec![vec![1, 0], vec![0, 1]]), // W_up
+        };
+
+        let result = chimera_ffn_swiglu(&module, &eval_key, &ct, &weights);
+        assert_eq!(result.len(), 2, "SwiGLU FFN d2 should produce 2 output ciphertexts");
     }
 }

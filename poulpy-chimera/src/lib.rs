@@ -62,6 +62,7 @@ pub mod transformer;
 pub mod moe;
 pub mod noise;
 pub mod bootstrapping;
+pub mod model_loader;
 
 #[cfg(test)]
 mod tests;

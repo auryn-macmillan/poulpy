@@ -25,7 +25,7 @@ use poulpy_hal::{
 };
 
 use crate::activations::{apply_poly_activation, chimera_ct_mul, PolyApprox};
-use crate::arithmetic::{chimera_add, chimera_mul_const, chimera_project_layout, chimera_slot_sum};
+use crate::arithmetic::{chimera_add, chimera_align_layout, chimera_mul_const, chimera_slot_sum};
 use crate::encrypt::ChimeraEvalKey;
 
 /// Configuration for LayerNorm/RMSNorm evaluation under FHE.
@@ -301,7 +301,7 @@ where
             }
             cloned
         } else {
-            chimera_project_layout(module, xi, &inv_rms_layout)
+            chimera_align_layout(module, xi, &inv_rms_layout)
         };
         let normed = chimera_ct_mul(module, eval_key, &xi_proj, &inv_rms);
         outputs.push(normed);
@@ -416,7 +416,7 @@ where
         dst[..len].copy_from_slice(&src[..len]);
         cloned
     } else {
-        chimera_project_layout(module, ct, &inv_rms_layout)
+        chimera_align_layout(module, ct, &inv_rms_layout)
     };
 
     let normalised = chimera_ct_mul(module, eval_key, &ct_projected, &inv_rms);

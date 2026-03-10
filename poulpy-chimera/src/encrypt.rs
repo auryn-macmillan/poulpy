@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use crate::params::ChimeraParams;
 use poulpy_core::ScratchTakeCore;
 use poulpy_core::{
     layouts::{
@@ -24,18 +25,13 @@ use poulpy_hal::{
     source::Source,
 };
 
-use crate::params::ChimeraParams;
-
 /// Key material for CHIMERA encryption/decryption.
 ///
 /// Holds both the raw secret and its DFT-prepared form for fast operations.
+/// On drop, the raw secret is overwritten with zeros via the exposed Poulpy API.
+/// The prepared secret remains a known limitation until poulpy-core exposes a
+/// mutable buffer API for it.
 ///
-/// # Security Note
-///
-/// This struct does not zeroize secret key material on drop. In a production
-/// deployment, the `zeroize` crate should be used to ensure `secret` and
-/// `prepared` are zeroed from memory when the key is dropped. This prevents
-/// secret key remnants from persisting in freed memory.
 pub struct ChimeraKey<BE: Backend> {
     /// The GLWE layout parameters.
     pub layout: GLWELayout,
@@ -43,6 +39,12 @@ pub struct ChimeraKey<BE: Backend> {
     pub secret: GLWESecret<Vec<u8>>,
     /// DFT-prepared secret for fast polynomial multiplication.
     pub prepared: GLWESecretPrepared<Vec<u8>, BE>,
+}
+
+impl<BE: Backend> Drop for ChimeraKey<BE> {
+    fn drop(&mut self) {
+        self.secret.fill_zero();
+    }
 }
 
 impl<BE: Backend> ChimeraKey<BE>

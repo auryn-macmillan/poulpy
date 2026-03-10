@@ -412,15 +412,15 @@ where
 
     // Project diff and flag to the output layout (tensor product output) so
     // that all subsequent operations use compatible layouts.
-    let diff_proj = crate::arithmetic::chimera_project_layout(module, &diff, &eval_key.output_layout);
-    let flag_proj = crate::arithmetic::chimera_project_layout(module, flag, &eval_key.output_layout);
+    let diff_proj = crate::arithmetic::chimera_align_layout(module, &diff, &eval_key.output_layout);
+    let flag_proj = crate::arithmetic::chimera_align_layout(module, flag, &eval_key.output_layout);
 
     // flag_diff = flag * diff (ct × ct multiply via tensor product)
     let flag_diff = crate::activations::chimera_ct_mul(module, eval_key, &flag_proj, &diff_proj);
 
     // Project a and b to the output layout
-    let a_proj = crate::arithmetic::chimera_project_layout(module, a, &eval_key.output_layout);
-    let b_proj = crate::arithmetic::chimera_project_layout(module, b, &eval_key.output_layout);
+    let a_proj = crate::arithmetic::chimera_align_layout(module, a, &eval_key.output_layout);
+    let b_proj = crate::arithmetic::chimera_align_layout(module, b, &eval_key.output_layout);
 
     // new_a = a + flag_diff
     let new_a = chimera_add(module, &a_proj, &flag_diff);

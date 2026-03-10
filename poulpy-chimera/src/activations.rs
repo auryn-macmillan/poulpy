@@ -27,7 +27,7 @@ use poulpy_hal::{
     layouts::{Backend, Module, Scratch, ScratchOwned, ZnxViewMut},
 };
 
-use crate::arithmetic::chimera_project_layout;
+use crate::arithmetic::chimera_align_layout;
 use crate::encrypt::ChimeraEvalKey;
 
 /// Number of bits used for fixed-point scaling of polynomial coefficients.
@@ -293,7 +293,7 @@ where
     let ct_for_cube = if ct.base2k() == ct_sq.base2k() && ct.k() == ct_sq.k() {
         ct.clone()
     } else {
-        chimera_project_layout(module, ct, &ct_sq.glwe_layout())
+        chimera_align_layout(module, ct, &ct_sq.glwe_layout())
     };
     let ct_cube = chimera_ct_mul(module, eval_key, &ct_sq, &ct_for_cube);
 
@@ -306,7 +306,7 @@ where
     let ct_sq_for_fourth = if ct_sq.base2k() == ct_cube.base2k() && ct_sq.k() == ct_cube.k() {
         ct_sq.clone()
     } else {
-        chimera_project_layout(module, &ct_sq, &ct_cube.glwe_layout())
+        chimera_align_layout(module, &ct_sq, &ct_cube.glwe_layout())
     };
     let ct_fourth = chimera_ct_mul(module, eval_key, &ct_sq_for_fourth, &ct_sq_for_fourth);
     combine_terms_deg4(module, ct, &ct_sq, &ct_cube, &ct_fourth, approx)

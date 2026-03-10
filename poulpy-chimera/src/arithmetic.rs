@@ -90,26 +90,25 @@ where
     res
 }
 
-/// Projects a ciphertext to a target layout (potentially with different base2k).
+/// Aligns a ciphertext to a target layout for mixed-level arithmetic.
 ///
 /// This is used when two ciphertexts at different base2k levels need to be
-/// combined (e.g., in SwiGLU where the activated gate is at `out_base2k`
-/// but the up-projection is still at `in_base2k`).
+/// combined (e.g. after nonlinear evaluation or before residual addition).
 ///
-/// The projection is performed via `glwe_mul_const` with a scalar `[1]`,
-/// which copies the ciphertext data into the new layout. This is not a
-/// rescale — it reinterprets the ciphertext at the target parameters.
+/// The current implementation uses `glwe_mul_const` with a scalar `[1]` to copy
+/// into the requested layout. This is an alignment helper for CHIMERA's tested
+/// paths, not a cryptographic modulus-switch or rescale primitive.
 ///
 /// # Arguments
 ///
 /// * `module` - Backend module.
 /// * `ct` - Input ciphertext.
-/// * `target` - Target layout to project into.
+/// * `target` - Target layout to align into.
 ///
 /// # Returns
 ///
 /// A new ciphertext at the target layout.
-pub fn chimera_project_layout<BE: Backend>(module: &Module<BE>, ct: &GLWE<Vec<u8>>, target: &GLWELayout) -> GLWE<Vec<u8>>
+pub fn chimera_align_layout<BE: Backend>(module: &Module<BE>, ct: &GLWE<Vec<u8>>, target: &GLWELayout) -> GLWE<Vec<u8>>
 where
     Module<BE>: GLWEMulConst<BE>,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
@@ -122,6 +121,16 @@ where
     let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp_bytes);
     module.glwe_mul_const(&mut res, res_offset, ct, &constants, scratch.borrow());
     res
+}
+
+#[deprecated(note = "use chimera_align_layout instead")]
+pub fn chimera_project_layout<BE: Backend>(module: &Module<BE>, ct: &GLWE<Vec<u8>>, target: &GLWELayout) -> GLWE<Vec<u8>>
+where
+    Module<BE>: GLWEMulConst<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchAvailable,
+{
+    chimera_align_layout(module, ct, target)
 }
 
 /// Rescales a CHIMERA ciphertext, reducing the scale factor by 2^base2k.

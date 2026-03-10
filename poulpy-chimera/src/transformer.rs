@@ -32,7 +32,7 @@ use poulpy_hal::{
 use crate::activations::{
     apply_poly_activation, chimera_ct_mul, gelu_poly_approx, silu_poly_approx, squared_relu_approx, PolyApprox,
 };
-use crate::arithmetic::{chimera_add, chimera_matmul_single_ct, chimera_project_layout};
+use crate::arithmetic::{chimera_add, chimera_align_layout, chimera_matmul_single_ct};
 use crate::attention::{
     chimera_apply_softmax, chimera_attention_context, chimera_attention_score, chimera_multi_head_attention_vec,
     chimera_output_project, chimera_qkv_project_single, plan_attention, AttentionConfig, AttentionPlan, AttentionWeights,
@@ -463,7 +463,7 @@ where
             // No projection needed — layouts already match
             up[j].clone()
         } else {
-            chimera_project_layout(module, &up[j], &gate_layout)
+            chimera_align_layout(module, &up[j], &gate_layout)
         };
 
         // Element-wise product: SiLU(gate_j) ⊙ up_j
@@ -624,6 +624,7 @@ impl TransformerBlockWeights {
 /// # Panics
 ///
 /// Panics if norm configurations are not set to RMSNorm mode.
+#[deprecated(note = "legacy toy-only API; use chimera_transformer_block_vec instead")]
 pub fn chimera_transformer_block<BE: Backend>(
     module: &Module<BE>,
     eval_key: &ChimeraEvalKey<BE>,
@@ -722,7 +723,7 @@ where
             let acc_proj = if acc.base2k() == head_out_h.base2k() && acc.k() == head_out_h.k() {
                 acc
             } else {
-                chimera_project_layout(module, &acc, &head_layout)
+                chimera_align_layout(module, &acc, &head_layout)
             };
             acc = chimera_add(module, &acc_proj, &head_out_h);
         }
@@ -758,7 +759,7 @@ where
             }
             cloned
         } else {
-            chimera_project_layout(module, ct_x, &ct_x_layout)
+            chimera_align_layout(module, ct_x, &ct_x_layout)
         };
         chimera_add(module, &ct_x_proj, &attn_out)
     } else {
@@ -813,7 +814,7 @@ where
             }
             cloned
         } else {
-            chimera_project_layout(module, &residual_1, &res1_layout)
+            chimera_align_layout(module, &residual_1, &res1_layout)
         };
         chimera_add(module, &res1_proj, &ffn_out)
     } else {
@@ -846,6 +847,8 @@ where
 /// # Panics
 ///
 /// Panics if `layer_weights.len()` does not match `num_layers`.
+#[deprecated(note = "legacy toy-only API; use chimera_forward_pass_vec instead")]
+#[allow(deprecated)]
 pub fn chimera_forward_pass<BE: Backend>(
     module: &Module<BE>,
     eval_key: &ChimeraEvalKey<BE>,
@@ -915,6 +918,7 @@ where
 /// # Panics
 ///
 /// Panics if bootstrapping is triggered but `bsk_prepared` is `None`.
+#[allow(deprecated)]
 pub fn chimera_forward_pass_with_bootstrap<BE: Backend>(
     module: &Module<BE>,
     eval_key: &ChimeraEvalKey<BE>,
@@ -1129,7 +1133,7 @@ where
         let up_proj = if up_j.base2k() == gate_activated.base2k() {
             up_j
         } else {
-            chimera_project_layout(module, &up_j, &gate_layout)
+            chimera_align_layout(module, &up_j, &gate_layout)
         };
 
         // Element-wise: SiLU(gate_j) ⊙ up_j
@@ -1275,7 +1279,7 @@ where
                 k: b[i].k(),
                 rank: b[i].rank(),
             };
-            let projected = chimera_project_layout(module, &a[i], &target);
+            let projected = chimera_align_layout(module, &a[i], &target);
             (projected, &b[i])
         };
         result.push(chimera_add(module, &ai_proj, bi_ref));

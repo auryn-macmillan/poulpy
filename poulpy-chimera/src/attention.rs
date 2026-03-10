@@ -46,7 +46,7 @@
 
 use crate::activations::{apply_poly_activation, chimera_ct_mul, squared_relu_approx, PolyApprox};
 use crate::arithmetic::{
-    chimera_add, chimera_matmul_single_ct, chimera_mul_const, chimera_project_layout, chimera_slot_sum, chimera_sub,
+    chimera_add, chimera_align_layout, chimera_matmul_single_ct, chimera_mul_const, chimera_slot_sum, chimera_sub,
 };
 use crate::encrypt::ChimeraEvalKey;
 use crate::params::{ChimeraParams, ModelDims};
@@ -890,7 +890,7 @@ where
             }
             cloned
         } else {
-            chimera_project_layout(module, &v_h[j], &attn_layout)
+            chimera_align_layout(module, &v_h[j], &attn_layout)
         };
         let ctx_j = chimera_ct_mul(module, eval_key, attn_weight, &v_proj);
         context.push(ctx_j);

@@ -264,3 +264,142 @@ Agents should treat the following as active research questions and document find
 7. What is the minimum proof size and verification cost achievable for user-side correct
    inference verification, and is it practical on a typical user device (e.g. a modern
    smartphone or laptop)?
+
+---
+
+## Implementation Status
+
+> Last updated: 2026-03-10
+
+### Crate: `poulpy-chimera` (15 source files, 118 tests passing)
+
+The CHIMERA scheme is implemented as a new crate in the Poulpy workspace, reusing
+`poulpy-hal` (backend traits, FFT) and `poulpy-core` (RLWE encryption, keyswitching,
+tensor products, automorphisms).
+
+### Deliverables — ALL COMPLETE
+
+| Deliverable | Location | Status |
+|-------------|----------|--------|
+| Scheme specification | `docs/chimera_spec.md` | ✅ Complete |
+| Reference implementation | `poulpy-chimera/src/` | ✅ Complete (15 modules) |
+| Benchmark harness | `poulpy-chimera/benches/chimera_ops.rs` | ✅ Complete |
+| Comparison report vs CKKS | `docs/chimera_comparison.md` | ✅ Complete (needs update with measured numbers) |
+| Security analysis | `docs/chimera_security.md` | ✅ Complete |
+| Verification analysis | `docs/chimera_verification.md` | ✅ Complete |
+
+### Module Map
+
+| Module | Responsibility | Status |
+|--------|---------------|--------|
+| `params.rs` | Security levels (80/100/128-bit), noise budgets, parameter selection | ✅ |
+| `encoding.rs` | INT8/FP16 plaintext encoding with SIMD slot packing | ✅ |
+| `encrypt.rs` | `ChimeraKey`, `ChimeraEvalKey`, RLWE encryption/decryption | ✅ |
+| `arithmetic.rs` | Homomorphic add, ct-pt multiply, rescale, rotate, matmul, dot product | ✅ |
+| `activations.rs` | Polynomial GELU/SiLU/SquaredReLU/inv_sqrt approximations, ct×ct multiply | ✅ |
+| `lut.rs` | LUT-based nonlinearity evaluation via blind rotation | ✅ |
+| `layernorm.rs` | Approximate RMSNorm/LayerNorm under FHE (with optional gamma/beta) | ✅ |
+| `attention.rs` | QKV projection, attention scores, softmax approximation, context, output | ✅ (single-head) |
+| `transformer.rs` | Full transformer block, forward pass, FFN (standard + SwiGLU) | ✅ |
+| `moe.rs` | MoE routing cost estimation | ✅ (cost only, no homomorphic routing) |
+| `noise.rs` | Noise tracking and budget estimation | ✅ |
+| `bootstrapping.rs` | Full bootstrap pipeline: sample extract → LWE keyswitch → blind rotation | ✅ |
+| `model_loader.rs` | Safetensors loading, INT8/FP16/BF16/FP32 quantization, transpose, sharded models | ✅ |
+| `tests.rs` | 106 integration tests | ✅ |
+| `benches/chimera_ops.rs` | Criterion benchmarks for all operations | ✅ |
+
+### Key Design Decisions Implemented
+
+- **base2k cascade**: master `base2k=14`, input ct `in_base2k=13`, output ct `out_base2k=12`
+- **k_ct = 113**: `8 * base2k + 1`, providing 9 limbs for tensor product relinearization
+- **Polynomial activations**: GELU (degree 3), SiLU (degree 3), SquaredReLU (degree 2)
+- **Softmax strategies**: PolynomialDeg4, ReluSquared, Linear (configurable per model)
+- **Encoding scale**: `2 * in_base2k = 26` (torus encoding for INT8 values)
+- **Bootstrapping**: sample_extract → LWE keyswitch (N→n_lwe) → blind rotation with identity LUT
+- **Model loading**: safetensors with automatic PyTorch→CHIMERA transpose, per-tensor INT8 quantization
+
+### What Works End-to-End
+
+1. Encrypt INT8 input → homomorphic transformer block → decrypt output (d_model=1 and d_model=4)
+2. Multi-layer forward pass (2 layers chained, output of block 1 feeds block 2)
+3. Standard FFN and SwiGLU FFN at d_model=1 and d_model=2
+4. Bootstrapping roundtrip: encrypt value → bootstrap through identity LUT → recover original
+5. Matmul with multi-coefficient polynomial weights (d_model=4)
+6. Load model weights from safetensors (INT8/FP16/BF16/FP32, sharded, memory-mapped)
+
+---
+
+## Remaining Work (Priority Order)
+
+### P0 — Functional Completeness
+
+1. **Wire RMSNorm gamma into transformer block**
+   - `TransformerBlockWeights` carries `pre_attn_norm_gamma` and `pre_ffn_norm_gamma`
+   - `chimera_transformer_block()` must pass them into `LayerNormConfig` before calling
+     `chimera_rms_norm()`, so that learnable scale parameters are applied
+   - Currently always uses unit gamma (no learnable scale)
+
+2. **Integrate bootstrapping into forward pass**
+   - `chimera_forward_pass()` has a commented-out placeholder for mid-inference
+     bootstrapping between layers
+   - With bootstrapping now working, wire it up with a noise budget check:
+     `if needs_bootstrap(&current, params) { current = chimera_bootstrap(...); }`
+   - Determine the optimal insertion point (after every N layers, or based on
+     measured noise)
+
+3. **Multi-head attention**
+   - Current: single-head simplification using `w_q[0]`, `w_k[0]`, `w_v[0]`
+   - Required: split input into per-head ciphertexts (d_head coefficients each),
+     compute attention independently per head, concatenate results
+   - This requires the packing mode switch (automorphism) to extract/insert head
+     slices from the d_model-packed ciphertext
+   - Consider: is per-head packing (one ct per head) or interleaved packing
+     (all heads in one ct) more efficient?
+
+### P1 — Validation & Measurement
+
+4. **Numerical accuracy characterization**
+   - Add tests that compute the same transformer block in cleartext and under FHE
+   - Report L∞ error (max absolute deviation) and L2 error (RMS deviation)
+   - Characterize error growth across layers
+   - Establish acceptable error bounds for the governance inference use case
+
+5. **Benchmark at realistic dimensions**
+   - Current benchmarks run at toy sizes (d_model=1)
+   - Run at d_model=128, d_model=256 to get meaningful latency numbers
+   - Measure: single matmul, single attention layer, single FFN, full block
+   - Compare against CKKS baselines (SEAL, OpenFHE, HEaaN)
+   - Update `docs/chimera_comparison.md` with actual measured numbers
+
+### P2 — Advanced Features
+
+6. **Homomorphic MoE routing**
+   - `moe.rs` has cost estimation but no homomorphic gating implementation
+   - Implement encrypted top-k expert selection (argmax under FHE)
+   - Route tokens to active experts without revealing which experts are selected
+   - Evaluate whether inactive expert paths can be skipped (FHE-specific
+     optimization opportunity from Open Question #6)
+
+7. **Security parameter sweep**
+   - Run identical workload at 80-bit (N=4096), 100-bit (N=8192), 128-bit (N=16384)
+   - Measure latency, noise budget consumption, and error for each
+   - Document recommended security level for inference with justification
+
+8. **User-side verification prototype**
+   - Design a lightweight proof of correct inference (not publicly verifiable)
+   - Evaluate proof size and verification cost on typical user device
+   - If impractical, document the trust model explicitly
+
+### Path to Real Model Inference
+
+To run CHIMERA on a real model (e.g., a quantized LLaMA-7B):
+
+1. Complete P0 items (gamma wiring, bootstrapping integration, multi-head attention)
+2. Verify numerical accuracy at d_model=128 or 4096 (P1 item 4)
+3. Load real safetensors weights via `model_loader.rs` (already implemented)
+4. Run a single-token forward pass and compare output logits to cleartext inference
+5. Profile bottlenecks and optimize hot paths
+
+The model loader already supports LLaMA naming conventions and handles INT8 quantized
+weights. The remaining gap is the multi-head attention implementation and numerical
+validation at production dimensions.

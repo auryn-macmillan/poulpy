@@ -36,8 +36,12 @@ use crate::attention::{
     chimera_qkv_project_single, chimera_attention_score, chimera_apply_softmax,
     chimera_attention_context, chimera_output_project,
 };
+use crate::bootstrapping::{
+    BootstrappingConfig, ChimeraBootstrapKeyPrepared, chimera_bootstrap, needs_bootstrap,
+};
 use crate::encrypt::ChimeraEvalKey;
 use crate::layernorm::{LayerNormConfig, LayerNormPlan, chimera_rms_norm, plan_layernorm};
+use crate::noise::NoiseTracker;
 use crate::params::{ChimeraParams, ModelDims};
 
 /// Configuration for a single transformer block.
@@ -605,12 +609,16 @@ impl TransformerBlockWeights {
 /// 5. **FFN**: Applies the feed-forward network (standard or SwiGLU).
 /// 6. **Residual connection**: Adds the FFN output back to the post-attention result.
 ///
-/// ## Simplified Single-Head Attention
+/// ## Multi-Head Attention
 ///
-/// For the initial implementation, attention is simplified to a single-head
-/// computation on one ciphertext. The full multi-head attention with head
-/// splitting and concatenation is deferred until the packing mode switch
-/// infrastructure is more mature.
+/// The attention step iterates over `n_heads` heads. Each head h uses
+/// weight rows `w_q[h]`, `w_k[h]`, `w_v[h]`, `w_o[h]` to project Q, K, V
+/// and produce an output. The per-head outputs are summed to produce the
+/// final attention output. This is the "per-head" packing strategy where
+/// each head operates on the full polynomial ciphertext via ring
+/// multiplication with its weight row.
+///
+/// When `n_heads == 1`, this reduces to the original single-head behavior.
 ///
 /// ## Noise Budget
 ///
@@ -652,48 +660,97 @@ where
 {
     // -----------------------------------------------------------------------
     // Step 1: Pre-attention RMSNorm
-    // -----------------------------------------------------------------------
-    let normed_pre_attn = chimera_rms_norm(module, eval_key, ct_x, &config.pre_attn_norm);
-
-    // -----------------------------------------------------------------------
-    // Step 2: Simplified single-head attention
     //
-    // Full multi-head attention requires splitting the input into per-head
-    // ciphertexts and concatenating the results. For the initial end-to-end
-    // test, we implement a single-head simplified variant:
-    //   Q = W_Q[0] * normed_x  (single output dimension)
-    //   K = W_K[0] * normed_x
-    //   V = W_V[0] * normed_x
-    //   score = Q · K (ct*ct + slot sum)
-    //   attn_weight = softmax_approx(score)
-    //   context = attn_weight * V (ct*ct)
-    //   output = W_O[0] * context
+    // If the block weights carry learnable gamma for the pre-attention norm,
+    // build a config that includes it.  Otherwise fall back to the original
+    // config (unit gamma).
     // -----------------------------------------------------------------------
-    let (ct_q, ct_k, ct_v) = chimera_qkv_project_single(
-        module,
-        &normed_pre_attn,
-        &weights.attention.w_q[0],
-        &weights.attention.w_k[0],
-        &weights.attention.w_v[0],
-    );
+    let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+        Some(gamma) => config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+        None => config.pre_attn_norm.clone(),
+    };
+    let normed_pre_attn = chimera_rms_norm(module, eval_key, ct_x, &pre_attn_norm_cfg);
 
-    // Attention score: Q · K^T (element-wise product + slot sum)
-    let score = chimera_attention_score(module, eval_key, &ct_q, &ct_k, 0);
+    // -----------------------------------------------------------------------
+    // Step 2: Multi-head attention
+    //
+    // For each head h (0..n_heads), we project Q/K/V using one weight row
+    // per head:
+    //   Q_h = W_Q[h] · normed_x  (polynomial ring multiplication)
+    //   K_h = W_K[h] · normed_x
+    //   V_h = W_V[h] · normed_x
+    //   score_h = Q_h · K_h (ct*ct + slot sum)
+    //   attn_h  = softmax_approx(score_h)
+    //   context_h = attn_h * V_h (ct*ct)
+    //   head_out_h = W_O[h] · context_h
+    //
+    // The final attention output is the sum of all per-head contributions:
+    //   attn_out = Σ_h head_out_h
+    //
+    // Each weight row W_Q[h] encodes the projection for head h as a
+    // polynomial. The ring multiplication computes the inner product
+    // structure over d_model coefficients. The output projection W_O[h]
+    // recombines each head's context back into the d_model space.
+    //
+    // This is the "per-head" packing strategy described in the spec:
+    // one ciphertext per head throughout the computation, with the output
+    // projection summing across heads to produce the final result.
+    // -----------------------------------------------------------------------
+    let n_heads = config.attention.dims.n_heads;
+    let attn_out = {
+        // Compute first head to initialise the accumulator
+        let (ct_q0, ct_k0, ct_v0) = chimera_qkv_project_single(
+            module,
+            &normed_pre_attn,
+            &weights.attention.w_q[0],
+            &weights.attention.w_k[0],
+            &weights.attention.w_v[0],
+        );
+        let score0 = chimera_attention_score(module, eval_key, &ct_q0, &ct_k0, 0);
+        let attn_wts0 = chimera_apply_softmax(
+            module, eval_key, &[score0], &config.attention.softmax_approx,
+        );
+        let context0 = chimera_attention_context(module, eval_key, &attn_wts0, &[ct_v0]);
+        let head_out_vec0 = chimera_output_project(module, &context0, &[weights.attention.w_o[0].clone()]);
+        let mut acc = head_out_vec0.into_iter().next()
+            .expect("output projection must produce at least one ciphertext");
 
-    // Softmax approximation on the score
-    let attn_weights = chimera_apply_softmax(
-        module,
-        eval_key,
-        &[score],
-        &config.attention.softmax_approx,
-    );
+        // Accumulate remaining heads
+        for h in 1..n_heads {
+            let (ct_q_h, ct_k_h, ct_v_h) = chimera_qkv_project_single(
+                module,
+                &normed_pre_attn,
+                &weights.attention.w_q[h],
+                &weights.attention.w_k[h],
+                &weights.attention.w_v[h],
+            );
+            let score_h = chimera_attention_score(module, eval_key, &ct_q_h, &ct_k_h, 0);
+            let attn_wts_h = chimera_apply_softmax(
+                module, eval_key, &[score_h], &config.attention.softmax_approx,
+            );
+            let context_h = chimera_attention_context(module, eval_key, &attn_wts_h, &[ct_v_h]);
+            let head_out_vec_h = chimera_output_project(module, &context_h, &[weights.attention.w_o[h].clone()]);
+            let head_out_h = head_out_vec_h.into_iter().next()
+                .expect("output projection must produce at least one ciphertext");
 
-    // Context: attn_weight * V
-    let context = chimera_attention_context(module, eval_key, &attn_weights, &[ct_v]);
+            // The head outputs may be at different layouts after tensor products.
+            // Project the accumulator to match the new head's layout before adding.
+            let head_layout = GLWELayout {
+                n: head_out_h.n(),
+                base2k: head_out_h.base2k(),
+                k: head_out_h.k(),
+                rank: head_out_h.rank(),
+            };
+            let acc_proj = if acc.base2k() == head_out_h.base2k() && acc.k() == head_out_h.k() {
+                acc
+            } else {
+                chimera_project_layout(module, &acc, &head_layout)
+            };
+            acc = chimera_add(module, &acc_proj, &head_out_h);
+        }
 
-    // Output projection: W_O[0] * context (produces one output ciphertext)
-    let attn_out_vec = chimera_output_project(module, &context, &[weights.attention.w_o[0].clone()]);
-    let attn_out = attn_out_vec.into_iter().next().expect("output projection must produce at least one ciphertext");
+        acc
+    };
 
     // -----------------------------------------------------------------------
     // Step 3: Residual connection (attention)
@@ -732,8 +789,15 @@ where
 
     // -----------------------------------------------------------------------
     // Step 4: Pre-FFN RMSNorm
+    //
+    // Same gamma wiring as step 1 — use learnable scale from the weights
+    // if available.
     // -----------------------------------------------------------------------
-    let normed_pre_ffn = chimera_rms_norm(module, eval_key, &residual_1, &config.pre_ffn_norm);
+    let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
+        Some(gamma) => config.pre_ffn_norm.clone().with_gamma(gamma.clone()),
+        None => config.pre_ffn_norm.clone(),
+    };
+    let normed_pre_ffn = chimera_rms_norm(module, eval_key, &residual_1, &pre_ffn_norm_cfg);
 
     // -----------------------------------------------------------------------
     // Step 5: FFN
@@ -834,6 +898,145 @@ where
     }
 
     current
+}
+
+/// Evaluates a sequence of transformer blocks with optional mid-inference
+/// bootstrapping to refresh the noise budget.
+///
+/// This is the production-grade forward pass. It maintains a
+/// [`NoiseTracker`] that estimates noise growth after each transformer
+/// block. When the estimated noise budget drops below the threshold in
+/// `bootstrap_config`, the ciphertext is bootstrapped before proceeding
+/// to the next layer.
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key (tensor key, auto keys).
+/// * `ct_x` - Encrypted input vector.
+/// * `config` - Block configuration (shared across all layers).
+/// * `layer_weights` - Per-layer weight matrices.
+/// * `params` - CHIMERA parameter set (used for noise budget calculation).
+/// * `bootstrap_config` - Controls when bootstrapping is triggered.
+/// * `bsk_prepared` - Prepared bootstrap key material (required if
+///   `bootstrap_config.enabled` is `true`; may be `None` otherwise).
+///
+/// # Returns
+///
+/// A tuple of:
+/// - The encrypted output after all transformer blocks.
+/// - The final [`NoiseTracker`] state (useful for diagnostics).
+///
+/// # Panics
+///
+/// Panics if bootstrapping is triggered but `bsk_prepared` is `None`.
+pub fn chimera_forward_pass_with_bootstrap<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    ct_x: &GLWE<Vec<u8>>,
+    config: &TransformerBlockConfig,
+    layer_weights: &[TransformerBlockWeights],
+    params: &ChimeraParams,
+    bootstrap_config: &BootstrappingConfig,
+    bsk_prepared: Option<&ChimeraBootstrapKeyPrepared<BE>>,
+) -> (GLWE<Vec<u8>>, NoiseTracker)
+where
+    Module<BE>: GLWETensoring<BE>
+        + GLWEMulConst<BE>
+        + GLWEAdd
+        + GLWETrace<BE>
+        + GLWEAutomorphism<BE>
+        + poulpy_hal::api::ModuleN
+        + poulpy_core::LWESampleExtract
+        + poulpy_core::LWEKeySwitch<BE>
+        + poulpy_schemes::bin_fhe::blind_rotation::BlindRotationExecute<
+            poulpy_schemes::bin_fhe::blind_rotation::CGGI,
+            BE,
+        >
+        + poulpy_schemes::bin_fhe::blind_rotation::LookupTableFactory,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    let mut current = {
+        use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+        let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(ct_x);
+        {
+            let src_ref = ct_x.to_ref();
+            let src: &[u8] = src_ref.data().data;
+            let mut dst_mut = cloned.to_mut();
+            let dst: &mut [u8] = dst_mut.data_mut().data;
+            let len = src.len().min(dst.len());
+            dst[..len].copy_from_slice(&src[..len]);
+        }
+        cloned
+    };
+
+    let mut tracker = NoiseTracker::fresh();
+    let mut bootstrap_count: usize = 0;
+
+    // Estimate the noise cost of a single transformer block for the tracker.
+    // Each block performs: 2× RMSNorm (ct*ct + mul_const + ct*ct) + attention
+    // (3× mul_const + ct*ct + softmax + ct*ct + mul_const) + FFN (mul_const
+    // + activation + mul_const) + 2× residual add.  We approximate this as
+    // several mul_ct and mul_const operations.
+    let ring_degree = params.degree.0 as usize;
+
+    for (layer_idx, weights) in layer_weights.iter().enumerate() {
+        // --- Check noise budget before this layer ---
+        if needs_bootstrap(&tracker, params, bootstrap_config) {
+            let bsk = bsk_prepared.expect(
+                "chimera_forward_pass_with_bootstrap: bootstrapping triggered \
+                 but no bootstrap key provided (bsk_prepared is None)"
+            );
+
+            // Respect max_bootstraps_per_pass limit
+            if bootstrap_config.max_bootstraps_per_pass == 0
+                || bootstrap_count < bootstrap_config.max_bootstraps_per_pass
+            {
+                current = chimera_bootstrap(
+                    module,
+                    &current,
+                    &mut tracker,
+                    params,
+                    bsk,
+                    bootstrap_config,
+                );
+                bootstrap_count += 1;
+            }
+            // If we've hit the limit, we continue without bootstrapping
+            // (the computation may produce incorrect results, but we don't
+            // panic — the caller should check the tracker's budget).
+        }
+
+        // --- Evaluate transformer block ---
+        current = chimera_transformer_block(module, eval_key, &current, config, weights);
+
+        // --- Update noise tracker with approximate cost of one block ---
+        //
+        // A transformer block's dominant noise sources are:
+        //   - Pre-attn RMSNorm: 1 ct*ct (square) + 1 ct*ct (normalise) = 2 depth
+        //   - Attention: 1 ct*ct (score) + 1 ct*ct (context) = 2 depth
+        //   - Pre-FFN RMSNorm: 2 depth (same as pre-attn)
+        //   - FFN: 1-2 ct*ct (activation + optional SwiGLU element-wise) = 1-2 depth
+        // Total: ~7-8 ct*ct multiplications per block.
+        //
+        // We model this as a sequence of ct*ct multiplications applied to
+        // a fresh tracker (representing the "other operand" each time).
+        let block_ct_ct_muls = match &config.ffn {
+            FFNConfig::SwiGLU => 8,    // 2 (norm) + 2 (attn) + 2 (norm) + 2 (silu + ew)
+            FFNConfig::Standard { activation } => {
+                6 + activation.depth() // 2 (norm) + 2 (attn) + 2 (norm) + activation
+            }
+        };
+        for _ in 0..block_ct_ct_muls {
+            let other = NoiseTracker::fresh();
+            tracker.mul_ct(&other, ring_degree);
+        }
+
+        let _ = layer_idx;
+    }
+
+    (current, tracker)
 }
 
 #[cfg(test)]

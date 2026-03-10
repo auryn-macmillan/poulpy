@@ -684,11 +684,18 @@ where
     // Extracts coefficient 0 from the GLWE ciphertext into an LWE
     // ciphertext of dimension N, under the same ternary key.
     // No key-switch is performed; this is just a format conversion.
+    //
+    // The LWE layout must match the *actual* ciphertext's base2k and k,
+    // which may differ from the bootstrap params if the ciphertext has
+    // been through tensor products and rescaling.
     // -----------------------------------------------------------------------
+    use poulpy_core::layouts::LWEInfos;
+    let ct_base2k = ct.base2k();
+    let ct_k = ct.k();
     let lwe_big_layout = LWELayout {
         n: Degree(n_glwe as u32),
-        k: TorusPrecision(bp.k_lwe_big as u32),
-        base2k: Base2K(bp.base2k_lwe_big as u32),
+        k: ct_k,
+        base2k: ct_base2k,
     };
 
     let mut lwe_big = LWE::<Vec<u8>>::alloc_from_infos(&lwe_big_layout);

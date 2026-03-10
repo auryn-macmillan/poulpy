@@ -467,6 +467,270 @@ where
     chimera_matmul_single_ct(module, ct_context, w_o_rows)
 }
 
+/// Computes multi-head attention on an encrypted input vector.
+///
+/// This is the full multi-head attention implementation. For each head:
+/// 1. Project Q, K, V using weight rows `[h*d_head..(h+1)*d_head]`
+/// 2. Compute attention score: dot product of Q_h and K_h vectors
+/// 3. Apply softmax approximation
+/// 4. Compute context: weighted sum of V_h values
+///
+/// After all heads are computed, the per-head context vectors are concatenated
+/// into a single `d_model`-length vector of ciphertexts, and the output
+/// projection W_O is applied.
+///
+/// ## Weight Layout
+///
+/// The weight matrices W_Q, W_K, W_V are `[d_model × d_model]` where:
+/// - Rows `[h*d_head..(h+1)*d_head]` correspond to head `h`
+/// - Each row is a `d_model`-length polynomial weight vector
+///
+/// W_O is `[d_model × d_model]` and is applied to the concatenated output.
+///
+/// ## Packing Strategy
+///
+/// Each QKV projection output is a separate ciphertext (one per output
+/// dimension). Within a head, Q_h / K_h / V_h each consist of `d_head`
+/// ciphertexts. The attention score for each head is computed by:
+/// - Element-wise ct*ct multiplying corresponding Q and K ciphertexts
+/// - Accumulating with chimera_add to compute the dot product
+///
+/// This "per-dimension packing" approach avoids the need for automorphism-based
+/// head splitting/concatenation, at the cost of more ciphertexts in flight.
+///
+/// ## Sequence Length = 1 (Single Token)
+///
+/// For single-token inference (batch_size=1, seq_len=1), Q, K, V each have
+/// a single "position". The attention score is a scalar (Q · K^T), the
+/// softmax is trivially 1, and the context equals V. This simplification
+/// means the main cost is in the QKV and output projections.
+///
+/// For seq_len > 1, the KV cache would be used (not yet implemented).
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key (tensor key for ct*ct, auto keys for trace).
+/// * `ct_x` - Encrypted input vector (single ciphertext, d_model coefficients).
+/// * `weights` - Attention weight matrices (W_Q, W_K, W_V, W_O).
+/// * `config` - Attention configuration (dims, softmax strategy, etc.).
+///
+/// # Returns
+///
+/// A vector of `d_model` ciphertexts representing the attention output, one
+/// per output dimension.
+///
+/// # Panics
+///
+/// Panics if `d_model != n_heads * d_head` or if weight dimensions are
+/// inconsistent.
+pub fn chimera_multi_head_attention<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    ct_x: &GLWE<Vec<u8>>,
+    weights: &AttentionWeights,
+    config: &AttentionConfig,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    let d_model = config.dims.d_model;
+    let n_heads = config.dims.n_heads;
+    let d_head = config.dims.d_head;
+
+    assert_eq!(
+        d_model,
+        n_heads * d_head,
+        "chimera_multi_head_attention: d_model ({d_model}) != n_heads ({n_heads}) * d_head ({d_head})"
+    );
+    assert!(
+        weights.w_q.len() >= d_model,
+        "chimera_multi_head_attention: w_q has {} rows, need {d_model}",
+        weights.w_q.len()
+    );
+    assert!(
+        weights.w_k.len() >= d_model,
+        "chimera_multi_head_attention: w_k has {} rows, need {d_model}",
+        weights.w_k.len()
+    );
+    assert!(
+        weights.w_v.len() >= d_model,
+        "chimera_multi_head_attention: w_v has {} rows, need {d_model}",
+        weights.w_v.len()
+    );
+    assert!(
+        weights.w_o.len() >= d_model,
+        "chimera_multi_head_attention: w_o has {} rows, need {d_model}",
+        weights.w_o.len()
+    );
+
+    // -----------------------------------------------------------------------
+    // Step 1: QKV projections for ALL heads at once.
+    //
+    // Q = W_Q · x produces d_model ciphertexts (one per output dimension).
+    // Rows [h*d_head..(h+1)*d_head] belong to head h.
+    // -----------------------------------------------------------------------
+    let (q_all, k_all, v_all) = chimera_qkv_project(module, ct_x, weights, d_model);
+
+    // -----------------------------------------------------------------------
+    // Step 2: Per-head attention computation.
+    //
+    // For each head h:
+    //   Q_h = q_all[h*d_head..(h+1)*d_head]  (d_head ciphertexts)
+    //   K_h = k_all[h*d_head..(h+1)*d_head]
+    //   V_h = v_all[h*d_head..(h+1)*d_head]
+    //
+    //   score_h = Σ_i Q_h[i] * K_h[i]   (dot product: d_head ct*ct muls + additions)
+    //   attn_h  = softmax(score_h)        (single score for seq_len=1)
+    //   context_h = attn_h * V_h          (d_head ct*ct muls)
+    // -----------------------------------------------------------------------
+    let mut all_head_contexts: Vec<GLWE<Vec<u8>>> = Vec::with_capacity(d_model);
+
+    for h in 0..n_heads {
+        let start = h * d_head;
+        let end = start + d_head;
+
+        let q_h = &q_all[start..end];
+        let k_h = &k_all[start..end];
+        let v_h = &v_all[start..end];
+
+        // Compute attention score for this head:
+        // score_h = Σ_i Q_h[i] ⊙ K_h[i]
+        //
+        // Each Q_h[i] and K_h[i] are ciphertexts encoding a single projected
+        // dimension. Their ct*ct product gives that dimension's contribution to
+        // the score. We accumulate all d_head contributions.
+        let head_context = chimera_single_head_attention(
+            module, eval_key, q_h, k_h, v_h, &config.softmax_approx,
+        );
+
+        // head_context is a Vec of d_head ciphertexts
+        all_head_contexts.extend(head_context);
+    }
+
+    assert_eq!(
+        all_head_contexts.len(),
+        d_model,
+        "multi_head_attention: concatenated heads should produce {d_model} ciphertexts, got {}",
+        all_head_contexts.len()
+    );
+
+    // -----------------------------------------------------------------------
+    // Step 3: Output projection — W_O · concat(head_0, ..., head_{n-1})
+    //
+    // The concatenated head outputs form a d_model-length vector of cts.
+    // W_O is [d_model × d_model]. Each output dimension i is:
+    //   output_i = Σ_j W_O[i][j] * context[j]
+    //
+    // This is a ct-pt matrix-vector product using chimera_dot_product.
+    // -----------------------------------------------------------------------
+    let mut outputs = Vec::with_capacity(d_model);
+    for row in weights.w_o.iter().take(d_model) {
+        // Each W_O row is d_model scalars. Convert to single-coefficient weight vecs.
+        let w_vecs: Vec<Vec<i64>> = row.iter().map(|&w| vec![w]).collect();
+        let dot = crate::arithmetic::chimera_dot_product(module, &all_head_contexts, &w_vecs);
+        outputs.push(dot);
+    }
+
+    outputs
+}
+
+/// Computes attention for a single head given pre-projected Q, K, V vectors.
+///
+/// This is the inner loop of multi-head attention. Given `d_head` ciphertexts
+/// each for Q, K, V (one per projected dimension), this function:
+///
+/// 1. Computes the attention score as a dot product: `score = Σ_i Q[i] * K[i]`
+/// 2. Applies the softmax approximation to the score
+/// 3. Computes the context: `context[j] = attn_weight * V[j]` for each j
+///
+/// For single-token inference (seq_len=1), there is only one query-key pair,
+/// so the score is a single scalar and the softmax is trivially 1.0.
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key.
+/// * `q_h` - Query ciphertexts for this head (d_head elements).
+/// * `k_h` - Key ciphertexts for this head (d_head elements).
+/// * `v_h` - Value ciphertexts for this head (d_head elements).
+/// * `softmax` - Softmax approximation strategy.
+///
+/// # Returns
+///
+/// A vector of `d_head` ciphertexts representing the context for this head.
+///
+/// # Panics
+///
+/// Panics if Q, K, V have different lengths or are empty.
+pub fn chimera_single_head_attention<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    q_h: &[GLWE<Vec<u8>>],
+    k_h: &[GLWE<Vec<u8>>],
+    v_h: &[GLWE<Vec<u8>>],
+    softmax: &SoftmaxStrategy,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    let d_head = q_h.len();
+    assert_eq!(d_head, k_h.len(), "Q and K must have same length");
+    assert_eq!(d_head, v_h.len(), "Q and V must have same length");
+    assert!(d_head > 0, "head dimension must be > 0");
+
+    // -----------------------------------------------------------------------
+    // Score computation: score = Σ_i Q[i] * K[i]
+    //
+    // Each Q[i] and K[i] are ciphertexts from the QKV projection. Their
+    // ct*ct product (tensor product + relinearization) gives dimension i's
+    // contribution. We accumulate all d_head terms via chimera_add.
+    //
+    // Note: chimera_ct_mul performs the tensor product at the full polynomial
+    // level (all N coefficients), so the product encodes the negacyclic
+    // convolution. For single-coefficient-per-ct projections (when each
+    // Q[i]/K[i] encodes a scalar in coefficient 0), the product's coefficient 0
+    // is exactly Q[i]*K[i].
+    // -----------------------------------------------------------------------
+    let mut score = chimera_ct_mul(module, eval_key, &q_h[0], &k_h[0]);
+    for i in 1..d_head {
+        let term = chimera_ct_mul(module, eval_key, &q_h[i], &k_h[i]);
+        score = chimera_add(module, &score, &term);
+    }
+
+    // -----------------------------------------------------------------------
+    // Softmax approximation on the score.
+    //
+    // For seq_len=1, there's only one score, so softmax is trivially 1.0
+    // for the PolynomialDeg4 and ReluSquared strategies (p(x)/p(x) = 1).
+    // For the Linear strategy, we pass the raw score through.
+    //
+    // We apply the softmax polynomial to remain consistent with the depth
+    // accounting (even though it's a no-op for single-position attention).
+    // -----------------------------------------------------------------------
+    let attn_weights = chimera_apply_softmax(module, eval_key, &[score], softmax);
+    let attn_weight = &attn_weights[0];
+
+    // -----------------------------------------------------------------------
+    // Context computation: context[j] = attn_weight * V[j]
+    //
+    // The attention weight is a scalar (replicated in coefficient 0 after
+    // the score computation). For each value dimension j, we compute the
+    // ct*ct product of the weight and V[j].
+    // -----------------------------------------------------------------------
+    let mut context = Vec::with_capacity(d_head);
+    for j in 0..d_head {
+        let ctx_j = chimera_ct_mul(module, eval_key, attn_weight, &v_h[j]);
+        context.push(ctx_j);
+    }
+
+    context
+}
+
 /// Evaluates polynomial softmax on plaintext scores (for verification).
 ///
 /// poly_softmax(x_i) = p(x_i) / Σ_j p(x_j)

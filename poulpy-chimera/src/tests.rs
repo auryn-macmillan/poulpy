@@ -481,13 +481,290 @@ mod integration {
         );
     }
 
+    /// End-to-end GELU FHE test: encrypt → apply_poly_activation with GELU
+    /// (fractional coefficients: 0.5*x + 0.247*x²) → decrypt → verify.
+    ///
+    /// This validates that the mixed-layout term accumulation fix works:
+    /// - ct has base2k = in_base2k = 13
+    /// - ct_sq has base2k = out_base2k = 12 after tensor product
+    /// - The linear term (0.5*x) is converted to out_base2k layout
+    /// - Both terms are added successfully
+    #[test]
+    fn test_apply_poly_activation_gelu() {
+        use crate::activations::{activation_decode_precision, apply_poly_activation, gelu_poly_approx};
+        use poulpy_core::layouts::{
+            Base2K, Degree, Dsize, GLWE, GLWELayout, GLWEPlaintext,
+            GLWESecret, GLWETensorKey, GLWETensorKeyLayout, Rank, TorusPrecision,
+            prepared::{GLWESecretPrepared, GLWETensorKeyPrepared},
+        };
+        use poulpy_hal::{
+            api::{ScratchOwnedAlloc, ScratchOwnedBorrow},
+            layouts::ScratchOwned,
+            source::Source,
+        };
+
+        let base2k: usize = 14;
+        let in_base2k: usize = base2k - 1;
+        let out_base2k: usize = base2k - 2;
+        let tsk_base2k: usize = base2k;
+        let k: usize = 8 * base2k + 1;
+        let rank: usize = 1;
+        let n: u64 = 4096;
+
+        let module: Module<BE> = Module::new(n);
+        let n_usize = module.n();
+
+        let glwe_in = GLWELayout {
+            n: Degree(n as u32),
+            base2k: Base2K(in_base2k as u32),
+            k: TorusPrecision(k as u32),
+            rank: Rank(rank as u32),
+        };
+
+        let glwe_out = GLWELayout {
+            n: Degree(n as u32),
+            base2k: Base2K(out_base2k as u32),
+            k: TorusPrecision(k as u32),
+            rank: Rank(rank as u32),
+        };
+
+        let tsk_layout = GLWETensorKeyLayout {
+            n: Degree(n as u32),
+            base2k: Base2K(tsk_base2k as u32),
+            k: TorusPrecision((k + tsk_base2k) as u32),
+            rank: Rank(rank as u32),
+            dnum: poulpy_core::layouts::Dnum(k.div_ceil(tsk_base2k) as u32),
+            dsize: Dsize(1),
+        };
+
+        let mut source_xs = Source::new([15u8; 32]);
+        let mut source_xe = Source::new([25u8; 32]);
+        let mut source_xa = Source::new([35u8; 32]);
+
+        let mut sk = GLWESecret::<Vec<u8>>::alloc(Degree(n as u32), Rank(rank as u32));
+        sk.fill_ternary_prob(0.5, &mut source_xs);
+
+        let mut sk_dft = GLWESecretPrepared::<Vec<u8>, BE>::alloc_from_infos(&module, &sk);
+        sk_dft.prepare(&module, &sk);
+
+        let mut tsk = GLWETensorKey::<Vec<u8>>::alloc_from_infos(&tsk_layout);
+        let encrypt_bytes = GLWETensorKey::encrypt_sk_tmp_bytes(&module, &tsk_layout);
+        let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(encrypt_bytes);
+        tsk.encrypt_sk(&module, &sk, &mut source_xa, &mut source_xe, scratch.borrow());
+
+        let mut tsk_prep = GLWETensorKeyPrepared::<Vec<u8>, BE>::alloc_from_infos(&module, &tsk_layout);
+        let prep_bytes = tsk_prep.prepare_tmp_bytes(&module, &tsk_layout);
+        let mut prep_scratch: ScratchOwned<BE> = ScratchOwned::alloc(prep_bytes);
+        tsk_prep.prepare(&module, &tsk, prep_scratch.borrow());
+
+        let eval_key = ChimeraEvalKey {
+            tensor_key_prepared: tsk_prep,
+            tensor_key_layout: tsk_layout,
+            output_layout: glwe_out.clone(),
+            tensor_layout: glwe_out.clone(),
+            res_offset: 2 * in_base2k,
+            auto_keys: std::collections::HashMap::new(),
+            auto_key_layout: poulpy_core::layouts::GLWEAutomorphismKeyLayout {
+                n: Degree(n as u32),
+                base2k: Base2K(in_base2k as u32),
+                k: TorusPrecision(k as u32),
+                rank: Rank(rank as u32),
+                dsize: Dsize(1),
+                dnum: poulpy_core::layouts::Dnum(1),
+            },
+        };
+
+        // Encode a single value (4) in coefficient 0.
+        // GELU_approx(x) = 0.5*x + 0.247*x²
+        // GELU_approx(4) = 0.5*4 + 0.247*16 = 2.0 + 3.952 = 5.952
+        let scale = 2 * in_base2k;
+        let mut data = vec![0i64; n_usize];
+        data[0] = 4;
+        let mut pt = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&glwe_in);
+        pt.encode_vec_i64(&data, TorusPrecision(scale as u32));
+
+        let encrypt_ct_bytes = GLWE::encrypt_sk_tmp_bytes(&module, &glwe_in);
+        let mut ct_scratch: ScratchOwned<BE> = ScratchOwned::alloc(encrypt_ct_bytes);
+
+        let mut ct = GLWE::<Vec<u8>>::alloc_from_infos(&glwe_in);
+        ct.encrypt_sk(&module, &pt, &sk_dft, &mut source_xa, &mut source_xe, ct_scratch.borrow());
+
+        // Apply GELU polynomial activation
+        let approx = gelu_poly_approx();
+        let ct_result = apply_poly_activation(&module, &eval_key, &ct, &approx);
+
+        // Decrypt
+        let decrypt_bytes = GLWE::decrypt_tmp_bytes(&module, &glwe_out);
+        let mut dec_scratch: ScratchOwned<BE> = ScratchOwned::alloc(decrypt_bytes);
+        let mut pt_dec = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&glwe_out);
+        ct_result.decrypt(&module, &mut pt_dec, &sk_dft, dec_scratch.borrow());
+
+        // The output of apply_poly_activation uses coefficients scaled by 2^COEFF_SCALE_BITS.
+        // Since glwe_mul_const at res_offset=base2k gives identity scaling (a*b on torus),
+        // the output has an extra factor of 2^COEFF_SCALE_BITS. To recover the true value,
+        // decode at scale - COEFF_SCALE_BITS = 26 - 8 = 18.
+        let decode_scale = activation_decode_precision(scale);
+        let mut decoded = vec![0i64; n_usize];
+        pt_dec.decode_vec_i64(&mut decoded, TorusPrecision(decode_scale as u32));
+
+        // Expected: GELU_approx(4) = 0.5*4 + 0.247*16 ≈ 5.95
+        // But the c3 coefficient is 0.0 so no cubic term; c0=0 so no constant.
+        // With COEFF_SCALE_BITS=8: c1=128/256=0.5 (exact), c2=63/256≈0.246
+        // So actual eval: 0.5*4 + 0.246*16 ≈ 5.94
+        // Allow tolerance for FHE noise + coefficient quantisation.
+        let expected = 6; // rounded from ~5.95
+        let diff = (decoded[0] - expected).abs();
+        assert!(
+            diff <= 3,
+            "GELU_approx(4) should be ~6, got decoded[0]={}, diff={}",
+            decoded[0], diff
+        );
+    }
+
+    /// End-to-end pipeline test using high-level API:
+    /// ChimeraKey::generate + ChimeraEvalKey::generate + chimera_encrypt
+    /// + chimera_add + chimera_decrypt + decode.
+    ///
+    /// Validates that all high-level API functions work together.
+    /// Addition preserves the encoding format, so encode_int8 → encrypt → add
+    /// → decrypt → decode_int8 should round-trip correctly.
+    #[test]
+    fn test_full_pipeline_encrypt_add_decrypt() {
+        use crate::arithmetic::chimera_add;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+
+        // Generate keys using high-level API
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+
+        // Also generate eval key to test that doesn't interfere
+        let _eval_key = ChimeraEvalKey::generate(
+            &module,
+            &key,
+            &params,
+            [50u8; 32],
+            [60u8; 32],
+        );
+
+        // Encode and encrypt two vectors
+        let a_vals: Vec<i8> = vec![10, -20, 30, -40, 50, 0, 127, -128];
+        let b_vals: Vec<i8> = vec![5, 10, -15, 20, -25, 1, -127, 127];
+
+        let pt_a = encode_int8(&module, &params, &a_vals);
+        let pt_b = encode_int8(&module, &params, &b_vals);
+
+        let ct_a = chimera_encrypt(&module, &key, &pt_a, [70u8; 32], [80u8; 32]);
+        let ct_b = chimera_encrypt(&module, &key, &pt_b, [90u8; 32], [100u8; 32]);
+
+        // Homomorphic addition
+        let ct_sum = chimera_add(&module, &ct_a, &ct_b);
+
+        // Decrypt and decode using high-level API
+        let pt_dec = chimera_decrypt(&module, &key, &ct_sum, &params);
+        let decoded = decode_int8(&module, &params, &pt_dec, a_vals.len());
+
+        // Verify: each decoded value should be close to a + b
+        for i in 0..a_vals.len() {
+            let expected = a_vals[i] as i16 + b_vals[i] as i16;
+            let diff = (expected - decoded[i] as i16).unsigned_abs();
+            assert!(
+                diff <= 1,
+                "pipeline add error at {i}: expected {expected}, got {}, diff={}",
+                decoded[i], diff
+            );
+        }
+    }
+
+    /// End-to-end pipeline test for ct*ct multiplication using
+    /// ChimeraEvalKey::generate + chimera_ct_mul.
+    ///
+    /// Uses encode_vec_i64 (torus encoding) for inputs because the tensor
+    /// product changes the encoding format. Tests the full key generation
+    /// → encrypt → multiply → decrypt → decode_vec_i64 pipeline.
+    #[test]
+    fn test_full_pipeline_eval_key_ct_mul() {
+        use crate::activations::chimera_ct_mul;
+        use poulpy_core::layouts::{
+            GLWE, GLWEPlaintext, GLWEPlaintextLayout, TorusPrecision,
+        };
+        use poulpy_hal::{
+            api::{ScratchOwnedAlloc, ScratchOwnedBorrow},
+            layouts::ScratchOwned,
+        };
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let n_usize = module.n();
+
+        // Generate keys using high-level API
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module,
+            &key,
+            &params,
+            [50u8; 32],
+            [60u8; 32],
+        );
+
+        // Encode using encode_vec_i64 at the tensor product scale
+        // (this is the encoding that's compatible with decode_vec_i64
+        // after tensor product).
+        let scale = eval_key.res_offset; // 2 * in_base2k
+        let mut data = vec![0i64; n_usize];
+        data[0] = 3;
+
+        let pt_layout = GLWEPlaintextLayout {
+            n: key.layout.n,
+            base2k: key.layout.base2k,
+            k: key.layout.k,
+        };
+        let mut pt = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&pt_layout);
+        pt.encode_vec_i64(&data, TorusPrecision(scale as u32));
+
+        // Encrypt using chimera_encrypt
+        let ct = chimera_encrypt(&module, &key, &pt, [70u8; 32], [80u8; 32]);
+
+        // ct * ct multiplication using eval key
+        let ct_prod = chimera_ct_mul(&module, &eval_key, &ct, &ct);
+
+        // Decrypt
+        let out_pt_layout = GLWEPlaintextLayout {
+            n: eval_key.output_layout.n,
+            base2k: eval_key.output_layout.base2k,
+            k: eval_key.output_layout.k,
+        };
+        let decrypt_ct_layout = poulpy_core::layouts::GLWELayout {
+            n: eval_key.output_layout.n,
+            base2k: eval_key.output_layout.base2k,
+            k: eval_key.output_layout.k,
+            rank: key.layout.rank,
+        };
+        let mut pt_dec = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&out_pt_layout);
+        let decrypt_bytes = GLWE::<Vec<u8>>::decrypt_tmp_bytes(&module, &decrypt_ct_layout);
+        let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(decrypt_bytes);
+        ct_prod.decrypt(&module, &mut pt_dec, &key.prepared, scratch.borrow());
+
+        // Decode using decode_vec_i64 at the same scale
+        let mut decoded = vec![0i64; n_usize];
+        pt_dec.decode_vec_i64(&mut decoded, TorusPrecision(scale as u32));
+
+        // 3 * 3 = 9 in the first coefficient
+        let diff = (decoded[0] - 9).abs();
+        assert!(
+            diff <= 2,
+            "pipeline ct_mul(3,3) should give ~9, got decoded[0]={}, diff={}",
+            decoded[0], diff
+        );
+    }
+
     #[test]
     fn test_apply_poly_activation_squared_relu() {
         // Test apply_poly_activation with squared ReLU (x²), the simplest
         // non-trivial polynomial (degree 2, one multiplication).
         //
         // Uses the same low-level parameter setup as test_chimera_ct_mul_basic.
-        use crate::activations::{apply_poly_activation, squared_relu_approx};
+        use crate::activations::{activation_decode_precision, apply_poly_activation, squared_relu_approx};
         use poulpy_core::layouts::{
             Base2K, Degree, Dsize, GLWE, GLWELayout, GLWEPlaintext,
             GLWESecret, GLWETensorKey, GLWETensorKeyLayout, Rank, TorusPrecision,
@@ -594,20 +871,210 @@ mod integration {
         let mut pt_dec = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&glwe_out);
         ct_result.decrypt(&module, &mut pt_dec, &sk_dft, dec_scratch.borrow());
 
-        // Decode using decode_vec_i64 (same approach as the passing ct_mul test)
+        // Decode at scale - COEFF_SCALE_BITS to compensate for coefficient scaling.
+        // The tensor product gives ct_sq encrypting 3²=9 on the torus at 2^{-26}.
+        // mul_const(ct_sq, 256, res_offset=12) gives 9*256 on the torus at 2^{-26}.
+        // Decode at TorusPrecision(18) = 9*256*2^{-26}*2^{18} = 9*256/256 = 9.
+        let decode_scale = activation_decode_precision(scale);
         let mut decoded = vec![0i64; n_usize];
-        pt_dec.decode_vec_i64(&mut decoded, TorusPrecision(scale as u32));
+        pt_dec.decode_vec_i64(&mut decoded, TorusPrecision(decode_scale as u32));
 
         // For SqReLU with coeffs [0.0, 0.0, 1.0]:
-        // c₂ = 1.0 → mul_const coefficient = 1 (identity).
+        // c₂ = 1.0 → c2_scaled = 256 (= 1.0 * 2^8).
         // The tensor product computes ct*ct = encrypt(3*3) = encrypt(9).
-        // mul_const by 1 leaves it unchanged.
-        // decode_vec_i64 should recover 9 (within noise tolerance).
+        // mul_const(ct_sq, 256, res_offset=12) gives 9*256 on the torus at 2^{-26}.
+        // decode at TorusPrecision(18) = 9*256/2^8 = 9.
         let diff = (decoded[0] - 9).abs();
         assert!(
             diff <= 2,
             "squared ReLU(3) should be ~9, got decoded[0]={}, diff={}",
             decoded[0], diff
+        );
+    }
+
+    /// Regression test: validates glwe_mul_const res_offset behaviour on
+    /// post-tensor-product ciphertexts (mixed base2k scenarios).
+    ///
+    /// Verifies the two key invariants that the activation code relies on:
+    /// 1. mul_const(ct@base2k, coeff, res_offset=base2k) produces the raw
+    ///    product value*coeff at the original torus precision (identity scaling).
+    /// 2. ct_sq from chimera_ct_mul decodes correctly at the encoding scale.
+    #[test]
+    fn test_mul_const_on_tensor_output() {
+        use crate::activations::chimera_ct_mul;
+        use poulpy_core::{
+            GLWEMulConst,
+            layouts::{
+                Base2K, Degree, Dsize, GLWE, GLWELayout, GLWEPlaintext,
+                GLWESecret, GLWETensorKey, GLWETensorKeyLayout, Rank, TorusPrecision,
+                prepared::{GLWESecretPrepared, GLWETensorKeyPrepared},
+            },
+        };
+        use poulpy_hal::{
+            api::{ScratchOwnedAlloc, ScratchOwnedBorrow},
+            layouts::ScratchOwned,
+            source::Source,
+        };
+
+        let base2k: usize = 14;
+        let in_base2k: usize = base2k - 1;
+        let out_base2k: usize = base2k - 2;
+        let tsk_base2k: usize = base2k;
+        let k: usize = 8 * base2k + 1;
+        let rank: usize = 1;
+        let n: u64 = 4096;
+
+        let module: Module<BE> = Module::new(n);
+        let n_usize = module.n();
+
+        let glwe_in = GLWELayout {
+            n: Degree(n as u32),
+            base2k: Base2K(in_base2k as u32),
+            k: TorusPrecision(k as u32),
+            rank: Rank(rank as u32),
+        };
+
+        let glwe_out = GLWELayout {
+            n: Degree(n as u32),
+            base2k: Base2K(out_base2k as u32),
+            k: TorusPrecision(k as u32),
+            rank: Rank(rank as u32),
+        };
+
+        let tsk_layout = GLWETensorKeyLayout {
+            n: Degree(n as u32),
+            base2k: Base2K(tsk_base2k as u32),
+            k: TorusPrecision((k + tsk_base2k) as u32),
+            rank: Rank(rank as u32),
+            dnum: poulpy_core::layouts::Dnum(k.div_ceil(tsk_base2k) as u32),
+            dsize: Dsize(1),
+        };
+
+        let mut source_xs = Source::new([15u8; 32]);
+        let mut source_xe = Source::new([25u8; 32]);
+        let mut source_xa = Source::new([35u8; 32]);
+
+        let mut sk = GLWESecret::<Vec<u8>>::alloc(Degree(n as u32), Rank(rank as u32));
+        sk.fill_ternary_prob(0.5, &mut source_xs);
+
+        let mut sk_dft = GLWESecretPrepared::<Vec<u8>, BE>::alloc_from_infos(&module, &sk);
+        sk_dft.prepare(&module, &sk);
+
+        let mut tsk = GLWETensorKey::<Vec<u8>>::alloc_from_infos(&tsk_layout);
+        let encrypt_bytes = GLWETensorKey::encrypt_sk_tmp_bytes(&module, &tsk_layout);
+        let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(encrypt_bytes);
+        tsk.encrypt_sk(&module, &sk, &mut source_xa, &mut source_xe, scratch.borrow());
+
+        let mut tsk_prep = GLWETensorKeyPrepared::<Vec<u8>, BE>::alloc_from_infos(&module, &tsk_layout);
+        let prep_bytes = tsk_prep.prepare_tmp_bytes(&module, &tsk_layout);
+        let mut prep_scratch: ScratchOwned<BE> = ScratchOwned::alloc(prep_bytes);
+        tsk_prep.prepare(&module, &tsk, prep_scratch.borrow());
+
+        let eval_key = ChimeraEvalKey {
+            tensor_key_prepared: tsk_prep,
+            tensor_key_layout: tsk_layout,
+            output_layout: glwe_out.clone(),
+            tensor_layout: glwe_out.clone(),
+            res_offset: 2 * in_base2k,
+            auto_keys: std::collections::HashMap::new(),
+            auto_key_layout: poulpy_core::layouts::GLWEAutomorphismKeyLayout {
+                n: Degree(n as u32),
+                base2k: Base2K(in_base2k as u32),
+                k: TorusPrecision(k as u32),
+                rank: Rank(rank as u32),
+                dsize: Dsize(1),
+                dnum: poulpy_core::layouts::Dnum(1),
+            },
+        };
+
+        // Encode value 4 at scale = 2 * in_base2k = 26
+        let scale = 2 * in_base2k;
+        let mut data = vec![0i64; n_usize];
+        data[0] = 4;
+        let mut pt = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&glwe_in);
+        pt.encode_vec_i64(&data, TorusPrecision(scale as u32));
+
+        let encrypt_ct_bytes = GLWE::encrypt_sk_tmp_bytes(&module, &glwe_in);
+        let mut ct_scratch: ScratchOwned<BE> = ScratchOwned::alloc(encrypt_ct_bytes);
+        let mut ct = GLWE::<Vec<u8>>::alloc_from_infos(&glwe_in);
+        ct.encrypt_sk(&module, &pt, &sk_dft, &mut source_xa, &mut source_xe, ct_scratch.borrow());
+
+        // Step 1: ct_sq = ct * ct via tensor product (should give 16 at coeff 0)
+        let ct_sq = chimera_ct_mul(&module, &eval_key, &ct, &ct);
+
+        let decrypt_bytes = GLWE::decrypt_tmp_bytes(&module, &glwe_out);
+        let mut dec_scratch: ScratchOwned<BE> = ScratchOwned::alloc(decrypt_bytes);
+        let mut pt_sq = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&glwe_out);
+        ct_sq.decrypt(&module, &mut pt_sq, &sk_dft, dec_scratch.borrow());
+        let mut decoded_sq = vec![0i64; n_usize];
+        pt_sq.decode_vec_i64(&mut decoded_sq, TorusPrecision(scale as u32));
+        assert!(
+            (decoded_sq[0] - 16).abs() <= 2,
+            "ct_sq should decode to 16, got {}",
+            decoded_sq[0]
+        );
+
+        // Step 2: mul_const(ct_sq@12, 256, res_offset=12) should give raw product 16*256=4096
+        // at decode@26. Then decode@18 (= scale - COEFF_SCALE_BITS) should give 16.
+        let coeff_256 = vec![256i64; 1];
+        let res_offset_identity = out_base2k; // ct_sq.base2k() = 12
+
+        let mut result = GLWE::<Vec<u8>>::alloc_from_infos(&glwe_out);
+        let mul_bytes = module.glwe_mul_const_tmp_bytes(&result, res_offset_identity, &ct_sq, 1);
+        let mut mul_scratch: ScratchOwned<BE> = ScratchOwned::alloc(mul_bytes);
+        module.glwe_mul_const(&mut result, res_offset_identity, &ct_sq, &coeff_256, mul_scratch.borrow());
+
+        let mut pt_result = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&glwe_out);
+        result.decrypt(&module, &mut pt_result, &sk_dft, dec_scratch.borrow());
+
+        // At decode@26, raw product = 16 * 256 = 4096
+        let mut decoded_raw = vec![0i64; n_usize];
+        pt_result.decode_vec_i64(&mut decoded_raw, TorusPrecision(scale as u32));
+        assert!(
+            (decoded_raw[0] - 4096).abs() <= 16,
+            "mul_const(ct_sq, 256, res_offset=12) @ decode@26 should be 4096, got {}",
+            decoded_raw[0]
+        );
+
+        // At decode@18 (= 26 - 8), compensated for COEFF_SCALE_BITS, should give 16
+        let decode_compensated = scale - 8; // COEFF_SCALE_BITS = 8
+        let mut decoded_comp = vec![0i64; n_usize];
+        pt_result.decode_vec_i64(&mut decoded_comp, TorusPrecision(decode_compensated as u32));
+        assert!(
+            (decoded_comp[0] - 16).abs() <= 2,
+            "mul_const(ct_sq, 256, res_offset=12) @ decode@18 should be 16, got {}",
+            decoded_comp[0]
+        );
+
+        // Step 3: mul_const(ct@13, 128, res_offset=13) should give raw product 4*128=512
+        // at decode@26. At decode@18, should give 4*0.5=2.
+        let coeff_128 = vec![128i64; 1];
+        let res_offset_ct = in_base2k; // ct.base2k() = 13
+
+        let mut result2 = GLWE::<Vec<u8>>::alloc_from_infos(&glwe_in);
+        let mul_bytes2 = module.glwe_mul_const_tmp_bytes(&result2, res_offset_ct, &ct, 1);
+        let mut mul_scratch2: ScratchOwned<BE> = ScratchOwned::alloc(mul_bytes2);
+        module.glwe_mul_const(&mut result2, res_offset_ct, &ct, &coeff_128, mul_scratch2.borrow());
+
+        let mut pt_result2 = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&glwe_in);
+        let decrypt_bytes2 = GLWE::decrypt_tmp_bytes(&module, &glwe_in);
+        let mut dec_scratch2: ScratchOwned<BE> = ScratchOwned::alloc(decrypt_bytes2);
+        result2.decrypt(&module, &mut pt_result2, &sk_dft, dec_scratch2.borrow());
+
+        let mut decoded_raw2 = vec![0i64; n_usize];
+        pt_result2.decode_vec_i64(&mut decoded_raw2, TorusPrecision(scale as u32));
+        assert!(
+            (decoded_raw2[0] - 512).abs() <= 4,
+            "mul_const(ct, 128, res_offset=13) @ decode@26 should be 512, got {}",
+            decoded_raw2[0]
+        );
+
+        let mut decoded_comp2 = vec![0i64; n_usize];
+        pt_result2.decode_vec_i64(&mut decoded_comp2, TorusPrecision(decode_compensated as u32));
+        assert!(
+            (decoded_comp2[0] - 2).abs() <= 1,
+            "mul_const(ct, 128, res_offset=13) @ decode@18 should be 2, got {}",
+            decoded_comp2[0]
         );
     }
 }

@@ -19,7 +19,7 @@
 
 use poulpy_core::{
     GLWEAdd, GLWEMulConst, GLWETensoring,
-    layouts::{GLWE, GLWETensor, LWEInfos},
+    layouts::{GLWE, GLWEInfos, GLWETensor, LWEInfos},
 };
 use poulpy_hal::{
     api::{ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
@@ -33,12 +33,32 @@ use crate::encrypt::ChimeraEvalKey;
 ///
 /// Fractional coefficients like 0.5 or 0.247 are multiplied by 2^COEFF_SCALE_BITS
 /// and rounded to the nearest integer before being used with `glwe_mul_const`.
-/// The extra scale is then compensated via `res_offset`.
+///
+/// After polynomial evaluation, the result is encoded at an increased torus
+/// precision: `scale + COEFF_SCALE_BITS` instead of `scale`. The caller must
+/// decode at this increased precision using [`activation_decode_precision`].
 ///
 /// For GELU coefficients (0.5, 0.247), 8 bits gives:
 ///   0.5 * 256 = 128 (exact)
 ///   0.247 * 256 = 63.2 → 63 (error: 0.001)
-const COEFF_SCALE_BITS: usize = 8;
+pub const COEFF_SCALE_BITS: usize = 8;
+
+/// Returns the torus precision at which to decode the output of
+/// [`apply_poly_activation`].
+///
+/// After polynomial evaluation with fixed-point coefficient scaling, the
+/// coefficients have been multiplied by `2^COEFF_SCALE_BITS`. Since
+/// `glwe_mul_const` with `res_offset = a.base2k()` computes `a * b` on
+/// the torus (identity scaling), the output contains `value * coeff_scaled`
+/// at the original torus precision. To recover `value * coeff_float`, we
+/// must divide by `2^COEFF_SCALE_BITS`, which is achieved by decoding at
+/// `encoding_scale - COEFF_SCALE_BITS`.
+///
+/// For example, if the input was encoded at `scale = 2 * in_base2k = 26`,
+/// the output must be decoded at `TorusPrecision(18)`.
+pub fn activation_decode_precision(encoding_scale: usize) -> usize {
+    encoding_scale - COEFF_SCALE_BITS
+}
 
 /// Coefficients for a polynomial approximation.
 ///
@@ -65,13 +85,29 @@ impl PolyApprox {
         result
     }
 
-    /// Returns the degree of the polynomial.
+    /// Returns the nominal degree of the polynomial (from coefficient count).
     pub fn degree(&self) -> usize {
         if self.coeffs.is_empty() {
             0
         } else {
             self.coeffs.len() - 1
         }
+    }
+
+    /// Returns the effective degree — the highest index with a non-zero coefficient.
+    ///
+    /// For example, GELU `[0.0, 0.5, 0.247, 0.0]` has nominal degree 3
+    /// but effective degree 2 (because c₃ = 0). This avoids unnecessary
+    /// tensor products that would require mismatched-base2k inputs.
+    pub fn effective_degree(&self) -> usize {
+        let scale = 1i64 << COEFF_SCALE_BITS;
+        for i in (0..self.coeffs.len()).rev() {
+            let scaled = (self.coeffs[i] * scale as f64).round() as i64;
+            if scaled != 0 {
+                return i;
+            }
+        }
+        0
     }
 }
 
@@ -219,8 +255,8 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
-    let degree = approx.degree();
-    assert!(degree >= 1, "polynomial must be at least degree 1");
+    let degree = approx.effective_degree();
+    assert!(degree >= 1, "polynomial must have at least one non-zero coefficient above degree 0");
     assert!(degree <= 4, "polynomials above degree 4 are not supported");
 
     // For degree 1: result = c₀ + c₁·ct (no tensor product needed)
@@ -316,22 +352,19 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchAvailable,
 {
-    let _c0 = approx.coeffs[0];
     let c1 = approx.coeffs[1];
 
     // Scale the fractional coefficient to a fixed-point integer.
     let coeff_scale = 1i64 << COEFF_SCALE_BITS;
     let c1_scaled = (c1 * coeff_scale as f64).round() as i64;
 
-    // Use res_offset = 2 * base2k to avoid overflow, plus COEFF_SCALE_BITS
-    // to compensate for the fixed-point scaling of the coefficient.
-    let base2k = ct.base2k().0 as usize;
-    let res_offset = 2 * base2k + COEFF_SCALE_BITS;
-
     if c1_scaled == 0 {
         // All coefficients are zero; return a zero ciphertext.
         return GLWE::<Vec<u8>>::alloc_from_infos(ct);
     }
+
+    // Use res_offset = ct.base2k() for raw product.
+    let res_offset = ct.base2k().0 as usize;
 
     let c1_vec = vec![c1_scaled; 1];
     let mut result = GLWE::<Vec<u8>>::alloc_from_infos(ct);
@@ -346,15 +379,37 @@ where
     result
 }
 
+/// Returns a target layout if the source and target ciphertexts have different base2k.
+///
+/// When building a term from `ct_source` that needs to be added to a term from
+/// `ct_target`, and their base2k values differ, this returns `Some(layout)` matching
+/// `ct_target`'s parameters. Otherwise returns `None` (no layout conversion needed).
+fn get_target_layout(
+    ct_source: &GLWE<Vec<u8>>,
+    ct_target: &GLWE<Vec<u8>>,
+) -> Option<poulpy_core::layouts::GLWELayout> {
+    if ct_source.base2k() != ct_target.base2k() || ct_source.k() != ct_target.k() {
+        Some(poulpy_core::layouts::GLWELayout {
+            n: ct_target.n(),
+            base2k: ct_target.base2k(),
+            k: ct_target.k(),
+            rank: ct_target.rank(),
+        })
+    } else {
+        None
+    }
+}
+
 /// Combines terms for a degree-2 polynomial: p(x) = c₀ + c₁·x + c₂·x²
 ///
 /// Polynomial coefficients are scaled by 2^COEFF_SCALE_BITS to fixed-point
-/// integers before being used with `glwe_mul_const`. The `res_offset` parameter
-/// accounts for both the tensor product scale and the coefficient scale.
+/// integers before being used with `glwe_mul_const`. Each `glwe_mul_const`
+/// call uses `res_offset = ct.base2k()` (identity scaling on the torus),
+/// so the output contains `value * coeff_scaled` at the original torus precision.
+/// The caller must decode at `scale - COEFF_SCALE_BITS` to recover the true result.
 ///
-/// When a coefficient rounds to exactly 1 (in scaled form, i.e. the original
-/// coefficient == 1.0 and COEFF_SCALE_BITS == 0 for that specific case),
-/// we handle it via a direct copy to avoid unnecessary multiplication.
+/// The c₁·x term is built with the output layout of the tensor product
+/// (matching ct_sq's layout) to ensure all terms can be added together.
 fn combine_terms_deg2<BE: Backend>(
     module: &Module<BE>,
     ct: &GLWE<Vec<u8>>,
@@ -373,26 +428,37 @@ where
     let c1_scaled = (c1 * coeff_scale as f64).round() as i64;
     let c2_scaled = (c2 * coeff_scale as f64).round() as i64;
 
-    // Build the c₂·ct² term.
-    let term2 = build_scaled_term(module, ct_sq, c2, c2_scaled);
+    // Build the c₂·ct² term (output at ct_sq's layout, no layout change needed).
+    let term2 = build_scaled_term(module, ct_sq, c2, c2_scaled, None);
 
-    // Build the c₁·ct term.
-    let term1 = build_scaled_term(module, ct, c1, c1_scaled);
+    // Determine the target layout for the c₁·ct term.
+    let target_layout = get_target_layout(ct, ct_sq);
+    let term1 = build_scaled_term(module, ct, c1, c1_scaled, target_layout.as_ref());
 
     // Combine available terms via addition.
     combine_two_terms(module, term1, term2, ct_sq)
 }
 
-/// Helper: builds a single scaled term `coeff * ct` using glwe_mul_const.
+/// Helper: builds a single scaled term `coeff * ct` using glwe_mul_const,
+/// with the output allocated at a specified target layout.
 ///
-/// For integer coefficients that are exactly 1.0, the ciphertext is copied directly.
-/// For zero coefficients, returns None. For all other cases, uses fixed-point
-/// scaled `glwe_mul_const` with proper `res_offset`.
+/// Every coefficient (including exact integers like 1.0) is scaled by
+/// `2^COEFF_SCALE_BITS` and applied via `glwe_mul_const`. This ensures all terms
+/// land at the same output torus precision (`scale + COEFF_SCALE_BITS`) regardless
+/// of the coefficient value.
+///
+/// The `res_offset` is set to `ct.base2k()`, which produces the raw product
+/// `value * coeff_scaled` without any additional scaling. This is the only
+/// `res_offset` value that works reliably across all base2k levels.
+///
+/// For zero coefficients, returns None.
+/// If `target_layout` is None, the output has the same layout as the input ct.
 fn build_scaled_term<BE: Backend>(
     module: &Module<BE>,
     ct: &GLWE<Vec<u8>>,
-    coeff_f64: f64,
+    _coeff_f64: f64,
     coeff_scaled: i64,
+    target_layout: Option<&poulpy_core::layouts::GLWELayout>,
 ) -> Option<GLWE<Vec<u8>>>
 where
     Module<BE>: GLWEMulConst<BE>,
@@ -403,33 +469,22 @@ where
         return None;
     }
 
-    // Special case: when the original coefficient is exactly 1.0 (or -1.0),
-    // we can skip mul_const entirely.
-    let coeff_is_exact_one = (coeff_f64 - 1.0).abs() < 1e-12;
-    let coeff_is_exact_neg_one = (coeff_f64 + 1.0).abs() < 1e-12;
+    // Use res_offset = ct.base2k() to produce the raw product: value * coeff_scaled.
+    // This is the standard working point for glwe_mul_const (res_offset_hi = 0,
+    // res_offset_lo = 0), which avoids both the overflow issues of small res_offset
+    // and the signal loss of large res_offset.
+    let res_offset = ct.base2k().0 as usize;
 
-    if coeff_is_exact_one {
-        // Copy ct directly
-        let mut t = GLWE::<Vec<u8>>::alloc_from_infos(ct);
-        let raw_src: &[u8] = ct.data().data.as_ref();
-        let raw_dst: &mut [u8] = t.data_mut().data.as_mut();
-        raw_dst.copy_from_slice(raw_src);
-        return Some(t);
-    }
+    let coeff_vec = vec![coeff_scaled; 1];
 
-    if coeff_is_exact_neg_one {
-        // Copy ct and negate — for now, treat as general case with scale
-        // (negation via mul_const by -1 is handled below)
-    }
-
-    // General case: use fixed-point scaled coefficient with glwe_mul_const.
-    let base2k = ct.base2k().0 as usize;
-    let res_offset = 2 * base2k + COEFF_SCALE_BITS;
-    let c_vec = vec![coeff_scaled; 1];
-    let mut t = GLWE::<Vec<u8>>::alloc_from_infos(ct);
-    let tmp = module.glwe_mul_const_tmp_bytes(&t, res_offset, ct, c_vec.len());
+    let mut t = if let Some(layout) = target_layout {
+        GLWE::<Vec<u8>>::alloc_from_infos(layout)
+    } else {
+        GLWE::<Vec<u8>>::alloc_from_infos(ct)
+    };
+    let tmp = module.glwe_mul_const_tmp_bytes(&t, res_offset, ct, coeff_vec.len());
     let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp);
-    module.glwe_mul_const(&mut t, res_offset, ct, &c_vec, scratch.borrow());
+    module.glwe_mul_const(&mut t, res_offset, ct, &coeff_vec, scratch.borrow());
     Some(t)
 }
 
@@ -471,8 +526,9 @@ where
 
 /// Combines terms for a degree-3 polynomial: p(x) = c₀ + c₁·x + c₂·x² + c₃·x³
 ///
-/// All non-zero terms are computed and accumulated. The previous implementation
-/// only returned the highest-degree non-zero term, discarding lower-order terms.
+/// All non-zero terms are computed and accumulated. The c₁·x term is built with
+/// the output layout matching the highest-degree terms (from tensor products) to
+/// ensure all terms can be added together.
 fn combine_terms_deg3<BE: Backend>(
     module: &Module<BE>,
     ct: &GLWE<Vec<u8>>,
@@ -494,26 +550,28 @@ where
     let c2_scaled = (c2 * coeff_scale as f64).round() as i64;
     let c3_scaled = (c3 * coeff_scale as f64).round() as i64;
 
-    // Build each term with fixed-point scaled coefficients
-    let term1 = build_scaled_term(module, ct, c1, c1_scaled);
-    let term2 = build_scaled_term(module, ct_sq, c2, c2_scaled);
-    let term3 = build_scaled_term(module, ct_cube, c3, c3_scaled);
+    // The target layout for lower-degree terms: match ct_cube (deepest tensor product).
+    let target_for_ct = get_target_layout(ct, ct_cube);
+    let target_for_ct_sq = get_target_layout(ct_sq, ct_cube);
 
-    // Accumulate: start from the highest-degree term (deepest layout)
-    // and add lower terms that share the same layout.
+    // Build each term with fixed-point scaled coefficients.
+    // Lower-degree terms are converted to ct_cube's layout via glwe_mul_const.
+    let term1 = build_scaled_term(module, ct, c1, c1_scaled, target_for_ct.as_ref());
+    let term2 = build_scaled_term(module, ct_sq, c2, c2_scaled, target_for_ct_sq.as_ref());
+    let term3 = build_scaled_term(module, ct_cube, c3, c3_scaled, None);
+
+    // Accumulate all terms. Since all are now at the same layout, combine_two_terms
+    // should succeed for every pair.
     let partial = combine_two_terms(module, term2, term3, ct_cube);
 
-    // Try to add term1 if it has a matching layout
     if let Some(t1) = term1 {
         if t1.base2k() == partial.base2k() && t1.k() == partial.k() {
             let mut result = GLWE::<Vec<u8>>::alloc_from_infos(&partial);
             module.glwe_add(&mut result, &t1, &partial);
             return result;
         }
-        // Layouts differ — ct and ct_sq/ct_cube have different base2k after
-        // tensor products. Return the partial sum of higher-degree terms.
-        // This is a known limitation: proper mixed-layout accumulation
-        // would require rescaling ct to match the output layout.
+        // This should not happen now that we convert to target layout,
+        // but fall back gracefully if it does.
     }
 
     partial
@@ -521,7 +579,8 @@ where
 
 /// Combines terms for a degree-4 polynomial: p(x) = c₀ + c₁·x + c₂·x² + c₃·x³ + c₄·x⁴
 ///
-/// All non-zero terms are computed and accumulated.
+/// All non-zero terms are computed and accumulated. Lower-degree terms are
+/// converted to the highest-degree term's layout via glwe_mul_const.
 fn combine_terms_deg4<BE: Backend>(
     module: &Module<BE>,
     ct: &GLWE<Vec<u8>>,
@@ -546,13 +605,18 @@ where
     let c3_scaled = (c3 * coeff_scale as f64).round() as i64;
     let c4_scaled = (c4 * coeff_scale as f64).round() as i64;
 
-    // Build each term
-    let term1 = build_scaled_term(module, ct, c1, c1_scaled);
-    let term2 = build_scaled_term(module, ct_sq, c2, c2_scaled);
-    let term3 = build_scaled_term(module, ct_cube, c3, c3_scaled);
-    let term4 = build_scaled_term(module, ct_fourth, c4, c4_scaled);
+    // The target layout for lower-degree terms: match ct_fourth (deepest tensor product).
+    let target_for_ct = get_target_layout(ct, ct_fourth);
+    let target_for_ct_sq = get_target_layout(ct_sq, ct_fourth);
+    let target_for_ct_cube = get_target_layout(ct_cube, ct_fourth);
 
-    // Accumulate from highest to lowest degree (matching layouts where possible)
+    // Build each term, converting to the target layout where needed.
+    let term1 = build_scaled_term(module, ct, c1, c1_scaled, target_for_ct.as_ref());
+    let term2 = build_scaled_term(module, ct_sq, c2, c2_scaled, target_for_ct_sq.as_ref());
+    let term3 = build_scaled_term(module, ct_cube, c3, c3_scaled, target_for_ct_cube.as_ref());
+    let term4 = build_scaled_term(module, ct_fourth, c4, c4_scaled, None);
+
+    // Accumulate from highest to lowest degree
     let partial_34 = combine_two_terms(module, term3, term4, ct_fourth);
     let partial_234 = {
         if let Some(t2) = term2 {

@@ -122,15 +122,16 @@ where
     use poulpy_core::layouts::GLWEToRef;
 
     // Reduce torus precision by base2k bits (drop the lowest limb)
-    let new_k = if ct.k().as_u32() > params.base2k.as_u32() {
-        ct.k().as_u32() - params.base2k.as_u32()
+    let ct_base2k = ct.base2k().as_u32();
+    let new_k = if ct.k().as_u32() > ct_base2k {
+        ct.k().as_u32() - ct_base2k
     } else {
         ct.k().as_u32() // Can't reduce further
     };
 
     let new_layout = GLWELayout {
         n: params.degree,
-        base2k: params.base2k,
+        base2k: ct.base2k(),
         k: TorusPrecision(new_k),
         rank: params.rank,
     };

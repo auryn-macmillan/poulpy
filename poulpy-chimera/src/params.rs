@@ -30,11 +30,22 @@ pub enum Precision {
 /// All fields are determined by the security level and precision mode.
 /// Users should construct this via [`ChimeraParams::new`] rather than
 /// filling fields manually.
+///
+/// ## Parameter relationships for tensor products
+///
+/// The tensor product (ct*ct multiplication) requires a cascade of base2k values:
+/// - `base2k`: the "master" base2k (e.g. 14), used for the tensor key
+/// - `in_base2k = base2k - 1`: base2k of input ciphertexts and plaintexts
+/// - `out_base2k = base2k - 2`: base2k of output ciphertexts after tensor product
+///
+/// Ciphertexts produced by `chimera_encrypt` use `in_base2k`, NOT `base2k`.
+/// This matches the pattern from poulpy-core's tensor test.
 #[derive(Clone, Debug)]
 pub struct ChimeraParams {
     /// Ring polynomial degree N (power of two).
     pub degree: Degree,
-    /// Base-2 logarithm of the limb radix (digit decomposition).
+    /// Master base-2 logarithm of the limb radix. The tensor key uses this value.
+    /// Input ciphertexts use `base2k - 1`; output ciphertexts use `base2k - 2`.
     pub base2k: Base2K,
     /// Torus precision in bits (ciphertext modulus budget).
     pub k_ct: TorusPrecision,
@@ -75,7 +86,11 @@ impl ChimeraParams {
         };
 
         let base2k = 14u32;
-        let k_ct = 54u32;
+        // k_ct must be large enough to hold the tensor product intermediate:
+        // following poulpy-core's tensor test pattern, k = 8 * base2k + 1.
+        // With base2k=14 this gives k_ct=113, providing sufficient limbs for
+        // the relinearization (dnum = k/tsk_base2k = 113/14 = 9).
+        let k_ct = 8 * base2k + 1;
 
         let (k_pt, scale_bits) = match precision {
             Precision::Int8 => (base2k, 8),
@@ -100,6 +115,26 @@ impl ChimeraParams {
     /// Returns the ring degree N as a `u64` (for `Module::new`).
     pub fn n(&self) -> u64 {
         self.degree.0 as u64
+    }
+
+    /// Returns the input ciphertext base2k (`base2k - 1`).
+    ///
+    /// Input ciphertexts and plaintexts are encoded at this base2k.
+    /// This matches the pattern from poulpy-core's tensor test.
+    pub fn in_base2k(&self) -> usize {
+        let b = self.base2k.0 as usize;
+        if b > 1 { b - 1 } else { b }
+    }
+
+    /// Returns the output ciphertext base2k after a tensor product (`base2k - 2`).
+    pub fn out_base2k(&self) -> usize {
+        let b = self.base2k.0 as usize;
+        if b > 2 { b - 2 } else { b }
+    }
+
+    /// Returns the encoding scale used for torus encoding (`2 * in_base2k`).
+    pub fn encoding_scale(&self) -> usize {
+        2 * self.in_base2k()
     }
 
     /// Returns the number of limbs in the digit decomposition.
@@ -209,7 +244,7 @@ mod tests {
         let params = ChimeraParams::new(SecurityLevel::Bits128, Precision::Int8);
         assert_eq!(params.degree.0, 16384);
         assert_eq!(params.base2k.0, 14);
-        assert_eq!(params.k_ct.0, 54);
+        assert_eq!(params.k_ct.0, 113);
         assert_eq!(params.rank.0, 1);
         assert_eq!(params.slots, 16384);
         assert_eq!(params.scale_bits, 8);

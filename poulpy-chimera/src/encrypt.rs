@@ -10,7 +10,7 @@ use poulpy_core::{
     GLWEAutomorphismKeyEncryptSk, GLWEEncryptSk, GLWETensorKeyEncryptSk, GLWETrace,
     layouts::{
         Dsize, GLWE, GLWEAutomorphismKey, GLWEAutomorphismKeyLayout, GLWELayout, GLWEPlaintext,
-        GLWESecret, GLWESecretTensorFactory, GLWETensorKey, GLWETensorKeyLayout,
+        GLWESecret, GLWESecretTensorFactory, GLWETensorKey, GLWETensorKeyLayout, LWEInfos,
         prepared::{
             GLWEAutomorphismKeyPrepared, GLWEAutomorphismKeyPreparedFactory,
             GLWESecretPrepared, GLWESecretPreparedFactory,
@@ -57,10 +57,18 @@ where
     /// * `module` - The backend module (ring arithmetic tables).
     /// * `params` - CHIMERA parameter set.
     /// * `seed` - 32-byte seed for deterministic key generation.
+    ///
+    /// # Note on base2k
+    ///
+    /// The key's GLWE layout uses `in_base2k = params.base2k - 1` for the
+    /// ciphertext base2k, matching the tensor product parameter convention
+    /// from poulpy-core. See [`ChimeraParams`] for details on the base2k cascade.
     pub fn generate(module: &Module<BE>, params: &ChimeraParams, seed: [u8; 32]) -> Self {
+        let in_base2k = params.in_base2k();
+
         let layout = GLWELayout {
             n: params.degree,
-            base2k: params.base2k,
+            base2k: poulpy_core::layouts::Base2K(in_base2k as u32),
             k: params.k_ct,
             rank: params.rank,
         };
@@ -298,19 +306,21 @@ where
 
 /// Decrypts a GLWE ciphertext under CHIMERA parameters.
 ///
-/// Returns an owned GLWE plaintext.
+/// Returns an owned GLWE plaintext. The plaintext layout is derived from
+/// the ciphertext's actual layout (base2k, k), not from `params` directly,
+/// to handle ciphertexts at different levels (input vs post-tensor-product).
 ///
 /// # Arguments
 ///
 /// * `module` - The backend module.
 /// * `key` - CHIMERA key material.
 /// * `ct` - The ciphertext to decrypt.
-/// * `params` - CHIMERA parameter set (for plaintext layout).
+/// * `_params` - CHIMERA parameter set (reserved for future use).
 pub fn chimera_decrypt<BE: Backend>(
     module: &Module<BE>,
     key: &ChimeraKey<BE>,
     ct: &GLWE<Vec<u8>>,
-    params: &ChimeraParams,
+    _params: &ChimeraParams,
 ) -> GLWEPlaintext<Vec<u8>>
 where
     Module<BE>: poulpy_core::GLWEDecrypt<BE>,
@@ -319,16 +329,27 @@ where
 {
     use poulpy_core::layouts::GLWEPlaintextLayout;
 
+    // Use the ciphertext's actual layout so decryption works for both
+    // input ciphertexts (in_base2k) and post-tensor-product ciphertexts (out_base2k).
     let pt_layout = GLWEPlaintextLayout {
-        n: params.degree,
-        base2k: params.base2k,
-        k: params.k_pt,
+        n: ct.n(),
+        base2k: ct.base2k(),
+        k: ct.k(),
     };
 
     let mut pt = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&pt_layout);
 
+    // Use a layout matching the ciphertext for scratch sizing.
+    // The ciphertext may be at in_base2k (fresh encryption) or out_base2k
+    // (after tensor product), so we derive scratch from the ct itself.
+    let ct_layout = GLWELayout {
+        n: ct.n(),
+        base2k: ct.base2k(),
+        k: ct.k(),
+        rank: key.layout.rank,
+    };
     let mut scratch: ScratchOwned<BE> =
-        ScratchOwned::alloc(GLWE::decrypt_tmp_bytes(module, &key.layout));
+        ScratchOwned::alloc(GLWE::decrypt_tmp_bytes(module, &ct_layout));
 
     ct.decrypt(module, &mut pt, &key.prepared, scratch.borrow());
 

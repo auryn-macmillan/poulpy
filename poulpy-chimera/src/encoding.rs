@@ -39,7 +39,7 @@ where
 
     let layout = poulpy_core::layouts::GLWEPlaintextLayout {
         n: params.degree,
-        base2k: params.base2k,
+        base2k: poulpy_core::layouts::Base2K(params.in_base2k() as u32),
         k: params.k_pt,
     };
 
@@ -48,10 +48,10 @@ where
     // Write scaled values into the first limb of each coefficient.
     // In Poulpy's bivariate representation, each limb stores coefficients
     // in the range [-2^(base2k-1), 2^(base2k-1)). For INT8 values (8-bit),
-    // we shift by (base2k - scale_bits) to place them in the upper bits
+    // we shift by (in_base2k - scale_bits) to place them in the upper bits
     // of the limb's digit range.
     let n = module.n() as usize;
-    let shift = params.base2k.0 as usize - params.scale_bits as usize;
+    let shift = params.in_base2k() - params.scale_bits as usize;
 
     let raw: &mut [u8] = pt.data.data.as_mut();
     let coeffs: &mut [i64] = bytemuck::cast_slice_mut(&mut raw[..n * 8]);
@@ -89,7 +89,7 @@ where
 
     let layout = poulpy_core::layouts::GLWEPlaintextLayout {
         n: params.degree,
-        base2k: params.base2k,
+        base2k: poulpy_core::layouts::Base2K(params.in_base2k() as u32),
         k: params.k_pt,
     };
 
@@ -97,9 +97,7 @@ where
 
     let n = module.n() as usize;
     // For FP16, quantise to fixed-point within the limb's range.
-    // The limb stores values in [-2^(base2k-1), 2^(base2k-1)).
-    // scale_bits = base2k for FP16, so the quantised value maps
-    // directly into the limb's range (shift = 0).
+    // The limb stores values in [-2^(in_base2k-1), 2^(in_base2k-1)).
     //
     // Use f64 for the scale computation to match decode_fp16 and avoid
     // asymmetric rounding errors for large values.
@@ -136,7 +134,7 @@ where
     assert!(count <= params.slots);
 
     let n = module.n() as usize;
-    let shift = params.base2k.0 as usize - params.scale_bits as usize;
+    let shift = params.in_base2k() - params.scale_bits as usize;
 
     let raw: &[u8] = pt.data.data.as_ref();
     let coeffs: &[i64] = bytemuck::cast_slice(&raw[..n * 8]);

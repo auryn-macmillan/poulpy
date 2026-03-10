@@ -126,6 +126,21 @@ Criterion.
 | Matmul (multi-coeff)| 6       | 3.0         | More noise from ring multiply |
 | GELU activation    | 0.33      | 0.21        | vs cleartext PolyApprox::eval |
 
+#### Multi-security-level comparison (measured, Criterion optimized build)
+
+| Operation    | CHIMERA-80 (N=4096) | CHIMERA-100 (N=8192) | CHIMERA-128 (N=16384) |
+|-------------|--------------------:|---------------------:|----------------------:|
+| Encrypt     | 375 μs              | 705 μs               | 1.44 ms               |
+| Decrypt     | 250 μs              | 449 μs               | 938 μs                |
+| Add         | 16.9 μs             | 37.9 μs              | 70.5 μs               |
+| Mul_const   | 115 μs              | 222 μs               | 440 μs                |
+| Ct × Ct mul | 1.88 ms             | 3.90 ms              | 9.43 ms               |
+| EvalKey gen | 2.5 s               | 5.4 s                | 11.9 s                |
+
+Scaling is approximately 2x per security level step (linear in N), with ct×ct
+multiplication showing slightly super-linear scaling (~2.1x) due to O(N log N)
+FFT and relinearization. Accuracy is identical across all three levels.
+
 ### 3.2 Estimated CKKS Baselines
 
 Based on published benchmarks from Microsoft SEAL v4.1, HEaaN, and OpenFHE

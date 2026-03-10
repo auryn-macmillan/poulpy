@@ -2655,4 +2655,230 @@ mod integration {
             assert!(any_nonzero, "transformer block d4 produced all-zero output");
         }
     }
+
+    // ======================================================================
+    // Security parameter sweep tests (P2.7)
+    //
+    // Run the same FHE workload at all three security levels (80/100/128-bit)
+    // to compare latency, noise budget consumption, and error characteristics.
+    //
+    // The 100-bit and 128-bit tests are #[ignore] by default because key
+    // generation at N=8192/16384 takes several seconds and each FHE operation
+    // scales roughly with N^2.
+    //
+    // Run all sweep tests with:
+    //   cargo +nightly test -p poulpy-chimera -- --ignored security_sweep
+    // ======================================================================
+
+    /// Helper: run a standard FHE workload at a given security level and report metrics.
+    ///
+    /// Returns a tuple of (encrypt_decrypt_linf, add_linf, mul_const_linf, ct_ct_mul_ok, matmul_linf).
+    fn security_sweep_workload(security: SecurityLevel) -> (f64, f64, f64, bool, f64) {
+        use crate::arithmetic::{chimera_add, chimera_mul_const, chimera_matmul_single_ct};
+        use crate::activations::chimera_ct_mul;
+
+        let label = match security {
+            SecurityLevel::Bits80 => "80-bit",
+            SecurityLevel::Bits100 => "100-bit",
+            SecurityLevel::Bits128 => "128-bit",
+        };
+
+        let params = ChimeraParams::new(security, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+
+        eprintln!("\n[security_sweep {label}] N={}, slots={}, max_depth={}, ciphertext_bytes={}",
+            params.n(), params.slots, params.max_depth, params.ciphertext_bytes());
+
+        // Key generation (timed)
+        let t0 = std::time::Instant::now();
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+        let keygen_ms = t0.elapsed().as_millis();
+        eprintln!("[security_sweep {label}] keygen: {keygen_ms} ms");
+
+        let t0 = std::time::Instant::now();
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [50u8; 32], [60u8; 32]);
+        let evalkeygen_ms = t0.elapsed().as_millis();
+        eprintln!("[security_sweep {label}] eval_keygen: {evalkeygen_ms} ms");
+
+        // 1. Encrypt / decrypt roundtrip
+        let test_vals: Vec<i8> = vec![0, 1, -1, 10, -10, 42, -42, 100, -100, 127, -128];
+        let pt = encode_int8(&module, &params, &test_vals);
+
+        let t0 = std::time::Instant::now();
+        let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+        let encrypt_us = t0.elapsed().as_micros();
+
+        let t0 = std::time::Instant::now();
+        let pt_dec = chimera_decrypt(&module, &key, &ct, &params);
+        let decrypt_us = t0.elapsed().as_micros();
+
+        let decoded = decode_int8(&module, &params, &pt_dec, test_vals.len());
+        let fhe: Vec<f64> = decoded.iter().map(|&x| x as f64).collect();
+        let reference: Vec<f64> = test_vals.iter().map(|&x| x as f64).collect();
+        let (enc_linf, enc_l2) = accuracy_metrics(&fhe, &reference);
+        eprintln!("[security_sweep {label}] encrypt: {encrypt_us} us, decrypt: {decrypt_us} us");
+        eprintln!("[security_sweep {label}] encrypt/decrypt Linf={enc_linf:.4}, L2={enc_l2:.4}");
+
+        // 2. Addition
+        let a_vals: Vec<i8> = vec![10, -20, 30, -40, 50, -60, 70, -80];
+        let b_vals: Vec<i8> = vec![5, 15, -25, 35, -45, 55, -65, 75];
+        let pt_a = encode_int8(&module, &params, &a_vals);
+        let pt_b = encode_int8(&module, &params, &b_vals);
+        let ct_a = chimera_encrypt(&module, &key, &pt_a, [10u8; 32], [11u8; 32]);
+        let ct_b = chimera_encrypt(&module, &key, &pt_b, [12u8; 32], [13u8; 32]);
+
+        let t0 = std::time::Instant::now();
+        let ct_sum = chimera_add(&module, &ct_a, &ct_b);
+        let add_us = t0.elapsed().as_micros();
+
+        let pt_sum = chimera_decrypt(&module, &key, &ct_sum, &params);
+        let dec_sum = decode_int8(&module, &params, &pt_sum, a_vals.len());
+        let fhe_sum: Vec<f64> = dec_sum.iter().map(|&x| x as f64).collect();
+        let ref_sum: Vec<f64> = a_vals.iter().zip(b_vals.iter())
+            .map(|(&a, &b)| (a as i16 + b as i16) as f64).collect();
+        let (add_linf, add_l2) = accuracy_metrics(&fhe_sum, &ref_sum);
+        eprintln!("[security_sweep {label}] add: {add_us} us, Linf={add_linf:.4}, L2={add_l2:.4}");
+
+        // 3. Mul const (scalar)
+        let vals_m: Vec<i8> = vec![3, 0, 0, 0];
+        let pt_m = encode_int8(&module, &params, &vals_m);
+        let ct_m = chimera_encrypt(&module, &key, &pt_m, [20u8; 32], [21u8; 32]);
+        let constants = vec![2i64, 1, 0, 0];
+
+        let t0 = std::time::Instant::now();
+        let ct_mul = chimera_mul_const(&module, &ct_m, &constants);
+        let mulconst_us = t0.elapsed().as_micros();
+
+        let pt_mul = chimera_decrypt(&module, &key, &ct_mul, &params);
+        let dec_mul = decode_int8(&module, &params, &pt_mul, 4);
+        let fhe_mul: Vec<f64> = dec_mul.iter().map(|&x| x as f64).collect();
+        let ref_mul = vec![6.0, 3.0, 0.0, 0.0];
+        let (mulconst_linf, mulconst_l2) = accuracy_metrics(&fhe_mul, &ref_mul);
+        eprintln!("[security_sweep {label}] mul_const: {mulconst_us} us, Linf={mulconst_linf:.4}, L2={mulconst_l2:.4}");
+
+        // 4. CT * CT multiplication
+        // Encode using raw torus encoding (encode_vec_i64) at the tensor product
+        // scale, matching the pattern from test_full_pipeline_eval_key_ct_mul.
+        // encode_int8 uses a different internal scaling that is not compatible
+        // with decode_vec_i64 after tensor product.
+        use poulpy_core::layouts::{GLWE, GLWEPlaintext, GLWEPlaintextLayout, TorusPrecision};
+        use poulpy_hal::{api::{ScratchOwnedAlloc, ScratchOwnedBorrow}, layouts::ScratchOwned};
+
+        let scale = eval_key.res_offset; // = 2 * in_base2k = 26
+        let mut raw_data = vec![0i64; module.n()];
+        raw_data[0] = 3;
+        let pt_ct_layout = GLWEPlaintextLayout {
+            n: key.layout.n,
+            base2k: key.layout.base2k,
+            k: key.layout.k,
+        };
+        let mut pt_ct = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&pt_ct_layout);
+        pt_ct.encode_vec_i64(&raw_data, TorusPrecision(scale as u32));
+        let ct_for_mul = chimera_encrypt(&module, &key, &pt_ct, [30u8; 32], [31u8; 32]);
+
+        let t0 = std::time::Instant::now();
+        let ct_prod = chimera_ct_mul(&module, &eval_key, &ct_for_mul, &ct_for_mul);
+        let ctct_us = t0.elapsed().as_micros();
+
+        // Decrypt ct*ct result at the tensor product scale
+        let out_pt_layout = GLWEPlaintextLayout {
+            n: eval_key.output_layout.n,
+            base2k: eval_key.output_layout.base2k,
+            k: eval_key.output_layout.k,
+        };
+        let decrypt_ct_layout = poulpy_core::layouts::GLWELayout {
+            n: eval_key.output_layout.n,
+            base2k: eval_key.output_layout.base2k,
+            k: eval_key.output_layout.k,
+            rank: key.layout.rank,
+        };
+        let mut pt_prod = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&out_pt_layout);
+        let dec_bytes = GLWE::<Vec<u8>>::decrypt_tmp_bytes(&module, &decrypt_ct_layout);
+        let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(dec_bytes);
+        ct_prod.decrypt(&module, &mut pt_prod, &key.prepared, scratch.borrow());
+        let mut decoded_prod = vec![0i64; module.n()];
+        pt_prod.decode_vec_i64(&mut decoded_prod, TorusPrecision(scale as u32));
+
+        let ct_ct_ok = (decoded_prod[0] - 9).abs() <= 2;
+        eprintln!("[security_sweep {label}] ct*ct mul: {ctct_us} us, 3*3 → {}, ok={ct_ct_ok}",
+            decoded_prod[0]);
+
+        // 5. Matmul (4 rows, single-coefficient weights)
+        let vals_mm: Vec<i8> = vec![5, 0, 0, 0];
+        let pt_mm = encode_int8(&module, &params, &vals_mm);
+        let ct_mm = chimera_encrypt(&module, &key, &pt_mm, [40u8; 32], [41u8; 32]);
+        let weight_rows = vec![vec![2i64, 0, 0, 0], vec![1i64, 1, 0, 0]];
+
+        let t0 = std::time::Instant::now();
+        let results_mm = chimera_matmul_single_ct(&module, &ct_mm, &weight_rows);
+        let matmul_us = t0.elapsed().as_micros();
+
+        let pt_mm0 = chimera_decrypt(&module, &key, &results_mm[0], &params);
+        let dec_mm0 = decode_int8(&module, &params, &pt_mm0, 4);
+        let fhe_mm0: Vec<f64> = dec_mm0.iter().map(|&x| x as f64).collect();
+        let (matmul_linf, _) = accuracy_metrics(&fhe_mm0, &[10.0, 0.0, 0.0, 0.0]);
+        eprintln!("[security_sweep {label}] matmul (2 rows): {matmul_us} us, Linf={matmul_linf:.4}");
+
+        // 6. Noise budget tracking
+        let mut tracker = NoiseTracker::fresh();
+        let initial_budget = tracker.budget_bits(&params);
+        tracker.mul_const(10.0);
+        let after_mul_budget = tracker.budget_bits(&params);
+        tracker.rescale(params.base2k.0);
+        let after_rescale_budget = tracker.budget_bits(&params);
+        eprintln!("[security_sweep {label}] noise budget: fresh={initial_budget:.1}, after_mul={after_mul_budget:.1}, after_rescale={after_rescale_budget:.1}");
+        eprintln!("[security_sweep {label}] max_layers_no_bootstrap = {}", params.max_depth / 10);
+
+        // Summary line
+        eprintln!(
+            "[security_sweep {label}] SUMMARY: keygen={keygen_ms}ms evalkeygen={evalkeygen_ms}ms \
+             encrypt={encrypt_us}us decrypt={decrypt_us}us add={add_us}us \
+             mulconst={mulconst_us}us ctct={ctct_us}us matmul={matmul_us}us"
+        );
+
+        (enc_linf, add_linf, mulconst_linf, ct_ct_ok, matmul_linf)
+    }
+
+    /// Security sweep at 80-bit (N=4096) — runs as part of the normal test suite.
+    #[test]
+    fn test_security_sweep_80bit() {
+        let (enc_linf, add_linf, mulconst_linf, ct_ct_ok, matmul_linf) =
+            security_sweep_workload(SecurityLevel::Bits80);
+
+        assert!(enc_linf <= 1.0, "80-bit enc/dec Linf: {enc_linf}");
+        assert!(add_linf <= 1.0, "80-bit add Linf: {add_linf}");
+        assert!(mulconst_linf <= 8.0, "80-bit mul_const Linf: {mulconst_linf}");
+        assert!(ct_ct_ok, "80-bit ct*ct mul failed");
+        assert!(matmul_linf <= 4.0, "80-bit matmul Linf: {matmul_linf}");
+    }
+
+    /// Security sweep at 100-bit (N=8192) — ignored by default (slower).
+    /// Run with: cargo +nightly test -p poulpy-chimera -- --ignored test_security_sweep_100bit
+    #[test]
+    #[ignore]
+    fn test_security_sweep_100bit() {
+        let (enc_linf, add_linf, mulconst_linf, ct_ct_ok, matmul_linf) =
+            security_sweep_workload(SecurityLevel::Bits100);
+
+        assert!(enc_linf <= 1.0, "100-bit enc/dec Linf: {enc_linf}");
+        assert!(add_linf <= 1.0, "100-bit add Linf: {add_linf}");
+        assert!(mulconst_linf <= 8.0, "100-bit mul_const Linf: {mulconst_linf}");
+        assert!(ct_ct_ok, "100-bit ct*ct mul failed");
+        assert!(matmul_linf <= 4.0, "100-bit matmul Linf: {matmul_linf}");
+    }
+
+    /// Security sweep at 128-bit (N=16384) — ignored by default (much slower).
+    /// Run with: cargo +nightly test -p poulpy-chimera -- --ignored test_security_sweep_128bit
+    #[test]
+    #[ignore]
+    fn test_security_sweep_128bit() {
+        let (enc_linf, add_linf, mulconst_linf, ct_ct_ok, matmul_linf) =
+            security_sweep_workload(SecurityLevel::Bits128);
+
+        assert!(enc_linf <= 1.0, "128-bit enc/dec Linf: {enc_linf}");
+        assert!(add_linf <= 1.0, "128-bit add Linf: {add_linf}");
+        assert!(mulconst_linf <= 8.0, "128-bit mul_const Linf: {mulconst_linf}");
+        assert!(ct_ct_ok, "128-bit ct*ct mul failed");
+        assert!(matmul_linf <= 4.0, "128-bit matmul Linf: {matmul_linf}");
+    }
 }

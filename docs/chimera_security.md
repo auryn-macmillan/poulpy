@@ -97,14 +97,66 @@ in the threat model.
 
 ### 2.3 Security-Performance Tradeoff
 
-| Parameter set | Ciphertext (KB) | Encrypt (μs est.) | Layer (sec est.) | Security |
-|---------------|----------------|-------------------|------------------|----------|
-| CHIMERA-80    | 256            | 186               | 1-4              | 80-bit   |
-| CHIMERA-100   | 512            | ~400              | 2-7              | 100-bit  |
-| CHIMERA-128   | 1024           | ~900              | 5-14             | 128-bit  |
+#### Measured Benchmark Results
 
-Moving from CHIMERA-80 to CHIMERA-128 costs approximately **4x** in ciphertext
-size and **3-4x** in per-operation latency. The quadratic scaling in N dominates.
+All benchmarks run with Criterion (optimized release build) on the reference
+CPU backend. Accuracy metrics collected from integration tests. All three
+security levels use identical noise/encoding parameters (base2k=14, k_ct=113,
+scale=26); only the polynomial degree N differs.
+
+**Latency per operation (Criterion, optimized build):**
+
+| Operation    | CHIMERA-80 (N=4096) | CHIMERA-100 (N=8192) | CHIMERA-128 (N=16384) | Ratio 80→128 |
+|-------------|--------------------:|---------------------:|----------------------:|:------------:|
+| Encrypt     | 375 μs              | 705 μs               | 1.44 ms               | 3.8x         |
+| Decrypt     | 250 μs              | 449 μs               | 938 μs                | 3.8x         |
+| Add         | 16.9 μs             | 37.9 μs              | 70.5 μs               | 4.2x         |
+| Mul_const   | 115 μs              | 222 μs               | 440 μs                | 3.8x         |
+| Ct × Ct mul | 1.88 ms             | 3.90 ms              | 9.43 ms               | 5.0x         |
+
+**Accuracy (identical across all security levels):**
+
+| Operation      | L∞ error | L2/RMS  | Notes                      |
+|---------------|:--------:|:-------:|----------------------------|
+| Encrypt/decrypt | 0        | 0       | Exact roundtrip             |
+| Addition        | 0        | 0       | Exact                       |
+| Mul_const       | 3        | ~1.7    | From rescaling              |
+| Ct × Ct mul     | 0        | 0       | 3×3 = 9 exact at all levels |
+| Matmul          | 0        | 0       | Single-coeff weights        |
+
+**Structural parameters:**
+
+| Parameter        | CHIMERA-80  | CHIMERA-100 | CHIMERA-128  |
+|-----------------|:----------:|:-----------:|:------------:|
+| Polynomial N     | 4096       | 8192        | 16384        |
+| SIMD slots       | 4096       | 8192        | 16384        |
+| Ciphertext size  | 576 KB     | 1.15 MB     | 2.30 MB      |
+| Max depth        | 12         | 24          | 48           |
+| Layers (no BS)   | 1          | 2           | 4            |
+| Keygen time      | 1 ms       | 2 ms        | 4 ms         |
+| EvalKey gen time | 2.5 s      | 5.4 s       | 11.9 s       |
+
+**Key observations:**
+
+1. **Linear-in-N scaling**: Most operations scale roughly linearly with N
+   (i.e., 2x per security level step). Ct × Ct multiplication scales
+   super-linearly (~2.1x per step) due to the O(N log N) FFT and the
+   relinearization cost.
+
+2. **Accuracy is security-independent**: Error characteristics are identical
+   across all three security levels. The noise/encoding parameters (base2k,
+   k_ct, scale) are shared; only N changes. This means users can choose
+   security level based purely on latency/size tradeoffs without worrying
+   about accuracy regression.
+
+3. **4x overhead for 128-bit security**: Moving from CHIMERA-80 to CHIMERA-128
+   costs approximately 4-5x in latency and 4x in ciphertext size. This is the
+   standard quadratic scaling in lattice dimension.
+
+4. **Max depth doubles with N**: CHIMERA-128 supports 48 levels of
+   multiplicative depth (4 transformer layers without bootstrapping), while
+   CHIMERA-80 supports only 12 levels (1 layer). For models with >4 layers,
+   bootstrapping is required regardless of security level.
 
 ## 3. Approximate FHE: Security Implications
 

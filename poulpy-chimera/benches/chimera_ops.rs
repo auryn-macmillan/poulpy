@@ -335,6 +335,134 @@ fn bench_ffn_d4h8(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Security parameter sweep benchmarks (P2.7)
+//
+// Run the same operations at 80-bit (N=4096), 100-bit (N=8192), and
+// 128-bit (N=16384) security levels to measure the performance-security
+// tradeoff.
+// ---------------------------------------------------------------------------
+
+fn bench_security_sweep_encrypt(c: &mut Criterion) {
+    use criterion::BenchmarkId;
+    let mut group = c.benchmark_group("chimera/sweep_encrypt");
+
+    for (label, security) in [
+        ("80bit", SecurityLevel::Bits80),
+        ("100bit", SecurityLevel::Bits100),
+        ("128bit", SecurityLevel::Bits128),
+    ] {
+        let params = ChimeraParams::new(security, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+        let values: Vec<i8> = vec![1; 64];
+        let pt = encode_int8(&module, &params, &values);
+
+        group.bench_with_input(BenchmarkId::new("encrypt", label), &(), |b, _| {
+            b.iter(|| chimera_encrypt(&module, &key, black_box(&pt), [1u8; 32], [2u8; 32]))
+        });
+    }
+    group.finish();
+}
+
+fn bench_security_sweep_decrypt(c: &mut Criterion) {
+    use criterion::BenchmarkId;
+    let mut group = c.benchmark_group("chimera/sweep_decrypt");
+
+    for (label, security) in [
+        ("80bit", SecurityLevel::Bits80),
+        ("100bit", SecurityLevel::Bits100),
+        ("128bit", SecurityLevel::Bits128),
+    ] {
+        let params = ChimeraParams::new(security, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+        let values: Vec<i8> = vec![1; 64];
+        let pt = encode_int8(&module, &params, &values);
+        let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+        group.bench_with_input(BenchmarkId::new("decrypt", label), &(), |b, _| {
+            b.iter(|| chimera_decrypt(&module, &key, black_box(&ct), &params))
+        });
+    }
+    group.finish();
+}
+
+fn bench_security_sweep_add(c: &mut Criterion) {
+    use criterion::BenchmarkId;
+    let mut group = c.benchmark_group("chimera/sweep_add");
+
+    for (label, security) in [
+        ("80bit", SecurityLevel::Bits80),
+        ("100bit", SecurityLevel::Bits100),
+        ("128bit", SecurityLevel::Bits128),
+    ] {
+        let params = ChimeraParams::new(security, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+        let pt_a = encode_int8(&module, &params, &[1i8; 64]);
+        let pt_b = encode_int8(&module, &params, &[2i8; 64]);
+        let ct_a = chimera_encrypt(&module, &key, &pt_a, [1u8; 32], [2u8; 32]);
+        let ct_b = chimera_encrypt(&module, &key, &pt_b, [3u8; 32], [4u8; 32]);
+
+        group.bench_with_input(BenchmarkId::new("add", label), &(), |b, _| {
+            b.iter(|| chimera_add(&module, black_box(&ct_a), black_box(&ct_b)))
+        });
+    }
+    group.finish();
+}
+
+fn bench_security_sweep_mul_const(c: &mut Criterion) {
+    use criterion::BenchmarkId;
+    let mut group = c.benchmark_group("chimera/sweep_mul_const");
+
+    for (label, security) in [
+        ("80bit", SecurityLevel::Bits80),
+        ("100bit", SecurityLevel::Bits100),
+        ("128bit", SecurityLevel::Bits128),
+    ] {
+        let params = ChimeraParams::new(security, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+        let pt = encode_int8(&module, &params, &[3i8; 64]);
+        let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+        let weight = vec![7i64; 1];
+
+        group.bench_with_input(BenchmarkId::new("mul_const", label), &(), |b, _| {
+            b.iter(|| chimera_mul_const(&module, black_box(&ct), black_box(&weight)))
+        });
+    }
+    group.finish();
+}
+
+fn bench_security_sweep_ct_ct_mul(c: &mut Criterion) {
+    use criterion::BenchmarkId;
+    let mut group = c.benchmark_group("chimera/sweep_ct_ct_mul");
+    // ct*ct is expensive; give more time for higher N
+    group.sample_size(10);
+
+    for (label, security) in [
+        ("80bit", SecurityLevel::Bits80),
+        ("100bit", SecurityLevel::Bits100),
+        ("128bit", SecurityLevel::Bits128),
+    ] {
+        let params = ChimeraParams::new(security, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [50u8; 32], [60u8; 32]);
+        let pt = encode_int8(&module, &params, &[3i8; 64]);
+        let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+        group.bench_with_input(BenchmarkId::new("ct_ct_mul", label), &(), |b, _| {
+            b.iter(|| {
+                use poulpy_chimera::activations::chimera_ct_mul;
+                chimera_ct_mul(&module, &eval_key, black_box(&ct), black_box(&ct))
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encoding,
@@ -353,5 +481,10 @@ criterion_group!(
     bench_mul_const_d128,
     bench_ct_ct_mul_d128,
     bench_ffn_d4h8,
+    bench_security_sweep_encrypt,
+    bench_security_sweep_decrypt,
+    bench_security_sweep_add,
+    bench_security_sweep_mul_const,
+    bench_security_sweep_ct_ct_mul,
 );
 criterion_main!(benches);

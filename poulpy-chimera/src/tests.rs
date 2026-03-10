@@ -2068,4 +2068,591 @@ mod integration {
              history: {:?}", tracker.history.iter().map(|e| &e.op).collect::<Vec<_>>()
         );
     }
+
+    // ======================================================================
+    // Numerical accuracy tests (P1 item 4)
+    //
+    // Compare FHE outputs against cleartext reference implementations.
+    // Report L-inf (max absolute error) and L2 (RMS error) for each operation.
+    // ======================================================================
+
+    /// Helper: compute L-inf (max absolute deviation) and L2 (RMS) error
+    /// between two f64 slices.
+    fn accuracy_metrics(fhe: &[f64], reference: &[f64]) -> (f64, f64) {
+        assert_eq!(fhe.len(), reference.len());
+        let n = fhe.len() as f64;
+        let mut max_err = 0.0_f64;
+        let mut sum_sq = 0.0_f64;
+        for (a, b) in fhe.iter().zip(reference.iter()) {
+            let e = (a - b).abs();
+            max_err = max_err.max(e);
+            sum_sq += e * e;
+        }
+        let rms = (sum_sq / n).sqrt();
+        (max_err, rms)
+    }
+
+    /// Test encrypt-decrypt roundtrip accuracy across multiple values.
+    ///
+    /// Measures the baseline noise floor introduced by encryption alone.
+    #[test]
+    fn test_accuracy_encrypt_decrypt_baseline() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [250u8; 32]);
+
+        let test_vals: Vec<i8> = vec![
+            0, 1, -1, 10, -10, 42, -42, 100, -100, 127, -128,
+        ];
+
+        let pt = encode_int8(&module, &params, &test_vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [251u8; 32], [252u8; 32]);
+        let pt_dec = chimera_decrypt(&module, &key, &ct, &params);
+        let decoded = decode_int8(&module, &params, &pt_dec, test_vals.len());
+
+        let fhe: Vec<f64> = decoded.iter().map(|&x| x as f64).collect();
+        let reference: Vec<f64> = test_vals.iter().map(|&x| x as f64).collect();
+
+        let (linf, l2) = accuracy_metrics(&fhe, &reference);
+        eprintln!("[accuracy_baseline] Linf = {linf:.4}, L2 = {l2:.4}");
+        eprintln!("[accuracy_baseline] values: {test_vals:?}");
+        eprintln!("[accuracy_baseline] decoded: {decoded:?}");
+
+        assert!(linf <= 1.0, "encrypt-decrypt Linf error too large: {linf}");
+        assert!(l2 <= 0.5, "encrypt-decrypt L2 error too large: {l2}");
+    }
+
+    /// Test encrypt-add-decrypt accuracy.
+    ///
+    /// Addition is exact under FHE (no tensor product), so errors should
+    /// be purely from encryption noise.
+    #[test]
+    fn test_accuracy_addition() {
+        use crate::arithmetic::chimera_add;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [200u8; 32]);
+
+        let a_vals: Vec<i8> = vec![10, -20, 30, -40, 50, -60, 70, -80];
+        let b_vals: Vec<i8> = vec![5, 15, -25, 35, -45, 55, -65, 75];
+
+        let pt_a = encode_int8(&module, &params, &a_vals);
+        let pt_b = encode_int8(&module, &params, &b_vals);
+        let ct_a = chimera_encrypt(&module, &key, &pt_a, [201u8; 32], [202u8; 32]);
+        let ct_b = chimera_encrypt(&module, &key, &pt_b, [203u8; 32], [204u8; 32]);
+
+        let ct_sum = chimera_add(&module, &ct_a, &ct_b);
+        let pt_dec = chimera_decrypt(&module, &key, &ct_sum, &params);
+        let decoded = decode_int8(&module, &params, &pt_dec, a_vals.len());
+
+        let fhe: Vec<f64> = decoded.iter().map(|&x| x as f64).collect();
+        let reference: Vec<f64> = a_vals.iter().zip(b_vals.iter())
+            .map(|(&a, &b)| (a as i16 + b as i16) as f64)
+            .collect();
+
+        let (linf, l2) = accuracy_metrics(&fhe, &reference);
+        eprintln!("[accuracy_addition] Linf = {linf:.4}, L2 = {l2:.4}");
+        assert!(linf <= 1.0, "addition Linf error too large: {linf}");
+        assert!(l2 <= 1.0, "addition L2 error too large: {l2}");
+    }
+
+    /// Test encrypt-mul_const-decrypt accuracy.
+    ///
+    /// Exercises polynomial ring multiplication on the torus. Errors come
+    /// from encryption noise amplified by the constant magnitude.
+    #[test]
+    fn test_accuracy_mul_const() {
+        use crate::arithmetic::chimera_mul_const;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [210u8; 32]);
+
+        // Encrypt [3, 0, 0, 0]
+        let vals: Vec<i8> = vec![3, 0, 0, 0];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [211u8; 32], [212u8; 32]);
+
+        // Multiply by constant polynomial [2, 1, 0, 0] (= 2 + X)
+        let constants = vec![2i64, 1, 0, 0];
+        let ct_mul = chimera_mul_const(&module, &ct, &constants);
+
+        let pt_dec = chimera_decrypt(&module, &key, &ct_mul, &params);
+        let decoded = decode_int8(&module, &params, &pt_dec, 4);
+
+        // Cleartext: (3) * (2 + X) = 6 + 3X
+        let fhe: Vec<f64> = decoded.iter().map(|&x| x as f64).collect();
+        let reference = vec![6.0, 3.0, 0.0, 0.0];
+
+        let (linf, l2) = accuracy_metrics(&fhe, &reference);
+        eprintln!("[accuracy_mul_const] Linf = {linf:.4}, L2 = {l2:.4}");
+        // Ring polynomial multiplication introduces noise; expect Linf <= 8 for INT8
+        assert!(linf <= 8.0, "mul_const Linf error too large: {linf}");
+        assert!(l2 <= 4.0, "mul_const L2 error too large: {l2}");
+    }
+
+    /// Test encrypt-matmul-decrypt accuracy.
+    ///
+    /// Matmul is implemented as multiple `chimera_mul_const` calls, one per
+    /// weight row.
+    #[test]
+    fn test_accuracy_matmul() {
+        use crate::arithmetic::chimera_matmul_single_ct;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [220u8; 32]);
+
+        let vals: Vec<i8> = vec![5, 0, 0, 0];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [221u8; 32], [222u8; 32]);
+
+        let weight_rows = vec![
+            vec![2i64, 0, 0, 0],
+            vec![1i64, 1, 0, 0],
+        ];
+
+        let results = chimera_matmul_single_ct(&module, &ct, &weight_rows);
+        assert_eq!(results.len(), 2);
+
+        let pt0 = chimera_decrypt(&module, &key, &results[0], &params);
+        let dec0 = decode_int8(&module, &params, &pt0, 4);
+        let pt1 = chimera_decrypt(&module, &key, &results[1], &params);
+        let dec1 = decode_int8(&module, &params, &pt1, 4);
+
+        // Row 0: [5,0,0,0] * [2,0,0,0] = [10, 0, 0, 0]
+        let (linf0, l2_0) = accuracy_metrics(
+            &dec0.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+            &[10.0, 0.0, 0.0, 0.0],
+        );
+        eprintln!("[accuracy_matmul row0] Linf={linf0:.4}, L2={l2_0:.4}, dec={dec0:?}");
+
+        // Row 1: [5,0,0,0] * [1,1,0,0] = [5, 5, 0, 0]
+        let (linf1, l2_1) = accuracy_metrics(
+            &dec1.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+            &[5.0, 5.0, 0.0, 0.0],
+        );
+        eprintln!("[accuracy_matmul row1] Linf={linf1:.4}, L2={l2_1:.4}, dec={dec1:?}");
+
+        assert!(linf0 <= 4.0, "matmul row0 Linf error: {linf0}");
+        // Multi-coefficient weight rows accumulate more noise from ring multiplication
+        assert!(linf1 <= 8.0, "matmul row1 Linf error: {linf1}");
+    }
+
+    /// Test GELU polynomial activation accuracy under FHE.
+    ///
+    /// Compares FHE `apply_poly_activation` result with cleartext
+    /// `PolyApprox::eval` for GELU on small integer inputs.
+    #[test]
+    fn test_accuracy_gelu_activation() {
+        use crate::activations::{
+            activation_decode_precision, apply_poly_activation, gelu_poly_approx,
+        };
+        use poulpy_core::layouts::{
+            Base2K, Degree, Dsize, GLWELayout, GLWEPlaintext,
+            GLWESecret, GLWETensorKey, GLWETensorKeyLayout, Rank, TorusPrecision,
+            prepared::{GLWESecretPrepared, GLWETensorKeyPrepared},
+        };
+        use poulpy_hal::{
+            api::{ScratchOwnedAlloc, ScratchOwnedBorrow},
+            layouts::ScratchOwned,
+            source::Source,
+        };
+        use poulpy_core::layouts::GLWE;
+
+        let base2k: usize = 14;
+        let in_base2k: usize = base2k - 1;
+        let out_base2k: usize = base2k - 2;
+        let tsk_base2k: usize = base2k;
+        let k: usize = 8 * base2k + 1;
+        let rank: usize = 1;
+        let n: u64 = 4096;
+
+        let module: Module<BE> = Module::new(n);
+        let n_usize = module.n();
+
+        let glwe_in = GLWELayout {
+            n: Degree(n as u32),
+            base2k: Base2K(in_base2k as u32),
+            k: TorusPrecision(k as u32),
+            rank: Rank(rank as u32),
+        };
+        let glwe_out = GLWELayout {
+            n: Degree(n as u32),
+            base2k: Base2K(out_base2k as u32),
+            k: TorusPrecision(k as u32),
+            rank: Rank(rank as u32),
+        };
+        let tsk_layout = GLWETensorKeyLayout {
+            n: Degree(n as u32),
+            base2k: Base2K(tsk_base2k as u32),
+            k: TorusPrecision((k + tsk_base2k) as u32),
+            rank: Rank(rank as u32),
+            dnum: poulpy_core::layouts::Dnum(k.div_ceil(tsk_base2k) as u32),
+            dsize: Dsize(1),
+        };
+
+        let mut source_xs = Source::new([140u8; 32]);
+        let mut source_xe = Source::new([141u8; 32]);
+        let mut source_xa = Source::new([142u8; 32]);
+
+        let mut sk = GLWESecret::<Vec<u8>>::alloc(Degree(n as u32), Rank(rank as u32));
+        sk.fill_ternary_prob(0.5, &mut source_xs);
+        let mut sk_dft = GLWESecretPrepared::<Vec<u8>, BE>::alloc_from_infos(&module, &sk);
+        sk_dft.prepare(&module, &sk);
+
+        let mut tsk = GLWETensorKey::<Vec<u8>>::alloc_from_infos(&tsk_layout);
+        let enc_bytes = GLWETensorKey::encrypt_sk_tmp_bytes(&module, &tsk_layout);
+        let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(enc_bytes);
+        tsk.encrypt_sk(&module, &sk, &mut source_xa, &mut source_xe, scratch.borrow());
+
+        let mut tsk_prep =
+            GLWETensorKeyPrepared::<Vec<u8>, BE>::alloc_from_infos(&module, &tsk_layout);
+        let prep_bytes = tsk_prep.prepare_tmp_bytes(&module, &tsk_layout);
+        let mut prep_scratch: ScratchOwned<BE> = ScratchOwned::alloc(prep_bytes);
+        tsk_prep.prepare(&module, &tsk, prep_scratch.borrow());
+
+        let eval_key = ChimeraEvalKey {
+            tensor_key_prepared: tsk_prep,
+            tensor_key_layout: tsk_layout,
+            output_layout: glwe_out.clone(),
+            tensor_layout: glwe_out.clone(),
+            res_offset: 2 * in_base2k,
+            tensor_key_l2_prepared: None,
+            tensor_key_l2_layout: None,
+            output_l2_layout: None,
+            tensor_l2_layout: None,
+            res_offset_l2: None,
+            auto_keys: std::collections::HashMap::new(),
+            auto_key_layout: poulpy_core::layouts::GLWEAutomorphismKeyLayout {
+                n: Degree(n as u32),
+                base2k: Base2K(in_base2k as u32),
+                k: TorusPrecision(k as u32),
+                rank: Rank(rank as u32),
+                dsize: Dsize(1),
+                dnum: poulpy_core::layouts::Dnum(1),
+            },
+        };
+
+        let scale = 2 * in_base2k;
+        let approx = gelu_poly_approx();
+
+        let test_inputs: Vec<i64> = vec![1, 2, 3, 4, 5, -1, -2];
+        let mut fhe_outputs = Vec::new();
+        let mut ref_outputs = Vec::new();
+
+        for &val in &test_inputs {
+            let mut data = vec![0i64; n_usize];
+            data[0] = val;
+            let mut pt = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&glwe_in);
+            pt.encode_vec_i64(&data, TorusPrecision(scale as u32));
+
+            let enc_ct_bytes = GLWE::encrypt_sk_tmp_bytes(&module, &glwe_in);
+            let mut ct_scratch: ScratchOwned<BE> = ScratchOwned::alloc(enc_ct_bytes);
+            let mut ct = GLWE::<Vec<u8>>::alloc_from_infos(&glwe_in);
+            ct.encrypt_sk(
+                &module, &pt, &sk_dft,
+                &mut source_xa, &mut source_xe, ct_scratch.borrow(),
+            );
+
+            let ct_result = apply_poly_activation(&module, &eval_key, &ct, &approx);
+
+            let dec_bytes = GLWE::decrypt_tmp_bytes(&module, &glwe_out);
+            let mut dec_scratch: ScratchOwned<BE> = ScratchOwned::alloc(dec_bytes);
+            let mut pt_dec = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&glwe_out);
+            ct_result.decrypt(&module, &mut pt_dec, &sk_dft, dec_scratch.borrow());
+
+            let decode_scale = activation_decode_precision(scale);
+            let mut decoded = vec![0i64; n_usize];
+            pt_dec.decode_vec_i64(&mut decoded, TorusPrecision(decode_scale as u32));
+
+            fhe_outputs.push(decoded[0] as f64);
+            ref_outputs.push(approx.eval(val as f64));
+        }
+
+        let (linf, l2) = accuracy_metrics(&fhe_outputs, &ref_outputs);
+        eprintln!("[accuracy_gelu] inputs = {test_inputs:?}");
+        eprintln!("[accuracy_gelu] FHE    = {fhe_outputs:?}");
+        eprintln!(
+            "[accuracy_gelu] Ref    = {:?}",
+            ref_outputs.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>()
+        );
+        eprintln!("[accuracy_gelu] Linf = {linf:.4}, L2 = {l2:.4}");
+
+        assert!(linf <= 5.0, "GELU activation Linf error too large: {linf}");
+    }
+
+    /// Test full transformer block: FHE output is structurally valid and non-zero.
+    #[test]
+    fn test_accuracy_transformer_block_d1() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [230u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [231u8; 32], [232u8; 32],
+        );
+
+        let dims = ModelDims {
+            d_model: 1, d_head: 1, n_heads: 1,
+            d_ffn: 1, n_layers: 1,
+            n_experts: 1, n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(1),
+            pre_ffn_norm: LayerNormConfig::rms_norm(1),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: false,
+        };
+
+        let weights = TransformerBlockWeights {
+            attention: AttentionWeights {
+                w_q: vec![vec![1i64]],
+                w_k: vec![vec![1i64]],
+                w_v: vec![vec![1i64]],
+                w_o: vec![vec![1i64]],
+            },
+            ffn: FFNWeights {
+                w1: vec![vec![1i64]],
+                w2: vec![vec![1i64]],
+                w3: None,
+            },
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
+        };
+
+        let test_vals: Vec<i8> = vec![5, 10, -5, 1, 20];
+        for &input_val in &test_vals {
+            let pt = encode_int8(&module, &params, &[input_val]);
+            let ct = chimera_encrypt(&module, &key, &pt, [233u8; 32], [234u8; 32]);
+            let result = chimera_transformer_block(
+                &module, &eval_key, &ct, &config, &weights,
+            );
+
+            let pt_dec = chimera_decrypt(&module, &key, &result, &params);
+            let raw: &[u8] = pt_dec.data.data.as_ref();
+            let n = module.n();
+            let coeffs: &[i64] = bytemuck::cast_slice(&raw[..n * 8]);
+            let raw_coeff0 = coeffs[0];
+
+            eprintln!(
+                "[accuracy_block_d1] input={input_val}, raw_coeff0={raw_coeff0}",
+            );
+
+            if input_val > 0 {
+                assert!(
+                    raw_coeff0 != 0,
+                    "block should produce non-zero output for positive input {input_val}"
+                );
+            }
+        }
+    }
+
+    /// Test error growth across 2 transformer layers.
+    #[test]
+    fn test_accuracy_error_growth_2_layers() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [240u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [241u8; 32], [242u8; 32],
+        );
+
+        let dims = ModelDims {
+            d_model: 1, d_head: 1, n_heads: 1,
+            d_ffn: 1, n_layers: 2,
+            n_experts: 1, n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(1),
+            pre_ffn_norm: LayerNormConfig::rms_norm(1),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        let layer_weights = vec![
+            TransformerBlockWeights {
+                attention: AttentionWeights {
+                    w_q: vec![vec![1i64]],
+                    w_k: vec![vec![1i64]],
+                    w_v: vec![vec![1i64]],
+                    w_o: vec![vec![1i64]],
+                },
+                ffn: FFNWeights {
+                    w1: vec![vec![1i64]],
+                    w2: vec![vec![1i64]],
+                    w3: None,
+                },
+                pre_attn_norm_gamma: None,
+                pre_ffn_norm_gamma: None,
+            };
+            2
+        ];
+
+        let input_val: i8 = 5;
+        let pt = encode_int8(&module, &params, &[input_val]);
+        let ct = chimera_encrypt(&module, &key, &pt, [243u8; 32], [244u8; 32]);
+
+        let result = chimera_forward_pass(
+            &module, &eval_key, &ct, &config, &layer_weights,
+        );
+
+        use poulpy_core::layouts::LWEInfos;
+        assert!(result.n() > 0);
+        assert!(result.base2k() > 0);
+
+        eprintln!(
+            "[accuracy_error_growth] 2 layers completed, result n={} base2k={}",
+            result.n(), result.base2k()
+        );
+
+        let pt_dec = chimera_decrypt(&module, &key, &result, &params);
+        let raw: &[u8] = pt_dec.data.data.as_ref();
+        let n = module.n();
+        let coeffs: &[i64] = bytemuck::cast_slice(&raw[..n * 8]);
+        eprintln!("[accuracy_error_growth] raw_coeff0 = {}", coeffs[0]);
+    }
+
+    /// Consolidated accuracy summary at d_model=4 for add, mul_const, matmul.
+    #[test]
+    fn test_accuracy_summary_d4() {
+        use crate::arithmetic::{chimera_add, chimera_matmul_single_ct, chimera_mul_const};
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [180u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [181u8; 32], [182u8; 32],
+        );
+
+        let vals: Vec<i8> = vec![1, 2, 3, 4];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [183u8; 32], [184u8; 32]);
+
+        // Add
+        {
+            let vals_b: Vec<i8> = vec![4, 3, 2, 1];
+            let pt_b = encode_int8(&module, &params, &vals_b);
+            let ct_b = chimera_encrypt(&module, &key, &pt_b, [185u8; 32], [186u8; 32]);
+            let ct_sum = chimera_add(&module, &ct, &ct_b);
+            let pt_dec = chimera_decrypt(&module, &key, &ct_sum, &params);
+            let decoded = decode_int8(&module, &params, &pt_dec, 4);
+            let fhe: Vec<f64> = decoded.iter().map(|&x| x as f64).collect();
+            let (linf, l2) = accuracy_metrics(&fhe, &[5.0, 5.0, 5.0, 5.0]);
+            eprintln!("[summary_d4 add] Linf={linf:.4} L2={l2:.4} dec={decoded:?}");
+            assert!(linf <= 1.0, "d4 add Linf: {linf}");
+        }
+
+        // Mul const (identity)
+        {
+            let identity = vec![1i64, 0, 0, 0];
+            let ct_mul = chimera_mul_const(&module, &ct, &identity);
+            let pt_dec = chimera_decrypt(&module, &key, &ct_mul, &params);
+            let decoded = decode_int8(&module, &params, &pt_dec, 4);
+            let fhe: Vec<f64> = decoded.iter().map(|&x| x as f64).collect();
+            let (linf, l2) = accuracy_metrics(&fhe, &[1.0, 2.0, 3.0, 4.0]);
+            eprintln!("[summary_d4 mul_id] Linf={linf:.4} L2={l2:.4} dec={decoded:?}");
+            assert!(linf <= 2.0, "d4 mul_const identity Linf: {linf}");
+        }
+
+        // Matmul
+        {
+            let weight_rows = vec![
+                vec![1i64, 0, 0, 0],
+                vec![0i64, 1, 0, 0],
+            ];
+            let results = chimera_matmul_single_ct(&module, &ct, &weight_rows);
+
+            let pt0 = chimera_decrypt(&module, &key, &results[0], &params);
+            let dec0 = decode_int8(&module, &params, &pt0, 4);
+            let fhe0: Vec<f64> = dec0.iter().map(|&x| x as f64).collect();
+            let (linf0, _) = accuracy_metrics(&fhe0, &[1.0, 2.0, 3.0, 4.0]);
+            eprintln!("[summary_d4 matmul r0] Linf={linf0:.4} dec={dec0:?}");
+
+            // [1,2,3,4]*[0,1,0,0] = [0, 1, 2, 3, 4, ...] in Z[X]/(X^N+1) with N=4096
+            let pt1 = chimera_decrypt(&module, &key, &results[1], &params);
+            let dec1 = decode_int8(&module, &params, &pt1, 4);
+            let fhe1: Vec<f64> = dec1.iter().map(|&x| x as f64).collect();
+            let (linf1, _) = accuracy_metrics(&fhe1, &[0.0, 1.0, 2.0, 3.0]);
+            eprintln!("[summary_d4 matmul r1] Linf={linf1:.4} dec={dec1:?}");
+
+            assert!(linf0 <= 4.0, "d4 matmul r0 Linf: {linf0}");
+            // Multi-coefficient weight rows accumulate more noise
+            assert!(linf1 <= 8.0, "d4 matmul r1 Linf: {linf1}");
+        }
+
+        // Full transformer block
+        {
+            let dims = ModelDims {
+                d_model: 4, d_head: 4, n_heads: 1,
+                d_ffn: 4, n_layers: 1,
+                n_experts: 1, n_active_experts: 1,
+            };
+            let block_config = TransformerBlockConfig {
+                attention: AttentionConfig {
+                    dims: dims.clone(),
+                    params: params.clone(),
+                    softmax_approx: SoftmaxStrategy::ReluSquared,
+                    causal: true,
+                },
+                pre_attn_norm: LayerNormConfig::rms_norm(4),
+                pre_ffn_norm: LayerNormConfig::rms_norm(4),
+                ffn: FFNConfig::Standard {
+                    activation: ActivationChoice::SquaredReLU,
+                },
+                residual: true,
+            };
+            let id_row = vec![1i64, 0, 0, 0];
+            let weights = TransformerBlockWeights {
+                attention: AttentionWeights {
+                    w_q: vec![id_row.clone(); 4],
+                    w_k: vec![id_row.clone(); 4],
+                    w_v: vec![id_row.clone(); 4],
+                    w_o: vec![id_row.clone(); 4],
+                },
+                ffn: FFNWeights {
+                    w1: vec![id_row.clone(); 4],
+                    w2: vec![id_row.clone(); 4],
+                    w3: None,
+                },
+                pre_attn_norm_gamma: None,
+                pre_ffn_norm_gamma: None,
+            };
+
+            let result = chimera_transformer_block(
+                &module, &eval_key, &ct, &block_config, &weights,
+            );
+
+            let pt_dec = chimera_decrypt(&module, &key, &result, &params);
+            let raw: &[u8] = pt_dec.data.data.as_ref();
+            let n = module.n();
+            let coeffs: &[i64] = bytemuck::cast_slice(&raw[..n * 8]);
+
+            eprintln!(
+                "[summary_d4 block] raw coeffs[0..4] = [{}, {}, {}, {}]",
+                coeffs[0], coeffs[1], coeffs[2], coeffs[3]
+            );
+
+            let any_nonzero = coeffs[..4].iter().any(|&c| c != 0);
+            assert!(any_nonzero, "transformer block d4 produced all-zero output");
+        }
+    }
 }

@@ -4466,28 +4466,151 @@ mod integration {
         let decrypted = decrypt_vec(&module, &key, &params, &result_cts);
         eprintln!("[fhe_d64] Decrypted output (first 8 dims): {:?}", &decrypted[..8]);
 
-        // ---- 8. Sanity checks ----
-        // Output should be non-zero (we fed real non-zero weights through a real pipeline)
-        let any_nonzero = decrypted.iter().any(|&v| v != 0);
-        assert!(any_nonzero, "Output should not be all zeros");
+        // ---- 8. Cleartext reference and validation ----
+        //
+        // A full float-domain cleartext comparison of the entire transformer block
+        // is not feasible because:
+        //   - The FHE pipeline operates in fixed-point torus arithmetic with implicit
+        //     scaling, wrapping, and precision loss at each operation
+        //   - Polynomial approximations (inv_sqrt, SiLU) with missing c₀ operate at
+        //     torus-encoded scales that cannot be replicated in float
+        //   - score² in attention (without softmax normalisation for seq_len=1) causes
+        //     intermediate values to diverge between float (unbounded) and FHE (wraps)
+        //
+        // Instead, we validate correctness through:
+        //   A. Partial cleartext check: verify the QKV projection (linear-only, before
+        //      nonlinearities) matches between FHE and cleartext
+        //   B. Statistical properties of the full FHE output
+        //   C. Consistency checks (non-degeneracy, distribution, dynamic range)
 
-        // Count how many non-zero values there are
-        let nonzero_count = decrypted.iter().filter(|&&v| v != 0).count();
-        eprintln!(
-            "[fhe_d64] Non-zero outputs: {}/{} ({:.1}%)",
-            nonzero_count, trunc_d_model,
-            100.0 * nonzero_count as f64 / trunc_d_model as f64
+        // --- A. Partial cleartext: QKV projection check ---
+        //
+        // The QKV projection is purely linear: Q_i = Σ_j W_Q[i][j] * x_j
+        // This should match between FHE and cleartext within FHE noise bounds.
+
+        eprintln!("[fhe_d64] Running partial cleartext check (QKV projection)...");
+
+        // Compute cleartext Q, K, V projections
+        let cleartext_q: Vec<f64> = trunc_weights.attention.w_q.iter()
+            .map(|row| row.iter().zip(input_i8.iter()).map(|(&w, &x)| w * x as i64).sum::<i64>() as f64)
+            .collect();
+        let cleartext_k: Vec<f64> = trunc_weights.attention.w_k.iter()
+            .map(|row| row.iter().zip(input_i8.iter()).map(|(&w, &x)| w * x as i64).sum::<i64>() as f64)
+            .collect();
+
+        eprintln!("[fhe_d64] Cleartext Q[..8]: {:?}", &cleartext_q[..8].iter().map(|v| *v as i64).collect::<Vec<_>>());
+        eprintln!("[fhe_d64] Cleartext K[..8]: {:?}", &cleartext_k[..8].iter().map(|v| *v as i64).collect::<Vec<_>>());
+
+        // Also run a standalone FHE QKV projection to validate against cleartext
+        let (fhe_q, fhe_k, _fhe_v) = crate::attention::chimera_qkv_project_vec(
+            &module, &ct_x, &trunc_weights.attention, trunc_d_model, trunc_d_model,
         );
 
-        // Print full output for inspection
-        for (i, &v) in decrypted.iter().enumerate() {
-            if v != 0 || i < 8 {
-                eprintln!("[fhe_d64] output[{i}] = {v}");
-            }
+        // Decrypt FHE Q and K
+        let fhe_q_dec = decrypt_vec(&module, &key, &params, &fhe_q);
+        let fhe_k_dec = decrypt_vec(&module, &key, &params, &fhe_k);
+
+        eprintln!("[fhe_d64] FHE    Q[..8]: {:?}", &fhe_q_dec[..8]);
+        eprintln!("[fhe_d64] FHE    K[..8]: {:?}", &fhe_k_dec[..8]);
+
+        // Compare QKV projection: cleartext vs FHE
+        let q_errors: Vec<i16> = fhe_q_dec.iter()
+            .zip(cleartext_q.iter())
+            .map(|(&fhe, &ct)| (fhe as i16) - (ct.round().clamp(-128.0, 127.0) as i8 as i16))
+            .collect();
+        let q_max_err = q_errors.iter().map(|e| e.abs()).max().unwrap_or(0);
+        let q_mae: f64 = q_errors.iter().map(|e| e.abs() as f64).sum::<f64>() / trunc_d_model as f64;
+
+        eprintln!("[fhe_d64] QKV projection FHE vs cleartext:");
+        eprintln!("[fhe_d64]   Q max abs error: {q_max_err}");
+        eprintln!("[fhe_d64]   Q mean abs error: {q_mae:.2}");
+
+        // Q projection should be within known FHE mul_const error bounds.
+        // From accuracy tests: mul_const Linf=4, matmul (multi-coeff) Linf=6.
+        // Dot product of 64 terms accumulates error: ~6 per term but errors
+        // partially cancel, so total Linf should be bounded.
+        // Note: errors may be larger because each x_i*w_ij product has error ~4,
+        // and 64 such terms sum up. Worst case = 64*4 = 256, but RMS is much lower.
+        // We use a lenient bound here.
+        assert!(
+            q_mae < 30.0,
+            "Q projection MAE ({q_mae:.2}) should be < 30 (accumulated mul_const error over 64 dims)"
+        );
+
+        // --- B. Statistical properties of full FHE output ---
+
+        eprintln!("[fhe_d64] Analyzing full FHE output statistics...");
+
+        let dec_f64: Vec<f64> = decrypted.iter().map(|&v| v as f64).collect();
+        let n_f = trunc_d_model as f64;
+
+        // Non-zero count
+        let nonzero_count = decrypted.iter().filter(|&&v| v != 0).count();
+        let nonzero_frac = nonzero_count as f64 / n_f;
+
+        // Mean and standard deviation
+        let mean: f64 = dec_f64.iter().sum::<f64>() / n_f;
+        let variance: f64 = dec_f64.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / n_f;
+        let std_dev = variance.sqrt();
+
+        // Dynamic range
+        let min_val = decrypted.iter().copied().min().unwrap_or(0);
+        let max_val = decrypted.iter().copied().max().unwrap_or(0);
+        let dynamic_range = (max_val as i16) - (min_val as i16);
+
+        // Count positive/negative balance
+        let pos_count = decrypted.iter().filter(|&&v| v > 0).count();
+        let neg_count = decrypted.iter().filter(|&&v| v < 0).count();
+
+        eprintln!("[fhe_d64] Output statistics:");
+        eprintln!("[fhe_d64]   Non-zero: {nonzero_count}/{} ({:.1}%)", trunc_d_model, nonzero_frac * 100.0);
+        eprintln!("[fhe_d64]   Mean: {mean:.2}, Std: {std_dev:.2}");
+        eprintln!("[fhe_d64]   Min: {min_val}, Max: {max_val}, Dynamic range: {dynamic_range}");
+        eprintln!("[fhe_d64]   Positive: {pos_count}, Negative: {neg_count}, Zero: {}", trunc_d_model - pos_count - neg_count);
+
+        // Print side-by-side for first 16 dims
+        eprintln!("[fhe_d64] FHE output (first 16 dims):");
+        for i in 0..16.min(trunc_d_model) {
+            eprintln!("[fhe_d64]   dim[{i:2}]: FHE={:4}", decrypted[i]);
         }
+
+        // --- C. Assertions ---
+
+        // 1. Non-degeneracy: at least 30% of outputs are non-zero
+        assert!(
+            nonzero_frac >= 0.3,
+            "At least 30% of FHE outputs should be non-zero, got {:.1}%",
+            nonzero_frac * 100.0
+        );
+
+        // 2. Dynamic range: output should use a meaningful portion of the i8 range.
+        //    A degenerate pipeline would produce outputs clustered near zero or
+        //    saturated at ±127.
+        assert!(
+            dynamic_range >= 20,
+            "Output dynamic range ({dynamic_range}) should be >= 20, indicating non-trivial computation"
+        );
+
+        // 3. Sign balance: output should have both positive and negative values.
+        //    A one-sided output would suggest systematic bias from broken arithmetic.
+        assert!(
+            pos_count >= 5 && neg_count >= 5,
+            "Output should have both positive ({pos_count}) and negative ({neg_count}) values (>= 5 each)"
+        );
+
+        // 4. Standard deviation: should be non-trivial (not all same value)
+        assert!(
+            std_dev >= 5.0,
+            "Output std dev ({std_dev:.2}) should be >= 5.0, indicating varied computation"
+        );
+
+        // 5. QKV projection: linear operations should be close to cleartext
+        //    (validated above with q_mae < 30.0 assertion)
 
         eprintln!("[fhe_d64] E2E REAL TINYLLAMA FHE INFERENCE TEST PASSED");
         eprintln!("[fhe_d64] Pipeline: real BF16 safetensors -> INT8 quantize -> truncate d=64 -> encrypt -> transformer_block_vec -> decrypt");
+        eprintln!("[fhe_d64] QKV validation: Q MAE={q_mae:.2}, Q max_err={q_max_err}");
+        eprintln!("[fhe_d64] Output validation: non-zero={:.1}%, std={std_dev:.2}, range=[{min_val},{max_val}]", nonzero_frac * 100.0);
         eprintln!("[fhe_d64] Total wall time for FHE block: {:.2?}", elapsed);
     }
 }

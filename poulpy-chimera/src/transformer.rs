@@ -35,12 +35,13 @@ use crate::attention::{
     AttentionConfig, AttentionPlan, AttentionWeights, SoftmaxStrategy, plan_attention,
     chimera_qkv_project_single, chimera_attention_score, chimera_apply_softmax,
     chimera_attention_context, chimera_output_project,
+    chimera_multi_head_attention_vec,
 };
 use crate::bootstrapping::{
     BootstrappingConfig, ChimeraBootstrapKeyPrepared, chimera_bootstrap, needs_bootstrap,
 };
 use crate::encrypt::ChimeraEvalKey;
-use crate::layernorm::{LayerNormConfig, LayerNormPlan, chimera_rms_norm, plan_layernorm};
+use crate::layernorm::{LayerNormConfig, LayerNormPlan, chimera_rms_norm, chimera_rms_norm_vec, plan_layernorm};
 use crate::noise::NoiseTracker;
 use crate::params::{ChimeraParams, ModelDims};
 
@@ -1037,6 +1038,342 @@ where
     }
 
     (current, tracker)
+}
+
+// ===========================================================================
+// Vector-representation pipeline
+//
+// The functions below operate on `Vec<GLWE<Vec<u8>>>` — one ciphertext per
+// dimension, with each scalar value encoded in coefficient 0. This is the
+// representation needed for real model inference, where matrix-vector
+// products are computed as dot products of scalar ciphertexts with scalar
+// plaintext weights.
+//
+// The original single-ciphertext pipeline (above) remains unchanged for
+// backward compatibility with all 137+ existing tests.
+// ===========================================================================
+
+/// Computes a standard FFN in the vector representation.
+///
+/// `y_i = Σ_j W2[i][j] * activation(Σ_k W1[j][k] * x_k)`
+///
+/// Each element of `x_cts` encrypts one dimension of the input (value in
+/// coefficient 0). The output is a vector of the same kind.
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key.
+/// * `x_cts` - Input vector: one ct per dimension.
+/// * `weights` - FFN weight matrices.
+/// * `activation` - Which polynomial activation to apply.
+///
+/// # Returns
+///
+/// A vector of ciphertexts, one per output dimension (one per row of `w2`).
+pub fn chimera_ffn_standard_vec<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    weights: &FFNWeights,
+    activation: &ActivationChoice,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    assert!(!weights.w1.is_empty(), "W1 must have at least one row");
+    assert!(!weights.w2.is_empty(), "W2 must have at least one row");
+    let d_in = x_cts.len();
+
+    // Phase 1: Up-projection — h_j = Σ_k W1[j][k] * x_k
+    let approx = activation_to_poly(activation);
+    let d_ffn = weights.w1.len();
+    let mut h_act = Vec::with_capacity(d_ffn);
+    for j in 0..d_ffn {
+        let w_vecs: Vec<Vec<i64>> = weights.w1[j][..d_in].iter().map(|&w| vec![w]).collect();
+        let hj = crate::arithmetic::chimera_dot_product(module, x_cts, &w_vecs);
+
+        // Phase 2: Activation on each hidden dimension
+        let hj_act = apply_poly_activation(module, eval_key, &hj, &approx);
+        h_act.push(hj_act);
+    }
+
+    // Phase 3: Down-projection — y_i = Σ_j W2[i][j] * h'_j
+    let mut outputs = Vec::with_capacity(weights.w2.len());
+    for w2_row in &weights.w2 {
+        let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
+        let dot = crate::arithmetic::chimera_dot_product(module, &h_act, &w2_vecs);
+        outputs.push(dot);
+    }
+
+    outputs
+}
+
+/// Computes a SwiGLU FFN in the vector representation.
+///
+/// `y_i = Σ_j W_down[i][j] * (SiLU(Σ_k W_gate[j][k] * x_k) ⊙ (Σ_k W_up[j][k] * x_k))`
+pub fn chimera_ffn_swiglu_vec<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    weights: &FFNWeights,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    assert!(!weights.w1.is_empty(), "W_gate must have at least one row");
+    assert!(!weights.w2.is_empty(), "W_down must have at least one row");
+    let w_up = weights.w3.as_ref().expect("SwiGLU requires w3 (W_up)");
+    assert_eq!(weights.w1.len(), w_up.len(), "W_gate and W_up must have same row count");
+    let d_in = x_cts.len();
+    let d_ffn = weights.w1.len();
+
+    // Phase 1+2: Gate projection + SiLU, Up projection, element-wise product
+    let silu_approx = silu_poly_approx();
+    let mut h = Vec::with_capacity(d_ffn);
+    for j in 0..d_ffn {
+        // Gate: gate_j = Σ_k W_gate[j][k] * x_k
+        let wg_vecs: Vec<Vec<i64>> = weights.w1[j][..d_in].iter().map(|&w| vec![w]).collect();
+        let gate_j = crate::arithmetic::chimera_dot_product(module, x_cts, &wg_vecs);
+
+        // Up: up_j = Σ_k W_up[j][k] * x_k
+        let wu_vecs: Vec<Vec<i64>> = w_up[j][..d_in].iter().map(|&w| vec![w]).collect();
+        let up_j = crate::arithmetic::chimera_dot_product(module, x_cts, &wu_vecs);
+
+        // SiLU(gate_j)
+        let gate_activated = apply_poly_activation(module, eval_key, &gate_j, &silu_approx);
+
+        // Project up_j to match gate_activated's layout
+        let gate_layout = GLWELayout {
+            n: gate_activated.n(),
+            base2k: gate_activated.base2k(),
+            k: gate_activated.k(),
+            rank: gate_activated.rank(),
+        };
+        let up_proj = if up_j.base2k() == gate_activated.base2k() {
+            up_j
+        } else {
+            chimera_project_layout(module, &up_j, &gate_layout)
+        };
+
+        // Element-wise: SiLU(gate_j) ⊙ up_j
+        let hj = chimera_ct_mul(module, eval_key, &gate_activated, &up_proj);
+        h.push(hj);
+    }
+
+    // Phase 3: Down projection — y_i = Σ_j W_down[i][j] * h_j
+    let mut outputs = Vec::with_capacity(weights.w2.len());
+    for w2_row in &weights.w2 {
+        let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
+        let dot = crate::arithmetic::chimera_dot_product(module, &h, &w2_vecs);
+        outputs.push(dot);
+    }
+
+    outputs
+}
+
+/// Dispatches to the appropriate vector-based FFN variant.
+pub fn chimera_ffn_vec<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    weights: &FFNWeights,
+    config: &FFNConfig,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    match config {
+        FFNConfig::Standard { activation } => {
+            chimera_ffn_standard_vec(module, eval_key, x_cts, weights, activation)
+        }
+        FFNConfig::SwiGLU => chimera_ffn_swiglu_vec(module, eval_key, x_cts, weights),
+    }
+}
+
+/// Evaluates a complete transformer block in the vector representation.
+///
+/// This is the vector-representation variant of [`chimera_transformer_block`].
+/// Each element of the input and output is a separate ciphertext encoding
+/// one scalar dimension (value in coefficient 0).
+///
+/// Implements the pre-norm architecture:
+///
+/// ```text
+/// x = x + Attention(RMSNorm(x))
+/// x = x + FFN(RMSNorm(x))
+/// ```
+///
+/// All intermediate computations (RMSNorm, attention, FFN) operate on the
+/// full `Vec<GLWE>` without truncation. Residual connections add the full
+/// d_model-length vectors element-wise.
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key.
+/// * `x_cts` - Input vector: d_model ciphertexts.
+/// * `config` - Transformer block configuration.
+/// * `weights` - Weight matrices for this block.
+///
+/// # Returns
+///
+/// d_model ciphertexts representing the block output.
+pub fn chimera_transformer_block_vec<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    config: &TransformerBlockConfig,
+    weights: &TransformerBlockWeights,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE> + GLWEAutomorphism<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    let _d_model = x_cts.len();
+
+    // Step 1: Pre-attention RMSNorm
+    let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+        Some(gamma) => config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+        None => config.pre_attn_norm.clone(),
+    };
+    let normed_pre_attn = chimera_rms_norm_vec(module, eval_key, x_cts, &pre_attn_norm_cfg);
+
+    // Step 2: Multi-head attention (vector representation)
+    //
+    // chimera_multi_head_attention_vec takes Vec<GLWE> input (one per dim)
+    // and returns Vec<GLWE> output (one per dim). It uses dot products
+    // for QKV projection and output projection rather than ring products.
+    let attn_out = chimera_multi_head_attention_vec(
+        module,
+        eval_key,
+        &normed_pre_attn,
+        &weights.attention,
+        &config.attention,
+    );
+
+    // Step 3: Residual connection (attention)
+    let residual_1 = if config.residual {
+        project_and_add_vec(module, x_cts, &attn_out)
+    } else {
+        attn_out
+    };
+
+    // Step 4: Pre-FFN RMSNorm
+    let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
+        Some(gamma) => config.pre_ffn_norm.clone().with_gamma(gamma.clone()),
+        None => config.pre_ffn_norm.clone(),
+    };
+    let normed_pre_ffn = chimera_rms_norm_vec(module, eval_key, &residual_1, &pre_ffn_norm_cfg);
+
+    // Step 5: FFN (vector representation — returns full d_model output)
+    let ffn_out = chimera_ffn_vec(module, eval_key, &normed_pre_ffn, &weights.ffn, &config.ffn);
+
+    // Step 6: Residual connection (FFN)
+    if config.residual {
+        project_and_add_vec(module, &residual_1, &ffn_out)
+    } else {
+        ffn_out
+    }
+}
+
+/// Projects two ciphertext vectors to matching layouts and adds element-wise.
+///
+/// Used for residual connections in the vector pipeline. Handles the case
+/// where `a` and `b` may have different base2k/k after tensor products.
+fn project_and_add_vec<BE: Backend>(
+    module: &Module<BE>,
+    a: &[GLWE<Vec<u8>>],
+    b: &[GLWE<Vec<u8>>],
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchAvailable,
+{
+    assert_eq!(a.len(), b.len(), "project_and_add_vec: length mismatch");
+    let d = a.len();
+    let mut result = Vec::with_capacity(d);
+
+    for i in 0..d {
+        let (ai_proj, bi_ref) = if a[i].base2k() == b[i].base2k() && a[i].k() == b[i].k() {
+            // Layouts match — clone a[i]
+            let ai_cloned = clone_glwe(&a[i]);
+            (ai_cloned, &b[i])
+        } else {
+            // Project a[i] to match b[i]'s layout
+            let target = GLWELayout {
+                n: b[i].n(),
+                base2k: b[i].base2k(),
+                k: b[i].k(),
+                rank: b[i].rank(),
+            };
+            let projected = chimera_project_layout(module, &a[i], &target);
+            (projected, &b[i])
+        };
+        result.push(chimera_add(module, &ai_proj, bi_ref));
+    }
+
+    result
+}
+
+/// Clones a GLWE ciphertext (deep copy of data buffer).
+fn clone_glwe(ct: &GLWE<Vec<u8>>) -> GLWE<Vec<u8>> {
+    use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+    let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(ct);
+    {
+        let src_ref = ct.to_ref();
+        let src: &[u8] = src_ref.data().data;
+        let mut dst_mut = cloned.to_mut();
+        let dst: &mut [u8] = dst_mut.data_mut().data;
+        let len = src.len().min(dst.len());
+        dst[..len].copy_from_slice(&src[..len]);
+    }
+    cloned
+}
+
+/// Evaluates a sequence of transformer blocks in the vector representation.
+///
+/// Chains `num_layers` transformer blocks, feeding the full d_model output
+/// of each block as the input to the next.
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key.
+/// * `x_cts` - Initial input: d_model ciphertexts.
+/// * `config` - Block configuration (shared across layers).
+/// * `layer_weights` - Per-layer weights.
+///
+/// # Returns
+///
+/// d_model ciphertexts representing the final output.
+pub fn chimera_forward_pass_vec<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    config: &TransformerBlockConfig,
+    layer_weights: &[TransformerBlockWeights],
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE> + GLWEAutomorphism<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    let mut current: Vec<GLWE<Vec<u8>>> = x_cts.iter().map(|ct| clone_glwe(ct)).collect();
+
+    for weights in layer_weights {
+        current = chimera_transformer_block_vec(module, eval_key, &current, config, weights);
+    }
+
+    current
 }
 
 #[cfg(test)]

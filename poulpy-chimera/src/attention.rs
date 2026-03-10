@@ -45,12 +45,12 @@
 //! - **Output projection**: `chimera_matmul_single_ct` with plaintext W_O
 
 use crate::activations::{PolyApprox, apply_poly_activation, chimera_ct_mul, squared_relu_approx};
-use crate::arithmetic::{chimera_add, chimera_mul_const, chimera_matmul_single_ct, chimera_slot_sum};
+use crate::arithmetic::{chimera_add, chimera_sub, chimera_mul_const, chimera_matmul_single_ct, chimera_project_layout, chimera_slot_sum};
 use crate::encrypt::ChimeraEvalKey;
 use crate::params::{ChimeraParams, ModelDims};
 use poulpy_core::{
-    GLWEAdd, GLWEMulConst, GLWETensoring, GLWETrace,
-    layouts::GLWE,
+    GLWEAdd, GLWEMulConst, GLWESub, GLWETensoring, GLWETrace,
+    layouts::{GLWE, GLWEInfos, GLWELayout, LWEInfos},
 };
 use poulpy_hal::{
     api::{ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
@@ -109,30 +109,159 @@ impl SoftmaxStrategy {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RoPE (Rotary Position Embedding)
+// ---------------------------------------------------------------------------
+
+/// Precomputed RoPE rotation factors for a given position and dimension.
+#[derive(Clone, Debug)]
+pub struct RoPEConfig {
+    /// cos(θ_i) values scaled to integer representation, one per pair (d_head/2 entries).
+    pub cos_table: Vec<i64>,
+    /// sin(θ_i) values scaled to integer representation, one per pair (d_head/2 entries).
+    pub sin_table: Vec<i64>,
+}
+
+/// Precomputes RoPE rotation factors for a given position and head dimension.
+///
+/// # Arguments
+/// * `position` - Token position in the sequence (0-indexed)
+/// * `d_head` - Head dimension (must be even)
+/// * `scale_bits` - Number of bits for integer scaling of cos/sin values (e.g. 7 for range [-127, 127])
+/// * `base` - RoPE base frequency (default 10000.0 for LLaMA)
+///
+/// # Panics
+/// Panics if `d_head` is odd.
+pub fn precompute_rope(position: usize, d_head: usize, scale_bits: u32, base: f64) -> RoPEConfig {
+    assert!(d_head % 2 == 0, "precompute_rope: d_head ({d_head}) must be even");
+
+    let n_pairs = d_head / 2;
+    let scale = (1i64 << scale_bits) as f64;
+    let mut cos_table = Vec::with_capacity(n_pairs);
+    let mut sin_table = Vec::with_capacity(n_pairs);
+
+    for i in 0..n_pairs {
+        let theta = (position as f64) / base.powf(2.0 * i as f64 / d_head as f64);
+        cos_table.push(theta.cos().mul_add(scale, 0.0).round() as i64);
+        sin_table.push(theta.sin().mul_add(scale, 0.0).round() as i64);
+    }
+
+    RoPEConfig { cos_table, sin_table }
+}
+
+/// Applies RoPE rotation to encrypted Q or K vectors in the vector representation.
+///
+/// Each element of `q_or_k` is a ciphertext encrypting a single dimension.
+/// Dimensions are rotated in pairs: (0,1), (2,3), (4,5), etc.
+///
+/// For each pair (2i, 2i+1):
+/// - `out[2i]   = q[2i] * cos[i] - q[2i+1] * sin[i]`
+/// - `out[2i+1] = q[2i] * sin[i] + q[2i+1] * cos[i]`
+///
+/// The cos/sin values are precomputed cleartext scalars, so this only
+/// requires ct-pt multiplications and additions — no ct*ct operations.
+///
+/// # Arguments
+/// * `module` - Backend module
+/// * `q_or_k` - d_head ciphertexts to rotate
+/// * `rope` - Precomputed RoPE rotation factors
+///
+/// # Returns
+/// d_head ciphertexts with RoPE rotation applied
+///
+/// # Panics
+/// Panics if `q_or_k.len()` is odd or doesn't match `rope.cos_table.len() * 2`
+pub fn chimera_apply_rope_vec<BE: Backend>(
+    module: &Module<BE>,
+    q_or_k: &[GLWE<Vec<u8>>],
+    rope: &RoPEConfig,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWEMulConst<BE> + GLWEAdd + GLWESub,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchAvailable,
+{
+    let d_head = q_or_k.len();
+    assert!(
+        d_head % 2 == 0,
+        "chimera_apply_rope_vec: input length ({d_head}) must be even"
+    );
+    assert_eq!(
+        d_head,
+        rope.cos_table.len() * 2,
+        "chimera_apply_rope_vec: input length ({d_head}) != 2 * cos_table.len() ({})",
+        rope.cos_table.len() * 2
+    );
+
+    let n_pairs = d_head / 2;
+    let mut out = Vec::with_capacity(d_head);
+
+    for i in 0..n_pairs {
+        let cos_i = rope.cos_table[i];
+        let sin_i = rope.sin_table[i];
+
+        // q[2i] * cos[i]
+        let even_cos = chimera_mul_const(module, &q_or_k[2 * i], &[cos_i]);
+        // q[2i+1] * sin[i]
+        let odd_sin = chimera_mul_const(module, &q_or_k[2 * i + 1], &[sin_i]);
+        // out[2i] = q[2i] * cos[i] - q[2i+1] * sin[i]
+        let out_even = chimera_sub(module, &even_cos, &odd_sin);
+
+        // q[2i] * sin[i]
+        let even_sin = chimera_mul_const(module, &q_or_k[2 * i], &[sin_i]);
+        // q[2i+1] * cos[i]
+        let odd_cos = chimera_mul_const(module, &q_or_k[2 * i + 1], &[cos_i]);
+        // out[2i+1] = q[2i] * sin[i] + q[2i+1] * cos[i]
+        let out_odd = chimera_add(module, &even_sin, &odd_cos);
+
+        out.push(out_even);
+        out.push(out_odd);
+    }
+
+    out
+}
+
 /// Weight matrices for a single attention layer (in plaintext).
 ///
-/// Each matrix is stored as a flat vector of i64 values (quantised INT8
-/// weights scaled to torus representation).
+/// Each matrix is stored as a `Vec<Vec<i64>>` where each inner Vec is one
+/// output row of i64 values (quantised INT8 weights scaled to torus
+/// representation).
+///
+/// ## GQA (Grouped Query Attention)
+///
+/// When `n_kv_heads < n_heads`, K and V projections are smaller:
+/// - `w_q`: `[d_model × d_model]` — full-size query projection
+/// - `w_k`: `[d_kv × d_model]` — reduced key projection (`d_kv = n_kv_heads * d_head`)
+/// - `w_v`: `[d_kv × d_model]` — reduced value projection
+/// - `w_o`: `[d_model × d_model]` — full-size output projection
+///
+/// For standard MHA (`n_kv_heads == n_heads`), `d_kv == d_model` and all
+/// matrices are square.
 #[derive(Clone, Debug)]
 pub struct AttentionWeights {
-    /// Query projection: [d_model × d_model]
+    /// Query projection: `[d_model]` rows, each `[d_model]` long.
     pub w_q: Vec<Vec<i64>>,
-    /// Key projection: [d_model × d_model]
+    /// Key projection: `[d_kv]` rows, each `[d_model]` long.
+    /// For GQA, `d_kv = n_kv_heads * d_head < d_model`.
     pub w_k: Vec<Vec<i64>>,
-    /// Value projection: [d_model × d_model]
+    /// Value projection: `[d_kv]` rows, each `[d_model]` long.
+    /// For GQA, `d_kv = n_kv_heads * d_head < d_model`.
     pub w_v: Vec<Vec<i64>>,
-    /// Output projection: [d_model × d_model]
+    /// Output projection: `[d_model]` rows, each `[d_model]` long.
     pub w_o: Vec<Vec<i64>>,
 }
 
 impl AttentionWeights {
     /// Creates zero-initialised weights for the given dimensions.
+    ///
+    /// K and V projections use `d_kv()` rows (reduced for GQA).
     pub fn zeros(dims: &ModelDims) -> Self {
         let d = dims.d_model;
+        let d_kv = dims.d_kv();
         AttentionWeights {
             w_q: vec![vec![0i64; d]; d],
-            w_k: vec![vec![0i64; d]; d],
-            w_v: vec![vec![0i64; d]; d],
+            w_k: vec![vec![0i64; d]; d_kv],
+            w_v: vec![vec![0i64; d]; d_kv],
             w_o: vec![vec![0i64; d]; d],
         }
     }
@@ -260,6 +389,14 @@ where
 /// # Returns
 ///
 /// Tuple of (Q_cts, K_cts, V_cts) where each is a Vec of ciphertexts.
+///
+/// # Note
+///
+/// This function uses the same `n_rows` for Q, K, and V, so it only works
+/// for standard MHA (n_kv_heads == n_heads). For GQA, use the packed
+/// single-ct variant in [`chimera_multi_head_attention`] which handles
+/// separate Q/KV row counts directly.
+#[allow(dead_code)]
 pub fn chimera_qkv_project<BE: Backend>(
     module: &Module<BE>,
     ct_x: &GLWE<Vec<u8>>,
@@ -539,6 +676,8 @@ where
     let d_model = config.dims.d_model;
     let n_heads = config.dims.n_heads;
     let d_head = config.dims.d_head;
+    let d_kv = config.dims.d_kv();
+    let gqa_group = config.dims.gqa_group_size();
 
     assert_eq!(
         d_model,
@@ -551,13 +690,13 @@ where
         weights.w_q.len()
     );
     assert!(
-        weights.w_k.len() >= d_model,
-        "chimera_multi_head_attention: w_k has {} rows, need {d_model}",
+        weights.w_k.len() >= d_kv,
+        "chimera_multi_head_attention: w_k has {} rows, need {d_kv}",
         weights.w_k.len()
     );
     assert!(
-        weights.w_v.len() >= d_model,
-        "chimera_multi_head_attention: w_v has {} rows, need {d_model}",
+        weights.w_v.len() >= d_kv,
+        "chimera_multi_head_attention: w_v has {} rows, need {d_kv}",
         weights.w_v.len()
     );
     assert!(
@@ -571,30 +710,39 @@ where
     //
     // Q = W_Q · x produces d_model ciphertexts (one per output dimension).
     // Rows [h*d_head..(h+1)*d_head] belong to head h.
+    //
+    // K, V projections produce d_kv ciphertexts (n_kv_heads * d_head).
+    // For GQA, multiple Q heads share the same KV head.
     // -----------------------------------------------------------------------
-    let (q_all, k_all, v_all) = chimera_qkv_project(module, ct_x, weights, d_model);
+    let q_all = chimera_matmul_single_ct(module, ct_x, &weights.w_q[..d_model].to_vec());
+    let k_all = chimera_matmul_single_ct(module, ct_x, &weights.w_k[..d_kv].to_vec());
+    let v_all = chimera_matmul_single_ct(module, ct_x, &weights.w_v[..d_kv].to_vec());
 
     // -----------------------------------------------------------------------
     // Step 2: Per-head attention computation.
     //
-    // For each head h:
+    // For each query head h:
     //   Q_h = q_all[h*d_head..(h+1)*d_head]  (d_head ciphertexts)
-    //   K_h = k_all[h*d_head..(h+1)*d_head]
-    //   V_h = v_all[h*d_head..(h+1)*d_head]
+    //   kv_h = h / gqa_group  (the KV head this query head maps to)
+    //   K_kv = k_all[kv_h*d_head..(kv_h+1)*d_head]
+    //   V_kv = v_all[kv_h*d_head..(kv_h+1)*d_head]
     //
-    //   score_h = Σ_i Q_h[i] * K_h[i]   (dot product: d_head ct*ct muls + additions)
-    //   attn_h  = softmax(score_h)        (single score for seq_len=1)
-    //   context_h = attn_h * V_h          (d_head ct*ct muls)
+    //   score_h = Σ_i Q_h[i] * K_kv[i]   (dot product)
+    //   attn_h  = softmax(score_h)
+    //   context_h = attn_h * V_kv
     // -----------------------------------------------------------------------
     let mut all_head_contexts: Vec<GLWE<Vec<u8>>> = Vec::with_capacity(d_model);
 
     for h in 0..n_heads {
-        let start = h * d_head;
-        let end = start + d_head;
+        let q_start = h * d_head;
+        let q_end = q_start + d_head;
+        let q_h = &q_all[q_start..q_end];
 
-        let q_h = &q_all[start..end];
-        let k_h = &k_all[start..end];
-        let v_h = &v_all[start..end];
+        let kv_h = h / gqa_group;
+        let kv_start = kv_h * d_head;
+        let kv_end = kv_start + d_head;
+        let k_h = &k_all[kv_start..kv_end];
+        let v_h = &v_all[kv_start..kv_end];
 
         // Compute attention score for this head:
         // score_h = Σ_i Q_h[i] ⊙ K_h[i]
@@ -721,17 +869,189 @@ where
     // The attention weight is a scalar (replicated in coefficient 0 after
     // the score computation). For each value dimension j, we compute the
     // ct*ct product of the weight and V[j].
+    //
+    // V[j] may be at a different base2k than attn_weight (e.g. V at
+    // in_base2k=13 from QKV projection, attn_weight at out_base2k=12
+    // after tensor product). We project V[j] to match before the multiply.
     // -----------------------------------------------------------------------
+    let attn_layout = GLWELayout {
+        n: attn_weight.n(),
+        base2k: attn_weight.base2k(),
+        k: attn_weight.k(),
+        rank: attn_weight.rank(),
+    };
     let mut context = Vec::with_capacity(d_head);
     for j in 0..d_head {
-        let ctx_j = chimera_ct_mul(module, eval_key, attn_weight, &v_h[j]);
+        let v_proj = if v_h[j].base2k() == attn_weight.base2k() && v_h[j].k() == attn_weight.k() {
+            // Layouts match — clone V[j]
+            use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+            let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(&v_h[j]);
+            {
+                let src_ref = v_h[j].to_ref();
+                let src: &[u8] = src_ref.data().data;
+                let mut dst_mut = cloned.to_mut();
+                let dst: &mut [u8] = dst_mut.data_mut().data;
+                let len = src.len().min(dst.len());
+                dst[..len].copy_from_slice(&src[..len]);
+            }
+            cloned
+        } else {
+            chimera_project_layout(module, &v_h[j], &attn_layout)
+        };
+        let ctx_j = chimera_ct_mul(module, eval_key, attn_weight, &v_proj);
         context.push(ctx_j);
     }
 
     context
 }
 
-/// Evaluates polynomial softmax on plaintext scores (for verification).
+/// Computes Q, K, V projections in the vector representation.
+///
+/// Each input ciphertext `x_cts[j]` encrypts a single dimension of the
+/// input vector (value in coeff 0). The projection `Q_i = Σ_j W_Q[i][j] * x_j`
+/// is computed as a [`chimera_dot_product`] per output dimension.
+///
+/// For GQA, K and V have fewer output rows (`n_kv_rows`) than Q (`n_q_rows`).
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `x_cts` - Input vector: one ciphertext per dimension (d_model total).
+/// * `weights` - Attention weight matrices.
+/// * `n_q_rows` - Number of Q output rows (typically d_model).
+/// * `n_kv_rows` - Number of K/V output rows (d_kv for GQA, d_model for MHA).
+///
+/// # Returns
+///
+/// Tuple of (Q_cts, K_cts, V_cts) where Q has `n_q_rows` and K/V have `n_kv_rows` ciphertexts.
+pub fn chimera_qkv_project_vec<BE: Backend>(
+    module: &Module<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    weights: &AttentionWeights,
+    n_q_rows: usize,
+    n_kv_rows: usize,
+) -> (Vec<GLWE<Vec<u8>>>, Vec<GLWE<Vec<u8>>>, Vec<GLWE<Vec<u8>>>)
+where
+    Module<BE>: GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchAvailable,
+{
+    let d_in = x_cts.len();
+
+    let project_one_matrix = |w_rows: &[Vec<i64>], n_rows: usize| -> Vec<GLWE<Vec<u8>>> {
+        let mut outs = Vec::with_capacity(n_rows);
+        for i in 0..n_rows {
+            // W[i] is [d_model] — one weight per input dimension.
+            // Convert to single-coefficient weight vectors for dot product.
+            assert!(
+                w_rows[i].len() >= d_in,
+                "Weight row {i} has {} elements, need {d_in}",
+                w_rows[i].len()
+            );
+            let w_vecs: Vec<Vec<i64>> = w_rows[i][..d_in].iter().map(|&w| vec![w]).collect();
+            let dot = crate::arithmetic::chimera_dot_product(module, x_cts, &w_vecs);
+            outs.push(dot);
+        }
+        outs
+    };
+
+    let q_cts = project_one_matrix(&weights.w_q, n_q_rows);
+    let k_cts = project_one_matrix(&weights.w_k, n_kv_rows);
+    let v_cts = project_one_matrix(&weights.w_v, n_kv_rows);
+
+    (q_cts, k_cts, v_cts)
+}
+
+/// Computes multi-head attention in the vector representation.
+///
+/// This is the vector-representation variant of [`chimera_multi_head_attention`].
+/// Each element of the input and output is a separate ciphertext encoding a
+/// single scalar (value in coefficient 0).
+///
+/// ## Computation Flow
+///
+/// 1. **QKV projection**: `Q_i = Σ_j W_Q[i][j] * x_j` (dot product per output dim)
+/// 2. **Per-head attention**: For each head h with dims [h*d_head..(h+1)*d_head]:
+///    - Score: `s_h = Σ_k Q_h[k] * K_h[k]` (ct*ct dot product)
+///    - Softmax: polynomial approximation applied to s_h
+///    - Context: `c_h[k] = attn_h * V_h[k]` (ct*ct broadcast multiply)
+/// 3. **Output projection**: `out_i = Σ_j W_O[i][j] * context[j]`
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key (tensor key for ct*ct).
+/// * `x_cts` - Input vector: d_model ciphertexts, each encrypting one scalar.
+/// * `weights` - Attention weight matrices [d_model × d_model].
+/// * `config` - Attention configuration (dims, softmax strategy).
+///
+/// # Returns
+///
+/// d_model ciphertexts representing the attention output.
+pub fn chimera_multi_head_attention_vec<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    weights: &AttentionWeights,
+    config: &AttentionConfig,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    let d_model = config.dims.d_model;
+    let n_heads = config.dims.n_heads;
+    let d_head = config.dims.d_head;
+    let d_kv = config.dims.d_kv();
+    let gqa_group = config.dims.gqa_group_size();
+
+    assert_eq!(
+        d_model,
+        n_heads * d_head,
+        "chimera_multi_head_attention_vec: d_model ({d_model}) != n_heads ({n_heads}) * d_head ({d_head})"
+    );
+    assert_eq!(
+        x_cts.len(),
+        d_model,
+        "chimera_multi_head_attention_vec: input has {} cts, expected {d_model}",
+        x_cts.len()
+    );
+
+    // Step 1: QKV projections
+    // Q produces d_model outputs; K and V produce d_kv outputs each.
+    let (q_all, k_all, v_all) = chimera_qkv_project_vec(module, x_cts, weights, d_model, d_kv);
+
+    // Step 2: Per-head attention with GQA mapping
+    let mut all_head_contexts: Vec<GLWE<Vec<u8>>> = Vec::with_capacity(d_model);
+
+    for h in 0..n_heads {
+        let q_start = h * d_head;
+        let q_end = q_start + d_head;
+        let q_h = &q_all[q_start..q_end];
+
+        let kv_h = h / gqa_group;
+        let kv_start = kv_h * d_head;
+        let kv_end = kv_start + d_head;
+        let k_h = &k_all[kv_start..kv_end];
+        let v_h = &v_all[kv_start..kv_end];
+
+        let head_context = chimera_single_head_attention(
+            module, eval_key, q_h, k_h, v_h, &config.softmax_approx,
+        );
+        all_head_contexts.extend(head_context);
+    }
+
+    // Step 3: Output projection — out_i = Σ_j W_O[i][j] * context[j]
+    let mut outputs = Vec::with_capacity(d_model);
+    for row in weights.w_o.iter().take(d_model) {
+        let w_vecs: Vec<Vec<i64>> = row.iter().map(|&w| vec![w]).collect();
+        let dot = crate::arithmetic::chimera_dot_product(module, &all_head_contexts, &w_vecs);
+        outputs.push(dot);
+    }
+
+    outputs
+}
 ///
 /// poly_softmax(x_i) = p(x_i) / Σ_j p(x_j)
 /// where p(x) = (1 + x + x²/2)² (degree-4 approximation of exp)
@@ -952,5 +1272,100 @@ mod tests {
         let decoded = decode_int8(&module, &params, &pt_dec, 2);
         assert!((decoded[0] as i16 - 3).unsigned_abs() <= 1, "linear softmax[0] expected 3, got {}", decoded[0]);
         assert!((decoded[1] as i16 - 5).unsigned_abs() <= 1, "linear softmax[1] expected 5, got {}", decoded[1]);
+    }
+
+    #[test]
+    fn test_rope_precompute() {
+        // Position 0: θ_i = 0 for all i, so cos=1, sin=0.
+        let rope0 = precompute_rope(0, 4, 7, 10000.0);
+        assert_eq!(rope0.cos_table.len(), 2, "d_head=4 should give 2 pairs");
+        assert_eq!(rope0.sin_table.len(), 2);
+        // cos(0) * 128 = 128, sin(0) * 128 = 0
+        let scale = 1i64 << 7; // 128
+        for i in 0..2 {
+            assert!(
+                (rope0.cos_table[i] - scale).abs() <= 1,
+                "pos=0 cos[{i}] expected {scale}, got {}", rope0.cos_table[i]
+            );
+            assert!(
+                rope0.sin_table[i].abs() <= 1,
+                "pos=0 sin[{i}] expected 0, got {}", rope0.sin_table[i]
+            );
+        }
+
+        // Position 5: cos/sin should be non-trivial for at least pair 0.
+        let rope5 = precompute_rope(5, 4, 7, 10000.0);
+        assert_eq!(rope5.cos_table.len(), 2);
+        assert_eq!(rope5.sin_table.len(), 2);
+        // θ_0 = 5 / 10000^(0/4) = 5.0, so cos(5) ≈ 0.2837, sin(5) ≈ -0.9589
+        // cos_scaled ≈ round(0.2837 * 128) = 36, sin_scaled ≈ round(-0.9589 * 128) = -123
+        let expected_cos0 = (5.0f64.cos() * 128.0).round() as i64;
+        let expected_sin0 = (5.0f64.sin() * 128.0).round() as i64;
+        assert!(
+            (rope5.cos_table[0] - expected_cos0).abs() <= 1,
+            "pos=5 cos[0] expected {expected_cos0}, got {}", rope5.cos_table[0]
+        );
+        assert!(
+            (rope5.sin_table[0] - expected_sin0).abs() <= 1,
+            "pos=5 sin[0] expected {expected_sin0}, got {}", rope5.sin_table[0]
+        );
+    }
+
+    #[test]
+    fn test_rope_apply_identity() {
+        // At position 0, cos(0)=1 and sin(0)=0, so RoPE should approximately
+        // preserve the input vector. We use scale_bits=0 so that the cos/sin
+        // scaling factor is 2^0 = 1, meaning cos_scaled=1, sin_scaled=0.
+        // This way mul_const(ct, [1]) produces the original value without
+        // overflow.
+        use crate::encoding::{decode_int8, encode_int8};
+        use crate::encrypt::{chimera_decrypt, chimera_encrypt, ChimeraKey};
+        use poulpy_hal::api::ModuleNew;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [1u8; 32]);
+
+        let values: Vec<i8> = vec![10, 20, 30, 40];
+
+        // Encrypt each value as a separate ciphertext (vector representation)
+        let mut cts: Vec<GLWE<Vec<u8>>> = Vec::new();
+        for (idx, &v) in values.iter().enumerate() {
+            let pt = encode_int8(&module, &params, &[v]);
+            let mut seed_a = [0u8; 32];
+            let mut seed_e = [0u8; 32];
+            seed_a[0] = (idx * 2 + 10) as u8;
+            seed_e[0] = (idx * 2 + 11) as u8;
+            let ct = chimera_encrypt(&module, &key, &pt, seed_a, seed_e);
+            cts.push(ct);
+        }
+
+        // Precompute RoPE at position 0 with scale_bits=0 (cos=1, sin=0)
+        let rope = precompute_rope(0, 4, 0, 10000.0);
+        // Verify precomputed values
+        assert_eq!(rope.cos_table, vec![1, 1], "cos(0) scaled by 1 should be 1");
+        assert_eq!(rope.sin_table, vec![0, 0], "sin(0) scaled by 1 should be 0");
+
+        // Apply RoPE
+        let rotated = chimera_apply_rope_vec(&module, &cts, &rope);
+        assert_eq!(rotated.len(), 4);
+
+        // With cos=1, sin=0:
+        //   out[0] = q[0]*1 - q[1]*0 = q[0]
+        //   out[1] = q[0]*0 + q[1]*1 = q[1]
+        //   out[2] = q[2]*1 - q[3]*0 = q[2]
+        //   out[3] = q[2]*0 + q[3]*1 = q[3]
+        // So the output should approximately equal the input.
+        for (idx, &v) in values.iter().enumerate() {
+            let pt_dec = chimera_decrypt(&module, &key, &rotated[idx], &params);
+            let decoded = decode_int8(&module, &params, &pt_dec, 1);
+            let expected = v as i16;
+            let diff = (decoded[0] as i16 - expected).unsigned_abs();
+            assert!(
+                diff <= 2,
+                "RoPE identity at idx {idx}: expected ~{expected}, got {}, diff={diff}",
+                decoded[0]
+            );
+        }
     }
 }

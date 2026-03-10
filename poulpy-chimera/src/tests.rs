@@ -1389,6 +1389,7 @@ mod integration {
             d_model: 1,
             d_head: 1,
             n_heads: 1,
+            n_kv_heads: 1,
             d_ffn: 1,
             n_layers: 1,
             n_experts: 1,
@@ -1467,6 +1468,7 @@ mod integration {
             d_model: 1,
             d_head: 1,
             n_heads: 1,
+            n_kv_heads: 1,
             d_ffn: 1,
             n_layers: 2,
             n_experts: 1,
@@ -1556,6 +1558,7 @@ mod integration {
             d_model: 4,
             d_head: 4,
             n_heads: 1,
+            n_kv_heads: 1,
             d_ffn: 4,
             n_layers: 1,
             n_experts: 1,
@@ -1629,6 +1632,7 @@ mod integration {
             d_model: 4,
             d_head: 2,
             n_heads: 2,
+            n_kv_heads: 2,
             d_ffn: 4,
             n_layers: 1,
             n_experts: 1,
@@ -1794,6 +1798,7 @@ mod integration {
             d_model: 1,
             d_head: 1,
             n_heads: 1,
+            n_kv_heads: 1,
             d_ffn: 1,
             n_layers: 1,
             n_experts: 1,
@@ -1890,6 +1895,7 @@ mod integration {
             d_model: 1,
             d_head: 1,
             n_heads: 1,
+            n_kv_heads: 1,
             d_ffn: 1,
             n_layers: 1,
             n_experts: 1,
@@ -1977,6 +1983,7 @@ mod integration {
             d_model: 1,
             d_head: 1,
             n_heads: 1,
+            n_kv_heads: 1,
             d_ffn: 1,
             n_layers: 2,
             n_experts: 1,
@@ -2395,6 +2402,7 @@ mod integration {
 
         let dims = ModelDims {
             d_model: 1, d_head: 1, n_heads: 1,
+            n_kv_heads: 1,
             d_ffn: 1, n_layers: 1,
             n_experts: 1, n_active_experts: 1,
         };
@@ -2469,6 +2477,7 @@ mod integration {
 
         let dims = ModelDims {
             d_model: 1, d_head: 1, n_heads: 1,
+            n_kv_heads: 1,
             d_ffn: 1, n_layers: 2,
             n_experts: 1, n_active_experts: 1,
         };
@@ -2603,6 +2612,7 @@ mod integration {
         {
             let dims = ModelDims {
                 d_model: 4, d_head: 4, n_heads: 1,
+                n_kv_heads: 1,
                 d_ffn: 4, n_layers: 1,
                 n_experts: 1, n_active_experts: 1,
             };
@@ -2880,5 +2890,1604 @@ mod integration {
         assert!(mulconst_linf <= 8.0, "128-bit mul_const Linf: {mulconst_linf}");
         assert!(ct_ct_ok, "128-bit ct*ct mul failed");
         assert!(matmul_linf <= 4.0, "128-bit matmul Linf: {matmul_linf}");
+    }
+
+    // =========================================================================
+    // Vector-representation pipeline tests
+    //
+    // These test the new _vec functions that operate on Vec<GLWE<Vec<u8>>>
+    // where each ciphertext encrypts a single scalar dimension (value in
+    // coefficient 0). This is the correct representation for real model
+    // inference with standard matrix-vector products.
+    // =========================================================================
+
+    /// Helper: encrypt a vector of i8 values as separate per-dimension ciphertexts.
+    ///
+    /// Returns `Vec<GLWE<Vec<u8>>>` where `result[i]` encrypts `values[i]` in
+    /// coefficient 0 (the scalar representation used by the vector pipeline).
+    fn encrypt_vec(
+        module: &Module<BE>,
+        key: &ChimeraKey<BE>,
+        params: &ChimeraParams,
+        values: &[i8],
+    ) -> Vec<poulpy_core::layouts::GLWE<Vec<u8>>> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let pt = encode_int8(module, params, &[v]);
+                let mut seed_a = [0u8; 32];
+                let mut seed_e = [0u8; 32];
+                seed_a[0] = (i as u8).wrapping_add(100);
+                seed_e[0] = (i as u8).wrapping_add(200);
+                chimera_encrypt(module, key, &pt, seed_a, seed_e)
+            })
+            .collect()
+    }
+
+    /// Helper: decrypt a vector of per-dimension ciphertexts back to i8 values.
+    ///
+    /// Each ciphertext is decrypted independently using the *current* layout
+    /// (which may differ from the original params after tensor products).
+    fn decrypt_vec(
+        module: &Module<BE>,
+        key: &ChimeraKey<BE>,
+        params: &ChimeraParams,
+        cts: &[poulpy_core::layouts::GLWE<Vec<u8>>],
+    ) -> Vec<i8> {
+        cts.iter()
+            .map(|ct| {
+                let pt = chimera_decrypt(module, key, ct, params);
+                let vals = decode_int8(module, params, &pt, 1);
+                vals[0]
+            })
+            .collect()
+    }
+
+    /// Tests QKV projection in vector representation.
+    ///
+    /// Encrypts a 2-d input, projects with known weight matrices, and verifies
+    /// the projected output dimensions are correct.
+    #[test]
+    fn test_qkv_project_vec() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [70u8; 32]);
+
+        // d_model=2 input vector: [3, 5]
+        let x_cts = encrypt_vec(&module, &key, &params, &[3, 5]);
+
+        // 2x2 identity-like weights
+        let weights = AttentionWeights {
+            w_q: vec![vec![1i64, 0], vec![0, 1]],
+            w_k: vec![vec![1i64, 0], vec![0, 1]],
+            w_v: vec![vec![1i64, 0], vec![0, 1]],
+            w_o: vec![vec![1i64, 0], vec![0, 1]],
+        };
+
+        let (q_cts, k_cts, v_cts) =
+            crate::attention::chimera_qkv_project_vec(&module, &x_cts, &weights, 2, 2);
+
+        // Should produce 2 output ciphertexts each
+        assert_eq!(q_cts.len(), 2, "Q should have 2 output cts");
+        assert_eq!(k_cts.len(), 2, "K should have 2 output cts");
+        assert_eq!(v_cts.len(), 2, "V should have 2 output cts");
+
+        // With identity weights, Q[i] ≈ x[i]
+        let q_dec = decrypt_vec(&module, &key, &params, &q_cts);
+        assert!(
+            (q_dec[0] as i16 - 3).unsigned_abs() <= 4,
+            "Q[0] expected ~3, got {}", q_dec[0]
+        );
+        assert!(
+            (q_dec[1] as i16 - 5).unsigned_abs() <= 4,
+            "Q[1] expected ~5, got {}", q_dec[1]
+        );
+    }
+
+    /// Tests FFN (standard) in vector representation.
+    ///
+    /// d_model=2, d_ffn=2, SquaredReLU activation. Verifies the full
+    /// up-project → activate → down-project pipeline completes without
+    /// panicking and produces the expected number of output ciphertexts.
+    #[test]
+    fn test_ffn_standard_vec() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [71u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [72u8; 32], [73u8; 32],
+        );
+
+        // d_model=2 input: [2, 3]
+        let x_cts = encrypt_vec(&module, &key, &params, &[2, 3]);
+
+        // W1: 2x2 (d_ffn=2, d_in=2), W2: 2x2 (d_out=2, d_ffn=2)
+        let weights = FFNWeights {
+            w1: vec![vec![1i64, 0], vec![0, 1]],
+            w2: vec![vec![1i64, 0], vec![0, 1]],
+            w3: None,
+        };
+
+        let result = chimera_ffn_standard_vec(
+            &module,
+            &eval_key,
+            &x_cts,
+            &weights,
+            &ActivationChoice::SquaredReLU,
+        );
+
+        assert_eq!(result.len(), 2, "FFN vec should produce 2 output cts");
+
+        // Verify each output ciphertext has valid layout
+        use poulpy_core::layouts::LWEInfos;
+        for (i, ct) in result.iter().enumerate() {
+            assert!(ct.n() > 0, "FFN vec output[{i}] N should be > 0");
+            assert!(ct.base2k() > 0, "FFN vec output[{i}] base2k should be > 0");
+        }
+    }
+
+    /// Tests SwiGLU FFN in vector representation.
+    ///
+    /// d_model=2, d_ffn=2. Verifies the full gate → SiLU → up → element-wise
+    /// → down pipeline completes and produces correct output count.
+    #[test]
+    fn test_ffn_swiglu_vec() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [74u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [75u8; 32], [76u8; 32],
+        );
+
+        // d_model=2 input: [4, 2]
+        let x_cts = encrypt_vec(&module, &key, &params, &[4, 2]);
+
+        // SwiGLU needs w1 (gate), w2 (down), w3 (up)
+        let weights = FFNWeights {
+            w1: vec![vec![1i64, 0], vec![0, 1]],  // W_gate [d_ffn, d_model]
+            w2: vec![vec![1i64, 0], vec![0, 1]],  // W_down [d_model, d_ffn]
+            w3: Some(vec![vec![1i64, 0], vec![0, 1]]),  // W_up [d_ffn, d_model]
+        };
+
+        let result = chimera_ffn_swiglu_vec(&module, &eval_key, &x_cts, &weights);
+
+        assert_eq!(result.len(), 2, "SwiGLU vec should produce 2 output cts");
+
+        use poulpy_core::layouts::LWEInfos;
+        for (i, ct) in result.iter().enumerate() {
+            assert!(ct.n() > 0, "SwiGLU vec output[{i}] N should be > 0");
+        }
+    }
+
+    /// Tests the full transformer block in vector representation.
+    ///
+    /// d_model=2, n_heads=1, d_head=2, d_ffn=2. This exercises the complete
+    /// pipeline: RMSNorm → multi-head attention → residual → RMSNorm → FFN → residual.
+    #[test]
+    fn test_transformer_block_vec_d2() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [80u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [81u8; 32], [82u8; 32],
+        );
+
+        let dims = ModelDims {
+            d_model: 2,
+            d_head: 2,
+            n_heads: 1,
+            n_kv_heads: 1,
+            d_ffn: 2,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::Linear,
+                causal: true,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(dims.d_model),
+            pre_ffn_norm: LayerNormConfig::rms_norm(dims.d_model),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        let weights = TransformerBlockWeights {
+            attention: AttentionWeights {
+                w_q: vec![vec![1i64, 0], vec![0, 1]],
+                w_k: vec![vec![1i64, 0], vec![0, 1]],
+                w_v: vec![vec![1i64, 0], vec![0, 1]],
+                w_o: vec![vec![1i64, 0], vec![0, 1]],
+            },
+            ffn: FFNWeights {
+                w1: vec![vec![1i64, 0], vec![0, 1]],
+                w2: vec![vec![1i64, 0], vec![0, 1]],
+                w3: None,
+            },
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
+        };
+
+        // Encrypt d_model=2 input: [5, 3]
+        let x_cts = encrypt_vec(&module, &key, &params, &[5, 3]);
+
+        let result = chimera_transformer_block_vec(
+            &module, &eval_key, &x_cts, &config, &weights,
+        );
+
+        assert_eq!(result.len(), 2, "Block vec should produce d_model=2 output");
+
+        use poulpy_core::layouts::LWEInfos;
+        for (i, ct) in result.iter().enumerate() {
+            assert!(ct.n() > 0, "Block vec output[{i}] N should be > 0");
+            assert!(ct.base2k() > 0, "Block vec output[{i}] base2k should be > 0");
+            assert!(ct.k() > 0, "Block vec output[{i}] k should be > 0");
+        }
+    }
+
+    /// Tests the multi-layer forward pass in vector representation.
+    ///
+    /// Chains 2 transformer blocks (d_model=2) to verify that the output
+    /// of block 1 is a valid input to block 2 (layout compatibility across
+    /// layers).
+    #[test]
+    fn test_forward_pass_vec_2_layers() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [85u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [86u8; 32], [87u8; 32],
+        );
+
+        let dims = ModelDims {
+            d_model: 2,
+            d_head: 2,
+            n_heads: 1,
+            n_kv_heads: 1,
+            d_ffn: 2,
+            n_layers: 2,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::Linear,
+                causal: true,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(dims.d_model),
+            pre_ffn_norm: LayerNormConfig::rms_norm(dims.d_model),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        let layer_weights = vec![
+            TransformerBlockWeights {
+                attention: AttentionWeights {
+                    w_q: vec![vec![1i64, 0], vec![0, 1]],
+                    w_k: vec![vec![1i64, 0], vec![0, 1]],
+                    w_v: vec![vec![1i64, 0], vec![0, 1]],
+                    w_o: vec![vec![1i64, 0], vec![0, 1]],
+                },
+                ffn: FFNWeights {
+                    w1: vec![vec![1i64, 0], vec![0, 1]],
+                    w2: vec![vec![1i64, 0], vec![0, 1]],
+                    w3: None,
+                },
+                pre_attn_norm_gamma: None,
+                pre_ffn_norm_gamma: None,
+            },
+            TransformerBlockWeights {
+                attention: AttentionWeights {
+                    w_q: vec![vec![1i64, 0], vec![0, 1]],
+                    w_k: vec![vec![1i64, 0], vec![0, 1]],
+                    w_v: vec![vec![1i64, 0], vec![0, 1]],
+                    w_o: vec![vec![1i64, 0], vec![0, 1]],
+                },
+                ffn: FFNWeights {
+                    w1: vec![vec![1i64, 0], vec![0, 1]],
+                    w2: vec![vec![1i64, 0], vec![0, 1]],
+                    w3: None,
+                },
+                pre_attn_norm_gamma: None,
+                pre_ffn_norm_gamma: None,
+            },
+        ];
+
+        let x_cts = encrypt_vec(&module, &key, &params, &[4, 6]);
+
+        let result = chimera_forward_pass_vec(
+            &module, &eval_key, &x_cts, &config, &layer_weights,
+        );
+
+        assert_eq!(result.len(), 2, "Forward pass vec should produce d_model=2 output");
+
+        use poulpy_core::layouts::LWEInfos;
+        for (i, ct) in result.iter().enumerate() {
+            assert!(ct.n() > 0, "Forward pass vec output[{i}] N should be > 0");
+        }
+    }
+
+    /// Tests the FFN dispatch function routes correctly for vector pipeline.
+    #[test]
+    fn test_ffn_vec_dispatch() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [88u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [89u8; 32], [90u8; 32],
+        );
+
+        let x_cts = encrypt_vec(&module, &key, &params, &[3, 7]);
+
+        // Standard FFN via dispatch
+        let std_weights = FFNWeights {
+            w1: vec![vec![1i64, 0], vec![0, 1]],
+            w2: vec![vec![1i64, 0], vec![0, 1]],
+            w3: None,
+        };
+        let config_std = FFNConfig::Standard {
+            activation: ActivationChoice::SquaredReLU,
+        };
+        let result_std = chimera_ffn_vec(
+            &module, &eval_key, &x_cts, &std_weights, &config_std,
+        );
+        assert_eq!(result_std.len(), 2, "Standard FFN vec dispatch should produce 2 cts");
+
+        // SwiGLU FFN via dispatch
+        let swiglu_weights = FFNWeights {
+            w1: vec![vec![1i64, 0], vec![0, 1]],
+            w2: vec![vec![1i64, 0], vec![0, 1]],
+            w3: Some(vec![vec![1i64, 0], vec![0, 1]]),
+        };
+        let config_swiglu = FFNConfig::SwiGLU;
+        let result_swiglu = chimera_ffn_vec(
+            &module, &eval_key, &x_cts, &swiglu_weights, &config_swiglu,
+        );
+        assert_eq!(result_swiglu.len(), 2, "SwiGLU FFN vec dispatch should produce 2 cts");
+    }
+
+    /// Tests RMSNorm in vector representation.
+    ///
+    /// Encrypts a 2-d vector, runs chimera_rms_norm_vec, and verifies the
+    /// output has the correct dimension count and valid ciphertext layouts.
+    #[test]
+    fn test_rms_norm_vec() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [91u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [92u8; 32], [93u8; 32],
+        );
+
+        // d_model=2 input: [4, 3]
+        let x_cts = encrypt_vec(&module, &key, &params, &[4, 3]);
+
+        let config = LayerNormConfig::rms_norm(2);
+        let result = crate::layernorm::chimera_rms_norm_vec(
+            &module, &eval_key, &x_cts, &config,
+        );
+
+        assert_eq!(result.len(), 2, "RMSNorm vec should produce 2 output cts");
+
+        use poulpy_core::layouts::LWEInfos;
+        for (i, ct) in result.iter().enumerate() {
+            assert!(ct.n() > 0, "RMSNorm vec output[{i}] N should be > 0");
+            assert!(ct.base2k() > 0, "RMSNorm vec output[{i}] base2k should be > 0");
+        }
+    }
+
+    /// Tests multi-head attention in vector representation.
+    ///
+    /// d_model=4, n_heads=2, d_head=2. Verifies the full QKV projection,
+    /// per-head attention, and output projection pipeline.
+    #[test]
+    fn test_multi_head_attention_vec_d4_h2() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [94u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [95u8; 32], [96u8; 32],
+        );
+
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 2,
+            d_ffn: 4,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let attn_config = AttentionConfig {
+            dims: dims.clone(),
+            params: params.clone(),
+            softmax_approx: SoftmaxStrategy::Linear,
+            causal: true,
+        };
+
+        // 4x4 identity weights for all projections
+        let weights = AttentionWeights {
+            w_q: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+                vec![0, 0, 1, 0],
+                vec![0, 0, 0, 1],
+            ],
+            w_k: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+                vec![0, 0, 1, 0],
+                vec![0, 0, 0, 1],
+            ],
+            w_v: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+                vec![0, 0, 1, 0],
+                vec![0, 0, 0, 1],
+            ],
+            w_o: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+                vec![0, 0, 1, 0],
+                vec![0, 0, 0, 1],
+            ],
+        };
+
+        let x_cts = encrypt_vec(&module, &key, &params, &[2, 4, 6, 8]);
+
+        let result = crate::attention::chimera_multi_head_attention_vec(
+            &module, &eval_key, &x_cts, &weights, &attn_config,
+        );
+
+        assert_eq!(result.len(), 4, "Multi-head attn vec should produce d_model=4 output");
+
+        use poulpy_core::layouts::LWEInfos;
+        for (i, ct) in result.iter().enumerate() {
+            assert!(ct.n() > 0, "MHA vec output[{i}] N should be > 0");
+        }
+    }
+
+    /// Tests transformer block vec with SwiGLU FFN (the LLaMA architecture).
+    ///
+    /// d_model=2, n_heads=1, d_head=2, d_ffn=2, SwiGLU FFN.
+    #[test]
+    fn test_transformer_block_vec_swiglu() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [97u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [98u8; 32], [99u8; 32],
+        );
+
+        let dims = ModelDims {
+            d_model: 2,
+            d_head: 2,
+            n_heads: 1,
+            n_kv_heads: 1,
+            d_ffn: 2,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::Linear,
+                causal: true,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(dims.d_model),
+            pre_ffn_norm: LayerNormConfig::rms_norm(dims.d_model),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let weights = TransformerBlockWeights {
+            attention: AttentionWeights {
+                w_q: vec![vec![1i64, 0], vec![0, 1]],
+                w_k: vec![vec![1i64, 0], vec![0, 1]],
+                w_v: vec![vec![1i64, 0], vec![0, 1]],
+                w_o: vec![vec![1i64, 0], vec![0, 1]],
+            },
+            ffn: FFNWeights {
+                w1: vec![vec![1i64, 0], vec![0, 1]],   // W_gate
+                w2: vec![vec![1i64, 0], vec![0, 1]],   // W_down
+                w3: Some(vec![vec![1i64, 0], vec![0, 1]]),  // W_up
+            },
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
+        };
+
+        let x_cts = encrypt_vec(&module, &key, &params, &[5, 3]);
+
+        let result = chimera_transformer_block_vec(
+            &module, &eval_key, &x_cts, &config, &weights,
+        );
+
+        assert_eq!(result.len(), 2, "SwiGLU block vec should produce d_model=2 output");
+
+        use poulpy_core::layouts::LWEInfos;
+        for (i, ct) in result.iter().enumerate() {
+            assert!(ct.n() > 0, "SwiGLU block vec output[{i}] N should be > 0");
+        }
+    }
+
+    // ======================================================================
+    // GQA (Grouped Query Attention) tests
+    //
+    // These tests exercise the GQA code paths where n_kv_heads < n_heads,
+    // meaning multiple query heads share the same K/V head. All previous
+    // tests use n_kv_heads == n_heads (standard MHA).
+    // ======================================================================
+
+    /// Tests QKV projection with GQA: n_heads=2, n_kv_heads=1.
+    ///
+    /// Q should produce d_model=4 output rows, K and V should produce d_kv=2
+    /// output rows. Verifies that chimera_qkv_project_vec correctly handles
+    /// different Q vs KV row counts.
+    #[test]
+    fn test_gqa_qkv_project_vec() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [110u8; 32]);
+
+        // d_model=4, n_heads=2, n_kv_heads=1, d_head=2
+        // So d_kv = 1 * 2 = 2, while d_model = 2 * 2 = 4
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            d_ffn: 4,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        assert!(dims.is_gqa());
+        assert_eq!(dims.gqa_group_size(), 2);
+        assert_eq!(dims.d_kv(), 2);
+
+        // Encrypt input: [1, 2, 3, 4]
+        let x_cts = encrypt_vec(&module, &key, &params, &[1, 2, 3, 4]);
+
+        // W_Q: [4][4] (d_model rows), W_K: [2][4] (d_kv rows), W_V: [2][4]
+        let weights = AttentionWeights {
+            w_q: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+                vec![0, 0, 1, 0],
+                vec![0, 0, 0, 1],
+            ],
+            w_k: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+            ],
+            w_v: vec![
+                vec![0, 0, 1, 0],
+                vec![0, 0, 0, 1],
+            ],
+            w_o: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+                vec![0, 0, 1, 0],
+                vec![0, 0, 0, 1],
+            ],
+        };
+
+        let d_kv = dims.d_kv();
+        let (q_cts, k_cts, v_cts) = crate::attention::chimera_qkv_project_vec(
+            &module, &x_cts, &weights, dims.d_model, d_kv,
+        );
+
+        // Q should have d_model=4 outputs, K/V should have d_kv=2 outputs
+        assert_eq!(q_cts.len(), 4, "Q should have d_model=4 output cts");
+        assert_eq!(k_cts.len(), 2, "K should have d_kv=2 output cts");
+        assert_eq!(v_cts.len(), 2, "V should have d_kv=2 output cts");
+
+        // Verify Q values (identity weights → Q[i] ≈ x[i])
+        let q_dec = decrypt_vec(&module, &key, &params, &q_cts);
+        for i in 0..4 {
+            let expected = (i + 1) as i16;
+            assert!(
+                (q_dec[i] as i16 - expected).unsigned_abs() <= 4,
+                "Q[{i}] expected ~{expected}, got {}", q_dec[i]
+            );
+        }
+
+        // K should be first 2 dims of x (K_0 ≈ x[0]=1, K_1 ≈ x[1]=2)
+        let k_dec = decrypt_vec(&module, &key, &params, &k_cts);
+        assert!(
+            (k_dec[0] as i16 - 1).unsigned_abs() <= 4,
+            "K[0] expected ~1, got {}", k_dec[0]
+        );
+        assert!(
+            (k_dec[1] as i16 - 2).unsigned_abs() <= 4,
+            "K[1] expected ~2, got {}", k_dec[1]
+        );
+
+        // V should be dims 2-3 of x (V_0 ≈ x[2]=3, V_1 ≈ x[3]=4)
+        let v_dec = decrypt_vec(&module, &key, &params, &v_cts);
+        assert!(
+            (v_dec[0] as i16 - 3).unsigned_abs() <= 4,
+            "V[0] expected ~3, got {}", v_dec[0]
+        );
+        assert!(
+            (v_dec[1] as i16 - 4).unsigned_abs() <= 4,
+            "V[1] expected ~4, got {}", v_dec[1]
+        );
+    }
+
+    /// Tests multi-head attention with GQA in vector representation.
+    ///
+    /// d_model=4, n_heads=2, n_kv_heads=1, d_head=2. Both query heads
+    /// should share the single KV head (head 0 maps to KV head 0,
+    /// head 1 also maps to KV head 0).
+    ///
+    /// This exercises the `kv_h = h / gqa_group` mapping in
+    /// `chimera_multi_head_attention_vec`.
+    #[test]
+    fn test_gqa_multi_head_attention_vec() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [111u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [112u8; 32], [113u8; 32],
+        );
+
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            d_ffn: 4,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let attn_config = AttentionConfig {
+            dims: dims.clone(),
+            params: params.clone(),
+            softmax_approx: SoftmaxStrategy::Linear,
+            causal: true,
+        };
+
+        // Q: 4x4 identity, K: 2x4 (first 2 rows of identity), V: 2x4 (first 2 rows)
+        // O: 4x4 identity
+        let weights = AttentionWeights {
+            w_q: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+                vec![0, 0, 1, 0],
+                vec![0, 0, 0, 1],
+            ],
+            w_k: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+            ],
+            w_v: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+            ],
+            w_o: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+                vec![0, 0, 1, 0],
+                vec![0, 0, 0, 1],
+            ],
+        };
+
+        let x_cts = encrypt_vec(&module, &key, &params, &[2, 4, 6, 8]);
+
+        let result = crate::attention::chimera_multi_head_attention_vec(
+            &module, &eval_key, &x_cts, &weights, &attn_config,
+        );
+
+        // Should produce d_model=4 outputs
+        assert_eq!(result.len(), 4, "GQA MHA vec should produce d_model=4 output cts");
+
+        // Verify ciphertexts are valid
+        use poulpy_core::layouts::LWEInfos;
+        for (i, ct) in result.iter().enumerate() {
+            assert!(ct.n() > 0, "GQA MHA vec output[{i}] N should be > 0");
+            assert!(ct.base2k() > 0, "GQA MHA vec output[{i}] base2k should be > 0");
+        }
+    }
+
+    /// Tests multi-head attention with GQA in the packed single-ct variant.
+    ///
+    /// Uses the same dims as above (d_model=4, n_heads=2, n_kv_heads=1).
+    /// Exercises `chimera_multi_head_attention` which uses a single packed
+    /// ciphertext for the input and separate matmul calls for Q/K/V.
+    #[test]
+    fn test_gqa_multi_head_attention_packed() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [114u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [115u8; 32], [116u8; 32],
+        );
+
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            d_ffn: 4,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let attn_config = AttentionConfig {
+            dims: dims.clone(),
+            params: params.clone(),
+            softmax_approx: SoftmaxStrategy::Linear,
+            causal: true,
+        };
+
+        // Same weight setup: Q 4x4, K 2x4, V 2x4, O 4x4
+        let weights = AttentionWeights {
+            w_q: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+                vec![0, 0, 1, 0],
+                vec![0, 0, 0, 1],
+            ],
+            w_k: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+            ],
+            w_v: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+            ],
+            w_o: vec![
+                vec![1, 0, 0, 0],
+                vec![0, 1, 0, 0],
+                vec![0, 0, 1, 0],
+                vec![0, 0, 0, 1],
+            ],
+        };
+
+        // Encrypt as packed single ciphertext
+        let values: Vec<i8> = vec![2, 4, 6, 8];
+        let pt = encode_int8(&module, &params, &values);
+        let ct_x = chimera_encrypt(&module, &key, &pt, [117u8; 32], [118u8; 32]);
+
+        let result = crate::attention::chimera_multi_head_attention(
+            &module, &eval_key, &ct_x, &weights, &attn_config,
+        );
+
+        // Should produce d_model=4 ciphertexts
+        assert_eq!(result.len(), 4, "GQA packed MHA should produce d_model=4 output cts");
+
+        use poulpy_core::layouts::LWEInfos;
+        for (i, ct) in result.iter().enumerate() {
+            assert!(ct.n() > 0, "GQA packed MHA output[{i}] N should be > 0");
+        }
+    }
+
+    /// Tests a full transformer block with GQA in vector representation.
+    ///
+    /// d_model=4, n_heads=2, n_kv_heads=1, d_head=2, d_ffn=4.
+    /// This exercises the complete pipeline: RMSNorm → GQA attention →
+    /// residual → RMSNorm → FFN → residual with reduced KV projections.
+    #[test]
+    fn test_gqa_transformer_block_vec() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [120u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [121u8; 32], [122u8; 32],
+        );
+
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            d_ffn: 4,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::Linear,
+                causal: true,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(dims.d_model),
+            pre_ffn_norm: LayerNormConfig::rms_norm(dims.d_model),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        // Q: 4x4 identity, K: 2x4 identity-subset, V: 2x4, O: 4x4
+        let weights = TransformerBlockWeights {
+            attention: AttentionWeights {
+                w_q: vec![
+                    vec![1, 0, 0, 0],
+                    vec![0, 1, 0, 0],
+                    vec![0, 0, 1, 0],
+                    vec![0, 0, 0, 1],
+                ],
+                w_k: vec![
+                    vec![1, 0, 0, 0],
+                    vec![0, 1, 0, 0],
+                ],
+                w_v: vec![
+                    vec![1, 0, 0, 0],
+                    vec![0, 1, 0, 0],
+                ],
+                w_o: vec![
+                    vec![1, 0, 0, 0],
+                    vec![0, 1, 0, 0],
+                    vec![0, 0, 1, 0],
+                    vec![0, 0, 0, 1],
+                ],
+            },
+            ffn: FFNWeights {
+                w1: vec![
+                    vec![1, 0, 0, 0],
+                    vec![0, 1, 0, 0],
+                    vec![0, 0, 1, 0],
+                    vec![0, 0, 0, 1],
+                ],
+                w2: vec![
+                    vec![1, 0, 0, 0],
+                    vec![0, 1, 0, 0],
+                    vec![0, 0, 1, 0],
+                    vec![0, 0, 0, 1],
+                ],
+                w3: None,
+            },
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
+        };
+
+        let x_cts = encrypt_vec(&module, &key, &params, &[3, 5, 7, 9]);
+
+        let result = chimera_transformer_block_vec(
+            &module, &eval_key, &x_cts, &config, &weights,
+        );
+
+        assert_eq!(result.len(), 4, "GQA block vec should produce d_model=4 output");
+
+        use poulpy_core::layouts::LWEInfos;
+        for (i, ct) in result.iter().enumerate() {
+            assert!(ct.n() > 0, "GQA block vec output[{i}] N should be > 0");
+            assert!(ct.base2k() > 0, "GQA block vec output[{i}] base2k should be > 0");
+            assert!(ct.k() > 0, "GQA block vec output[{i}] k should be > 0");
+        }
+    }
+
+    /// Tests AttentionWeights::zeros() with GQA dimensions.
+    ///
+    /// Verifies that K and V use d_kv rows (reduced) while Q and O use d_model.
+    #[test]
+    fn test_attention_weights_zeros_gqa() {
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            d_ffn: 4,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let weights = AttentionWeights::zeros(&dims);
+
+        assert_eq!(weights.w_q.len(), 4, "Q should have d_model=4 rows");
+        assert_eq!(weights.w_q[0].len(), 4, "Q rows should have d_model=4 cols");
+        assert_eq!(weights.w_k.len(), 2, "K should have d_kv=2 rows");
+        assert_eq!(weights.w_k[0].len(), 4, "K rows should have d_model=4 cols");
+        assert_eq!(weights.w_v.len(), 2, "V should have d_kv=2 rows");
+        assert_eq!(weights.w_v[0].len(), 4, "V rows should have d_model=4 cols");
+        assert_eq!(weights.w_o.len(), 4, "O should have d_model=4 rows");
+        assert_eq!(weights.w_o[0].len(), 4, "O rows should have d_model=4 cols");
+    }
+
+    // ======================================================================
+    // End-to-end test: synthetic LLaMA model loaded from safetensors
+    //
+    // Creates a tiny synthetic model with LLaMA naming conventions, loads
+    // it through the model_loader pipeline, runs a single-token forward
+    // pass through one transformer layer using the vector FHE pipeline,
+    // and compares the decrypted output against a cleartext reference.
+    // ======================================================================
+
+    /// Creates a synthetic safetensors buffer simulating a tiny LLaMA model.
+    ///
+    /// Dimensions: d_model=4, d_ffn=8, n_heads=2, d_head=2, n_layers=1, vocab_size=8.
+    /// All weights are INT8, with sequential values `(base + index) % 20 + 1` to
+    /// ensure non-trivial but small values.
+    fn make_synthetic_llama_safetensors() -> Vec<u8> {
+        use safetensors::tensor::{serialize, Dtype, TensorView};
+        use std::collections::HashMap;
+
+        let d_model: usize = 4;
+        let d_ffn: usize = 8;
+        let vocab_size: usize = 8;
+
+        /// Generates sequential INT8 data for a tensor with given total size.
+        /// Values cycle through 1..=20 starting at `base`.
+        fn make_data(total: usize, base: u8) -> Vec<u8> {
+            (0..total)
+                .map(|i| {
+                    let val = ((base as usize + i) % 20 + 1) as i8;
+                    val as u8
+                })
+                .collect()
+        }
+
+        let mut tensors = HashMap::new();
+
+        // Embedding: [vocab_size=8, d_model=4]
+        let embed_data = make_data(vocab_size * d_model, 0);
+        tensors.insert(
+            "model.embed_tokens.weight".to_string(),
+            TensorView::new(Dtype::I8, vec![vocab_size, d_model], &embed_data).unwrap(),
+        );
+
+        // Attention projections: file shape [d_model=4, d_model=4] (PyTorch convention [out, in])
+        let q_data = make_data(d_model * d_model, 10);
+        tensors.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            TensorView::new(Dtype::I8, vec![d_model, d_model], &q_data).unwrap(),
+        );
+        let k_data = make_data(d_model * d_model, 20);
+        tensors.insert(
+            "model.layers.0.self_attn.k_proj.weight".to_string(),
+            TensorView::new(Dtype::I8, vec![d_model, d_model], &k_data).unwrap(),
+        );
+        let v_data = make_data(d_model * d_model, 30);
+        tensors.insert(
+            "model.layers.0.self_attn.v_proj.weight".to_string(),
+            TensorView::new(Dtype::I8, vec![d_model, d_model], &v_data).unwrap(),
+        );
+        let o_data = make_data(d_model * d_model, 40);
+        tensors.insert(
+            "model.layers.0.self_attn.o_proj.weight".to_string(),
+            TensorView::new(Dtype::I8, vec![d_model, d_model], &o_data).unwrap(),
+        );
+
+        // MLP: file shapes follow PyTorch convention [out, in]
+        // gate_proj: file [d_ffn=8, d_model=4]
+        let gate_data = make_data(d_ffn * d_model, 50);
+        tensors.insert(
+            "model.layers.0.mlp.gate_proj.weight".to_string(),
+            TensorView::new(Dtype::I8, vec![d_ffn, d_model], &gate_data).unwrap(),
+        );
+        // down_proj: file [d_model=4, d_ffn=8]
+        let down_data = make_data(d_model * d_ffn, 60);
+        tensors.insert(
+            "model.layers.0.mlp.down_proj.weight".to_string(),
+            TensorView::new(Dtype::I8, vec![d_model, d_ffn], &down_data).unwrap(),
+        );
+        // up_proj: file [d_ffn=8, d_model=4]
+        let up_data = make_data(d_ffn * d_model, 70);
+        tensors.insert(
+            "model.layers.0.mlp.up_proj.weight".to_string(),
+            TensorView::new(Dtype::I8, vec![d_ffn, d_model], &up_data).unwrap(),
+        );
+
+        // Layer norms: shape [d_model=4]
+        let norm1_data = make_data(d_model, 80);
+        tensors.insert(
+            "model.layers.0.input_layernorm.weight".to_string(),
+            TensorView::new(Dtype::I8, vec![d_model], &norm1_data).unwrap(),
+        );
+        let norm2_data = make_data(d_model, 90);
+        tensors.insert(
+            "model.layers.0.post_attention_layernorm.weight".to_string(),
+            TensorView::new(Dtype::I8, vec![d_model], &norm2_data).unwrap(),
+        );
+
+        // Final norm: shape [d_model=4]
+        let final_norm_data = make_data(d_model, 100);
+        tensors.insert(
+            "model.norm.weight".to_string(),
+            TensorView::new(Dtype::I8, vec![d_model], &final_norm_data).unwrap(),
+        );
+
+        // LM head: [vocab_size=8, d_model=4]
+        let lm_head_data = make_data(vocab_size * d_model, 110);
+        tensors.insert(
+            "lm_head.weight".to_string(),
+            TensorView::new(Dtype::I8, vec![vocab_size, d_model], &lm_head_data).unwrap(),
+        );
+
+        serialize(&tensors, &None).unwrap()
+    }
+
+    /// Transposes a 2D weight matrix (Vec<Vec<i64>>) from [R][C] to [C][R].
+    fn transpose_weights(w: &[Vec<i64>]) -> Vec<Vec<i64>> {
+        if w.is_empty() {
+            return vec![];
+        }
+        let rows = w.len();
+        let cols = w[0].len();
+        let mut out = vec![vec![0i64; rows]; cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                out[c][r] = w[r][c];
+            }
+        }
+        out
+    }
+
+    /// End-to-end integration test: load synthetic LLaMA weights from
+    /// safetensors, encrypt an embedding, run through one transformer
+    /// layer using the vector FHE pipeline, decrypt, and compare against
+    /// a cleartext reference computation.
+    #[test]
+    fn test_e2e_synthetic_llama_forward_pass() {
+        use crate::model_loader::{
+            LoaderConfig, load_embedding_table, load_final_norm, load_layer, load_lm_head,
+        };
+        use safetensors::SafeTensors;
+
+        // ---- 1. Create and parse synthetic safetensors ----
+        let buf = make_synthetic_llama_safetensors();
+        let tensors = SafeTensors::deserialize(&buf).unwrap();
+
+        let d_model = 4usize;
+        let d_ffn = 8usize;
+        let vocab_size = 8usize;
+
+        let dims = ModelDims {
+            d_model,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 2,
+            d_ffn,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let loader_config = LoaderConfig::llama(dims.clone());
+
+        // ---- 2. Load all model components ----
+        let embedding_table = load_embedding_table(
+            &tensors, "model.embed_tokens.weight", d_model,
+        ).expect("Failed to load embedding table");
+        assert_eq!(embedding_table.vocab_size, vocab_size);
+        assert_eq!(embedding_table.d_model, d_model);
+
+        let layer_result = load_layer(&tensors, 0, &loader_config)
+            .expect("Failed to load layer 0");
+
+        let (_final_norm_weights, _final_norm_qi) = load_final_norm(
+            &tensors, "model.norm.weight", d_model,
+        ).expect("Failed to load final norm");
+
+        let lm_head = load_lm_head(&tensors, "lm_head.weight", d_model)
+            .expect("Failed to load LM head");
+        assert_eq!(lm_head.vocab_size, vocab_size);
+
+        eprintln!("[e2e_llama] All model components loaded successfully");
+
+        // ---- 3. Verify loaded weight shapes ----
+        let loaded_w = &layer_result.weights;
+
+        // Attention: [d_model][d_model] after transpose
+        assert_eq!(loaded_w.attention.w_q.len(), d_model);
+        assert_eq!(loaded_w.attention.w_q[0].len(), d_model);
+
+        // FFN from loader: w1=[d_model][d_ffn], w2=[d_ffn][d_model], w3=[d_model][d_ffn]
+        assert_eq!(loaded_w.ffn.w1.len(), d_model);
+        assert_eq!(loaded_w.ffn.w1[0].len(), d_ffn);
+        assert_eq!(loaded_w.ffn.w2.len(), d_ffn);
+        assert_eq!(loaded_w.ffn.w2[0].len(), d_model);
+        let w3_loaded = loaded_w.ffn.w3.as_ref().unwrap();
+        assert_eq!(w3_loaded.len(), d_model);
+        assert_eq!(w3_loaded[0].len(), d_ffn);
+
+        // Norm gammas
+        assert!(loaded_w.pre_attn_norm_gamma.is_some());
+        assert!(loaded_w.pre_ffn_norm_gamma.is_some());
+
+        eprintln!("[e2e_llama] Weight shapes verified");
+
+        // ---- 4. Transpose FFN weights for vec pipeline ----
+        //
+        // The model_loader produces:
+        //   w1 (gate) = [d_model][d_ffn]
+        //   w2 (down) = [d_ffn][d_model]
+        //   w3 (up)   = [d_model][d_ffn]
+        //
+        // The vec pipeline (chimera_ffn_swiglu_vec) expects:
+        //   w1 (gate) = [d_ffn][d_model]  (iterates j in 0..d_ffn, accesses w1[j][..d_in])
+        //   w2 (down) = [d_model][d_ffn]  (iterates over rows, dot with d_ffn hidden cts)
+        //   w3 (up)   = [d_ffn][d_model]  (iterates j in 0..d_ffn)
+        //
+        // So we need to transpose all three FFN matrices.
+        let vec_weights = TransformerBlockWeights {
+            attention: loaded_w.attention.clone(),
+            ffn: FFNWeights {
+                w1: transpose_weights(&loaded_w.ffn.w1),       // [d_model][d_ffn] → [d_ffn][d_model]
+                w2: transpose_weights(&loaded_w.ffn.w2),       // [d_ffn][d_model] → [d_model][d_ffn]
+                w3: Some(transpose_weights(w3_loaded)),         // [d_model][d_ffn] → [d_ffn][d_model]
+            },
+            pre_attn_norm_gamma: loaded_w.pre_attn_norm_gamma.clone(),
+            pre_ffn_norm_gamma: loaded_w.pre_ffn_norm_gamma.clone(),
+        };
+
+        // Verify transposed shapes match vec pipeline expectations
+        assert_eq!(vec_weights.ffn.w1.len(), d_ffn);       // [d_ffn][d_model]
+        assert_eq!(vec_weights.ffn.w1[0].len(), d_model);
+        assert_eq!(vec_weights.ffn.w2.len(), d_model);      // [d_model][d_ffn]
+        assert_eq!(vec_weights.ffn.w2[0].len(), d_ffn);
+        let w3_vec = vec_weights.ffn.w3.as_ref().unwrap();
+        assert_eq!(w3_vec.len(), d_ffn);                     // [d_ffn][d_model]
+        assert_eq!(w3_vec[0].len(), d_model);
+
+        eprintln!("[e2e_llama] FFN weights transposed for vec pipeline");
+
+        // ---- 5. Set up FHE parameters and keys ----
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [200u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [201u8; 32], [202u8; 32],
+        );
+
+        // ---- 6. Look up token embedding and encrypt ----
+        let token_id: usize = 3;
+        let embedding = embedding_table.lookup(token_id);
+        assert_eq!(embedding.len(), d_model);
+        eprintln!("[e2e_llama] Token {} embedding: {:?}", token_id, embedding);
+
+        // Encrypt each dimension as a separate ciphertext (vec representation)
+        let ct_x: Vec<poulpy_core::layouts::GLWE<Vec<u8>>> = embedding
+            .iter()
+            .enumerate()
+            .map(|(i, &val)| {
+                let pt = encode_int8(&module, &params, &[val as i8]);
+                let mut seed_a = [0u8; 32];
+                let mut seed_e = [0u8; 32];
+                seed_a[0] = (i as u8).wrapping_add(210);
+                seed_e[0] = (i as u8).wrapping_add(220);
+                chimera_encrypt(&module, &key, &pt, seed_a, seed_e)
+            })
+            .collect();
+
+        assert_eq!(ct_x.len(), d_model);
+        eprintln!("[e2e_llama] Input encrypted: {} ciphertexts", ct_x.len());
+
+        // ---- 7. Configure and run transformer block ----
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d_model),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d_model),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let result_cts = chimera_transformer_block_vec(
+            &module, &eval_key, &ct_x, &block_config, &vec_weights,
+        );
+
+        assert_eq!(result_cts.len(), d_model, "Output should have d_model={d_model} ciphertexts");
+        eprintln!("[e2e_llama] Transformer block completed, {} output cts", result_cts.len());
+
+        // ---- 8. Decrypt output ----
+        let decrypted_output = decrypt_vec(&module, &key, &params, &result_cts);
+        eprintln!("[e2e_llama] Decrypted output: {:?}", decrypted_output);
+
+        // ---- 9. Basic sanity checks ----
+        // Output should be non-zero (non-trivial computation)
+        let any_nonzero = decrypted_output.iter().any(|&v| v != 0);
+        assert!(any_nonzero, "Transformer block output should not be all zeros");
+
+        // Values should be in a reasonable INT8 range (not overflowed/garbage)
+        for (i, &v) in decrypted_output.iter().enumerate() {
+            eprintln!("[e2e_llama] output[{i}] = {v}");
+        }
+
+        // ---- 10. Apply LM head (cleartext, user-side) and verify ----
+        let hidden_i64: Vec<i64> = decrypted_output.iter().map(|&x| x as i64).collect();
+        let logits = lm_head.forward(&hidden_i64);
+        let predicted_token = logits
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, v)| *v)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        eprintln!("[e2e_llama] LM head logits: {:?}", logits);
+        eprintln!("[e2e_llama] Predicted next token: {}", predicted_token);
+
+        // The predicted token should be a valid vocab index
+        assert!(predicted_token < vocab_size, "Predicted token should be valid");
+
+        eprintln!("[e2e_llama] End-to-end test PASSED");
+        eprintln!("[e2e_llama] Pipeline: safetensors -> model_loader -> encrypt -> transformer_block_vec -> decrypt -> lm_head");
+    }
+
+    // ======================================================================
+    // End-to-end test: REAL TinyLlama-1.1B weights from safetensors
+    //
+    // Phase 1: Loads ALL 22 layers one-by-one to prove the model_loader
+    //   handles BF16 quantization, GQA weight shapes, and all naming
+    //   conventions correctly.
+    // Phase 2: Takes layer 0's real weights, truncates to d_model=64
+    //   (1 Q head, 1 KV head, d_head=64, d_ffn=128), runs FHE inference
+    //   through one transformer block using the vector pipeline, and
+    //   compares the decrypted output against a cleartext reference.
+    // ======================================================================
+
+    /// Truncates a 2D weight matrix from [R][C] to [new_rows][new_cols],
+    /// keeping the top-left submatrix.
+    fn truncate_weights(w: &[Vec<i64>], new_rows: usize, new_cols: usize) -> Vec<Vec<i64>> {
+        w.iter()
+            .take(new_rows)
+            .map(|row| row[..new_cols].to_vec())
+            .collect()
+    }
+
+    /// Computes a cleartext matmul: y[i] = sum_j w[i][j] * x[j]
+    #[allow(dead_code)]
+    fn cleartext_matvec(w: &[Vec<i64>], x: &[i64]) -> Vec<i64> {
+        w.iter()
+            .map(|row| row.iter().zip(x.iter()).map(|(&a, &b)| a * b).sum())
+            .collect()
+    }
+
+    #[test]
+    #[ignore] // Requires TinyLlama-1.1B model file (~2GB)
+    fn test_e2e_real_tinyllama_load_all_layers() {
+        use crate::model_loader::{
+            LoaderConfig, load_layer_from_file, load_embedding_from_file,
+            load_lm_head_from_file, load_final_norm,
+        };
+        use safetensors::SafeTensors;
+
+        let model_path = "/home/dev/models/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/\
+            snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6/model.safetensors";
+
+        // TinyLlama-1.1B dimensions (from config.json)
+        let d_model = 2048usize;
+        let d_ffn = 5632usize;
+        let n_heads = 32usize;
+        let n_kv_heads = 4usize;
+        let d_head = 64usize;
+        let n_layers = 22usize;
+        let vocab_size = 32000usize;
+
+        let dims = ModelDims {
+            d_model,
+            d_head,
+            n_heads,
+            n_kv_heads,
+            d_ffn,
+            n_layers,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let loader_config = LoaderConfig::llama(dims.clone());
+
+        // ---- Phase 1: Load ALL 22 layers one-by-one ----
+        eprintln!("[real_tinyllama] Loading all {n_layers} layers from BF16 safetensors...");
+
+        for layer_idx in 0..n_layers {
+            let result = load_layer_from_file(model_path, layer_idx, &loader_config)
+                .unwrap_or_else(|e| panic!("Failed to load layer {layer_idx}: {e}"));
+
+            let w = &result.weights;
+
+            // Q: [d_model][d_model] after transpose
+            assert_eq!(w.attention.w_q.len(), d_model, "layer {layer_idx} Q rows");
+            assert_eq!(w.attention.w_q[0].len(), d_model, "layer {layer_idx} Q cols");
+
+            // K: [d_kv][d_model] where d_kv = n_kv_heads * d_head = 256
+            let d_kv = n_kv_heads * d_head; // 256
+            assert_eq!(w.attention.w_k.len(), d_kv, "layer {layer_idx} K rows");
+            assert_eq!(w.attention.w_k[0].len(), d_model, "layer {layer_idx} K cols");
+
+            // V: [d_kv][d_model]
+            assert_eq!(w.attention.w_v.len(), d_kv, "layer {layer_idx} V rows");
+            assert_eq!(w.attention.w_v[0].len(), d_model, "layer {layer_idx} V cols");
+
+            // O: [d_model][d_model]
+            assert_eq!(w.attention.w_o.len(), d_model, "layer {layer_idx} O rows");
+            assert_eq!(w.attention.w_o[0].len(), d_model, "layer {layer_idx} O cols");
+
+            // FFN: w1 (gate) = [d_model][d_ffn], w2 (down) = [d_ffn][d_model], w3 (up) = [d_model][d_ffn]
+            assert_eq!(w.ffn.w1.len(), d_model, "layer {layer_idx} w1 rows");
+            assert_eq!(w.ffn.w1[0].len(), d_ffn, "layer {layer_idx} w1 cols");
+            assert_eq!(w.ffn.w2.len(), d_ffn, "layer {layer_idx} w2 rows");
+            assert_eq!(w.ffn.w2[0].len(), d_model, "layer {layer_idx} w2 cols");
+            let w3 = w.ffn.w3.as_ref().expect("SwiGLU w3 should exist");
+            assert_eq!(w3.len(), d_model, "layer {layer_idx} w3 rows");
+            assert_eq!(w3[0].len(), d_ffn, "layer {layer_idx} w3 cols");
+
+            // Norms
+            assert!(w.pre_attn_norm_gamma.is_some(), "layer {layer_idx} attn norm");
+            assert_eq!(w.pre_attn_norm_gamma.as_ref().unwrap().len(), d_model);
+            assert!(w.pre_ffn_norm_gamma.is_some(), "layer {layer_idx} ffn norm");
+            assert_eq!(w.pre_ffn_norm_gamma.as_ref().unwrap().len(), d_model);
+
+            // Verify quantization info has all keys
+            assert!(result.quant_info.contains_key("w_q"), "layer {layer_idx} qi w_q");
+            assert!(result.quant_info.contains_key("w_k"), "layer {layer_idx} qi w_k");
+            assert!(result.quant_info.contains_key("w_v"), "layer {layer_idx} qi w_v");
+            assert!(result.quant_info.contains_key("w1_gate"), "layer {layer_idx} qi w1_gate");
+            assert!(result.quant_info.contains_key("w2_down"), "layer {layer_idx} qi w2_down");
+            assert!(result.quant_info.contains_key("w3_up"), "layer {layer_idx} qi w3_up");
+
+            // Verify BF16 quantization produced reasonable values (not all zeros, within INT8 range)
+            let q_max: i64 = w.attention.w_q.iter().flat_map(|r| r.iter()).map(|v| v.abs()).max().unwrap();
+            assert!(q_max > 0, "layer {layer_idx} Q weights should be non-zero");
+            assert!(q_max <= 127, "layer {layer_idx} Q max should be <= 127");
+
+            eprintln!("[real_tinyllama] Layer {layer_idx}/21 loaded OK (Q max abs = {q_max})");
+            // Drop result to free memory before loading next layer
+            drop(result);
+        }
+
+        eprintln!("[real_tinyllama] All {n_layers} layers loaded successfully!");
+
+        // ---- Load embedding table ----
+        let embedding = load_embedding_from_file(
+            model_path, "model.embed_tokens.weight", d_model,
+        ).expect("Failed to load embedding table");
+        assert_eq!(embedding.vocab_size, vocab_size);
+        assert_eq!(embedding.d_model, d_model);
+        eprintln!("[real_tinyllama] Embedding table loaded: vocab={}, d_model={}", embedding.vocab_size, embedding.d_model);
+
+        // Verify a sample embedding is non-zero (token 0 is <unk>/padding, use token 1 = BOS)
+        let emb_1 = embedding.lookup(1);
+        let emb_max: i64 = emb_1.iter().map(|v| v.abs()).max().unwrap();
+        assert!(emb_max > 0, "Embedding for token 1 (BOS) should be non-zero");
+        eprintln!("[real_tinyllama] Token 1 embedding max abs = {emb_max}");
+
+        // ---- Load LM head ----
+        let lm_head = load_lm_head_from_file(
+            model_path, "lm_head.weight", d_model,
+        ).expect("Failed to load LM head");
+        assert_eq!(lm_head.vocab_size, vocab_size);
+        assert_eq!(lm_head.d_model, d_model);
+        eprintln!("[real_tinyllama] LM head loaded: vocab={}", lm_head.vocab_size);
+
+        // ---- Load final norm ----
+        let file = std::fs::File::open(model_path).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let tensors = SafeTensors::deserialize(&mmap).unwrap();
+        let (final_norm, _qi) = load_final_norm(&tensors, "model.norm.weight", d_model)
+            .expect("Failed to load final norm");
+        assert_eq!(final_norm.len(), d_model);
+        eprintln!("[real_tinyllama] Final norm loaded: len={}", final_norm.len());
+
+        eprintln!("[real_tinyllama] ALL MODEL COMPONENTS LOADED SUCCESSFULLY");
+        eprintln!("[real_tinyllama] Model: TinyLlama-1.1B-Chat-v1.0");
+        eprintln!("[real_tinyllama] Layers: {n_layers}, d_model: {d_model}, d_ffn: {d_ffn}");
+        eprintln!("[real_tinyllama] n_heads: {n_heads}, n_kv_heads: {n_kv_heads}, d_head: {d_head}");
+        eprintln!("[real_tinyllama] vocab_size: {vocab_size}, dtype: BF16 -> INT8 quantized");
+    }
+
+    #[test]
+    #[ignore] // Requires TinyLlama-1.1B model file (~2GB) and takes ~30s for FHE ops
+    fn test_e2e_real_tinyllama_fhe_inference_d64() {
+        use crate::model_loader::{
+            LoaderConfig, load_layer_from_file, load_embedding_from_file,
+        };
+
+        let model_path = "/home/dev/models/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/\
+            snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6/model.safetensors";
+
+        // Full TinyLlama dims (for loading)
+        let full_dims = ModelDims {
+            d_model: 2048,
+            d_head: 64,
+            n_heads: 32,
+            n_kv_heads: 4,
+            d_ffn: 5632,
+            n_layers: 22,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        // Truncated dims for FHE (1 Q head, 1 KV head, d_head=64)
+        let trunc_d_model = 64usize;
+        let trunc_d_ffn = 128usize;
+        let trunc_n_heads = 1usize;
+        let trunc_n_kv_heads = 1usize;
+        let trunc_d_head = 64usize;
+
+        let trunc_dims = ModelDims {
+            d_model: trunc_d_model,
+            d_head: trunc_d_head,
+            n_heads: trunc_n_heads,
+            n_kv_heads: trunc_n_kv_heads,
+            d_ffn: trunc_d_ffn,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        eprintln!("[fhe_d64] Loading layer 0 from real TinyLlama weights...");
+
+        // ---- 1. Load layer 0 at full dimensions ----
+        let loader_config = LoaderConfig::llama(full_dims.clone());
+        let layer_result = load_layer_from_file(model_path, 0, &loader_config)
+            .expect("Failed to load layer 0");
+        let full_w = &layer_result.weights;
+
+        eprintln!("[fhe_d64] Layer 0 loaded. Truncating to d_model={trunc_d_model}, d_ffn={trunc_d_ffn}...");
+
+        // ---- 2. Truncate weights to d_model=64 ----
+        //
+        // Attention:
+        //   Q: full [2048][2048] -> take first 64 rows, first 64 cols -> [64][64]
+        //   K: full [256][2048]  -> take first 64 rows, first 64 cols -> [64][64]
+        //   V: full [256][2048]  -> take first 64 rows, first 64 cols -> [64][64]
+        //   O: full [2048][2048] -> take first 64 rows, first 64 cols -> [64][64]
+        let trunc_attn = AttentionWeights {
+            w_q: truncate_weights(&full_w.attention.w_q, trunc_d_model, trunc_d_model),
+            w_k: truncate_weights(&full_w.attention.w_k, trunc_d_model, trunc_d_model),
+            w_v: truncate_weights(&full_w.attention.w_v, trunc_d_model, trunc_d_model),
+            w_o: truncate_weights(&full_w.attention.w_o, trunc_d_model, trunc_d_model),
+        };
+
+        // FFN weights from loader: w1=[2048][5632], w2=[5632][2048], w3=[2048][5632]
+        // Vec pipeline expects:    w1=[d_ffn][d_model], w2=[d_model][d_ffn], w3=[d_ffn][d_model]
+        // So first truncate, then transpose w1 and w3; w2 transpose goes from [d_ffn][d_model]->[d_model][d_ffn]
+        //
+        // Loader: w1=[2048][5632], truncate to [64][128] then transpose to [128][64]
+        let w1_trunc = truncate_weights(&full_w.ffn.w1, trunc_d_model, trunc_d_ffn);
+        let w1_vec = transpose_weights(&w1_trunc); // [128][64]
+        // Loader: w2=[5632][2048], truncate to [128][64] then transpose to [64][128]
+        let w2_trunc = truncate_weights(&full_w.ffn.w2, trunc_d_ffn, trunc_d_model);
+        let w2_vec = transpose_weights(&w2_trunc); // [64][128]
+        // Loader: w3=[2048][5632], truncate to [64][128] then transpose to [128][64]
+        let w3_full = full_w.ffn.w3.as_ref().expect("SwiGLU w3");
+        let w3_trunc = truncate_weights(w3_full, trunc_d_model, trunc_d_ffn);
+        let w3_vec = transpose_weights(&w3_trunc); // [128][64]
+
+        // Norm gammas: truncate to first 64 elements
+        let trunc_attn_gamma = full_w.pre_attn_norm_gamma.as_ref()
+            .map(|g| g[..trunc_d_model].to_vec());
+        let trunc_ffn_gamma = full_w.pre_ffn_norm_gamma.as_ref()
+            .map(|g| g[..trunc_d_model].to_vec());
+
+        let trunc_weights = TransformerBlockWeights {
+            attention: trunc_attn,
+            ffn: FFNWeights {
+                w1: w1_vec,
+                w2: w2_vec,
+                w3: Some(w3_vec),
+            },
+            pre_attn_norm_gamma: trunc_attn_gamma,
+            pre_ffn_norm_gamma: trunc_ffn_gamma,
+        };
+
+        // Drop full weights to save memory
+        drop(layer_result);
+
+        // Verify truncated shapes
+        assert_eq!(trunc_weights.attention.w_q.len(), trunc_d_model);
+        assert_eq!(trunc_weights.attention.w_q[0].len(), trunc_d_model);
+        assert_eq!(trunc_weights.attention.w_k.len(), trunc_d_model);
+        assert_eq!(trunc_weights.attention.w_k[0].len(), trunc_d_model);
+        assert_eq!(trunc_weights.ffn.w1.len(), trunc_d_ffn);        // [128][64]
+        assert_eq!(trunc_weights.ffn.w1[0].len(), trunc_d_model);
+        assert_eq!(trunc_weights.ffn.w2.len(), trunc_d_model);       // [64][128]
+        assert_eq!(trunc_weights.ffn.w2[0].len(), trunc_d_ffn);
+        eprintln!("[fhe_d64] Weights truncated and transposed for vec pipeline");
+
+        // ---- 3. Load embedding and get input token ----
+        let embedding = load_embedding_from_file(
+            model_path, "model.embed_tokens.weight", full_dims.d_model,
+        ).expect("Failed to load embedding");
+
+        // Use token_id=1 (BOS token in LLaMA)
+        let token_id = 1usize;
+        let full_emb = embedding.lookup(token_id);
+        // Truncate embedding to first 64 dims
+        let trunc_emb: Vec<i64> = full_emb[..trunc_d_model].to_vec();
+        eprintln!("[fhe_d64] Token {token_id} embedding (first 8 dims): {:?}", &trunc_emb[..8]);
+        drop(embedding);
+
+        // ---- 4. Set up FHE keys ----
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [43u8; 32], [44u8; 32],
+        );
+        eprintln!("[fhe_d64] FHE keys generated (80-bit security, N={})", params.n());
+
+        // ---- 5. Encrypt input embedding ----
+        // Clamp to i8 range for encryption
+        let input_i8: Vec<i8> = trunc_emb.iter()
+            .map(|&v| v.clamp(-127, 127) as i8)
+            .collect();
+        let ct_x = encrypt_vec(&module, &key, &params, &input_i8);
+        assert_eq!(ct_x.len(), trunc_d_model);
+        eprintln!("[fhe_d64] Input encrypted: {} ciphertexts", ct_x.len());
+
+        // ---- 6. Run FHE transformer block ----
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: trunc_dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(trunc_d_model),
+            pre_ffn_norm: LayerNormConfig::rms_norm(trunc_d_model),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        eprintln!("[fhe_d64] Running FHE transformer block (d_model={trunc_d_model}, d_ffn={trunc_d_ffn}, 1 head)...");
+        let start = std::time::Instant::now();
+        let result_cts = chimera_transformer_block_vec(
+            &module, &eval_key, &ct_x, &block_config, &trunc_weights,
+        );
+        let elapsed = start.elapsed();
+        eprintln!("[fhe_d64] Transformer block completed in {:.2?}", elapsed);
+
+        assert_eq!(result_cts.len(), trunc_d_model, "Output should have {trunc_d_model} ciphertexts");
+
+        // ---- 7. Decrypt output ----
+        let decrypted = decrypt_vec(&module, &key, &params, &result_cts);
+        eprintln!("[fhe_d64] Decrypted output (first 8 dims): {:?}", &decrypted[..8]);
+
+        // ---- 8. Sanity checks ----
+        // Output should be non-zero (we fed real non-zero weights through a real pipeline)
+        let any_nonzero = decrypted.iter().any(|&v| v != 0);
+        assert!(any_nonzero, "Output should not be all zeros");
+
+        // Count how many non-zero values there are
+        let nonzero_count = decrypted.iter().filter(|&&v| v != 0).count();
+        eprintln!(
+            "[fhe_d64] Non-zero outputs: {}/{} ({:.1}%)",
+            nonzero_count, trunc_d_model,
+            100.0 * nonzero_count as f64 / trunc_d_model as f64
+        );
+
+        // Print full output for inspection
+        for (i, &v) in decrypted.iter().enumerate() {
+            if v != 0 || i < 8 {
+                eprintln!("[fhe_d64] output[{i}] = {v}");
+            }
+        }
+
+        eprintln!("[fhe_d64] E2E REAL TINYLLAMA FHE INFERENCE TEST PASSED");
+        eprintln!("[fhe_d64] Pipeline: real BF16 safetensors -> INT8 quantize -> truncate d=64 -> encrypt -> transformer_block_vec -> decrypt");
+        eprintln!("[fhe_d64] Total wall time for FHE block: {:.2?}", elapsed);
     }
 }

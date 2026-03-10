@@ -25,7 +25,7 @@ use poulpy_hal::{
 use poulpy_core::ScratchTakeCore;
 
 use crate::activations::{apply_poly_activation, chimera_ct_mul, PolyApprox};
-use crate::arithmetic::{chimera_mul_const, chimera_project_layout, chimera_slot_sum};
+use crate::arithmetic::{chimera_add, chimera_mul_const, chimera_project_layout, chimera_slot_sum};
 use crate::encrypt::ChimeraEvalKey;
 
 /// Configuration for LayerNorm/RMSNorm evaluation under FHE.
@@ -198,6 +198,130 @@ pub fn layernorm_plaintext(values: &[f64], config: &LayerNormConfig) -> Vec<f64>
     }
 
     result
+}
+
+/// Computes RMSNorm homomorphically on a vector of encrypted scalars.
+///
+/// This is the **vector representation** variant. Each element of `x_cts`
+/// is a separate ciphertext encrypting one dimension of the input vector
+/// (value in coefficient 0). This representation is used by the
+/// `chimera_transformer_block_vec` pipeline for real model inference.
+///
+/// RMSNorm(x)_i = x_i * (1 / √(mean(x²) + ε))
+///
+/// The computation proceeds as:
+///
+/// 1. **Square each dimension**: `sq_i = x_i * x_i` (ct*ct for each dim).
+/// 2. **Sum squares**: `sum_sq = Σ_i sq_i` (homomorphic addition of cts).
+/// 3. **Mean**: `mean_sq = sum_sq * (1/d_model)` (plaintext multiply).
+/// 4. **Inverse sqrt**: `inv_rms = inv_sqrt_poly(mean_sq)`.
+/// 5. **Scale each dimension**: `out_i = x_i * inv_rms` (ct*ct per dim).
+/// 6. **Optional gamma**: `out_i = out_i * gamma_i` (ct*pt per dim).
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key.
+/// * `x_cts` - Input vector: one ciphertext per dimension (value in coeff 0).
+/// * `config` - RMSNorm configuration.
+///
+/// # Returns
+///
+/// A vector of ciphertexts of the same length as `x_cts`.
+pub fn chimera_rms_norm_vec<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    config: &LayerNormConfig,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    assert!(
+        config.use_rms_norm,
+        "chimera_rms_norm_vec: full LayerNorm is not yet implemented. \
+         Use LayerNormConfig::rms_norm() instead."
+    );
+    assert!(!x_cts.is_empty(), "chimera_rms_norm_vec: input vector must not be empty");
+
+    let d = x_cts.len();
+
+    // Step 1: Square each dimension — sq_i = x_i * x_i
+    let sq: Vec<GLWE<Vec<u8>>> = x_cts
+        .iter()
+        .map(|xi| chimera_ct_mul(module, eval_key, xi, xi))
+        .collect();
+
+    // Step 2: Sum all squared values — sum_sq = Σ_i sq_i
+    // All sq_i should have the same layout after ct*ct (out_base2k).
+    let mut sum_sq = {
+        use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+        let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(&sq[0]);
+        {
+            let src_ref = sq[0].to_ref();
+            let src: &[u8] = src_ref.data().data;
+            let mut dst_mut = cloned.to_mut();
+            let dst: &mut [u8] = dst_mut.data_mut().data;
+            let len = src.len().min(dst.len());
+            dst[..len].copy_from_slice(&src[..len]);
+        }
+        cloned
+    };
+    for i in 1..d {
+        sum_sq = chimera_add(module, &sum_sq, &sq[i]);
+    }
+
+    // Step 3: Mean — multiply by 1/d_model
+    let inv_n_scaled = ((1i64 << crate::activations::COEFF_SCALE_BITS) as f64
+        / d as f64)
+        .round() as i64;
+    let mean_sq = chimera_mul_const(module, &sum_sq, &[inv_n_scaled]);
+
+    // Step 4: Inverse square root — evaluate polynomial approx of 1/√x
+    let inv_rms = apply_poly_activation(module, eval_key, &mean_sq, &config.inv_sqrt_approx);
+
+    // Step 5: Scale each dimension — out_i = x_i * inv_rms
+    // We need to project each x_i to match inv_rms's layout before ct*ct multiply.
+    let inv_rms_layout = poulpy_core::layouts::GLWELayout {
+        n: inv_rms.n(),
+        base2k: inv_rms.base2k(),
+        k: inv_rms.k(),
+        rank: inv_rms.rank(),
+    };
+
+    let mut outputs = Vec::with_capacity(d);
+    for xi in x_cts {
+        let xi_proj = if xi.base2k() == inv_rms.base2k() && xi.k() == inv_rms.k() {
+            use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+            let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(xi);
+            {
+                let src_ref = xi.to_ref();
+                let src: &[u8] = src_ref.data().data;
+                let mut dst_mut = cloned.to_mut();
+                let dst: &mut [u8] = dst_mut.data_mut().data;
+                let len = src.len().min(dst.len());
+                dst[..len].copy_from_slice(&src[..len]);
+            }
+            cloned
+        } else {
+            chimera_project_layout(module, xi, &inv_rms_layout)
+        };
+        let normed = chimera_ct_mul(module, eval_key, &xi_proj, &inv_rms);
+        outputs.push(normed);
+    }
+
+    // Step 6: Optional gamma scaling
+    if let Some(gamma) = &config.gamma {
+        for (i, out) in outputs.iter_mut().enumerate() {
+            if i < gamma.len() {
+                *out = chimera_mul_const(module, out, &[gamma[i]]);
+            }
+        }
+    }
+
+    outputs
 }
 
 /// Computes RMSNorm homomorphically on an encrypted vector.

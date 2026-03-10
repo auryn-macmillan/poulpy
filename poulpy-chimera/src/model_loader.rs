@@ -437,6 +437,7 @@ pub fn load_layer(
     config: &LoaderConfig,
 ) -> Result<LayerLoadResult, ModelLoadError> {
     let d = config.dims.d_model;
+    let d_kv = config.dims.d_kv();
     let d_ffn = config.dims.d_ffn;
     let prefix = format!("{}.{layer_idx}", config.layer_prefix);
     let attn = &config.attn_prefix;
@@ -445,6 +446,10 @@ pub fn load_layer(
     let mut quant_info = HashMap::new();
 
     // ----- Attention weights -----
+    // Q and O projections are always [d_model, d_model].
+    // K and V projections are [d_kv, d_model] where d_kv = n_kv_heads * d_head.
+    // For standard MHA (n_kv_heads == n_heads), d_kv == d_model.
+    // For GQA (n_kv_heads < n_heads), d_kv < d_model.
     let (w_q, qi) = load_weight_matrix(
         tensors,
         &format!("{prefix}.{attn}.q_proj.weight"),
@@ -453,19 +458,23 @@ pub fn load_layer(
     )?;
     quant_info.insert("w_q".to_string(), qi);
 
+    // K projection: file has [d_kv, d_model] (PyTorch: out_features × in_features).
+    // For GQA, d_kv < d_model so this is a non-square matrix.
+    // We use transpose=false to load as [d_kv][d_model] directly.
+    let kv_transpose = if d_kv == d { config.transpose } else { false };
     let (w_k, qi) = load_weight_matrix(
         tensors,
         &format!("{prefix}.{attn}.k_proj.weight"),
-        [d, d],
-        config.transpose,
+        [d_kv, d],
+        kv_transpose,
     )?;
     quant_info.insert("w_k".to_string(), qi);
 
     let (w_v, qi) = load_weight_matrix(
         tensors,
         &format!("{prefix}.{attn}.v_proj.weight"),
-        [d, d],
-        config.transpose,
+        [d_kv, d],
+        kv_transpose,
     )?;
     quant_info.insert("w_v".to_string(), qi);
 
@@ -691,6 +700,257 @@ pub fn load_model_sharded<P: AsRef<Path>>(
     }
 
     Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Embedding and LM head loading
+// ---------------------------------------------------------------------------
+
+/// Loaded embedding table: `[vocab_size, d_model]` as INT8 values.
+///
+/// The embedding table is not encrypted — it lives on the user's side.
+/// The user looks up a token's embedding row (cleartext), then encrypts
+/// each dimension as a separate ciphertext before sending to the provider.
+#[derive(Clone, Debug)]
+pub struct EmbeddingTable {
+    /// Embedding vectors: `embeddings[token_id][dim]`.
+    pub embeddings: Vec<Vec<i64>>,
+    /// Vocabulary size.
+    pub vocab_size: usize,
+    /// Embedding dimension.
+    pub d_model: usize,
+    /// Quantization parameters for the embedding table.
+    pub quant_info: QuantInfo,
+}
+
+impl EmbeddingTable {
+    /// Looks up the embedding for a given token ID.
+    ///
+    /// Returns a `Vec<i64>` of length `d_model`, suitable for encrypting
+    /// one dimension at a time via `chimera_encrypt`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `token_id >= vocab_size`.
+    pub fn lookup(&self, token_id: usize) -> &[i64] {
+        assert!(
+            token_id < self.vocab_size,
+            "token_id {token_id} out of range (vocab_size = {})",
+            self.vocab_size
+        );
+        &self.embeddings[token_id]
+    }
+}
+
+/// Loads the token embedding table from a safetensors buffer.
+///
+/// Looks for the tensor named `embed_name` (e.g. `"model.embed_tokens.weight"`),
+/// which should have shape `[vocab_size, d_model]`.
+///
+/// The tensor is quantized to INT8 if not already.
+pub fn load_embedding_table(
+    tensors: &SafeTensors<'_>,
+    embed_name: &str,
+    d_model: usize,
+) -> Result<EmbeddingTable, ModelLoadError> {
+    let view = tensors.tensor(embed_name).map_err(|_| {
+        ModelLoadError::MissingTensor(embed_name.to_string())
+    })?;
+
+    let shape = view.shape();
+    if shape.len() != 2 || shape[1] != d_model {
+        return Err(ModelLoadError::ShapeMismatch {
+            tensor_name: embed_name.to_string(),
+            expected: vec![0, d_model], // 0 = any vocab_size
+            actual: shape.to_vec(),
+        });
+    }
+
+    let vocab_size = shape[0];
+    let dtype = view.dtype();
+    let data = view.data();
+
+    let (flat_quantized, quant_info) = if dtype == Dtype::I8 {
+        let values: Vec<i64> = data.iter().map(|&b| (b as i8) as i64).collect();
+        (values, QuantInfo { scale: 1.0, abs_max: 127.0 })
+    } else {
+        let float_values = tensor_to_f64(data, dtype).map_err(|e| {
+            ModelLoadError::UnsupportedDtype {
+                tensor_name: embed_name.to_string(),
+                dtype: e,
+            }
+        })?;
+        let (quantized, qi) = quantize_to_int8(&float_values);
+        (quantized, qi)
+    };
+
+    // Reshape flat [vocab_size * d_model] → [vocab_size][d_model]
+    let mut embeddings = Vec::with_capacity(vocab_size);
+    for i in 0..vocab_size {
+        let start = i * d_model;
+        let end = start + d_model;
+        embeddings.push(flat_quantized[start..end].to_vec());
+    }
+
+    Ok(EmbeddingTable {
+        embeddings,
+        vocab_size,
+        d_model,
+        quant_info,
+    })
+}
+
+/// Loads the token embedding table from a safetensors file on disk.
+pub fn load_embedding_from_file<P: AsRef<Path>>(
+    path: P,
+    embed_name: &str,
+    d_model: usize,
+) -> Result<EmbeddingTable, ModelLoadError> {
+    let file = std::fs::File::open(path.as_ref())?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let tensors = SafeTensors::deserialize(&mmap)
+        .map_err(|e| ModelLoadError::SafeTensors(e.to_string()))?;
+    load_embedding_table(&tensors, embed_name, d_model)
+}
+
+/// Loaded LM head weights: `[vocab_size, d_model]` as INT8 values.
+///
+/// Like the embedding table, the LM head lives on the user's side.
+/// After the provider returns encrypted hidden states, the user decrypts
+/// locally and computes `logits[v] = Σ_d W_lmhead[v][d] * hidden[d]` in
+/// cleartext.
+#[derive(Clone, Debug)]
+pub struct LMHead {
+    /// Weight matrix: `weights[vocab_token][dim]`.
+    pub weights: Vec<Vec<i64>>,
+    /// Vocabulary size.
+    pub vocab_size: usize,
+    /// Hidden dimension.
+    pub d_model: usize,
+    /// Quantization parameters.
+    pub quant_info: QuantInfo,
+}
+
+impl LMHead {
+    /// Computes output logits from a decrypted hidden state (cleartext).
+    ///
+    /// `hidden` should be a `Vec<i64>` of length `d_model` (the decrypted
+    /// output of the final transformer layer).
+    ///
+    /// Returns `Vec<i64>` of length `vocab_size` where `logits[v] = Σ_d W[v][d] * hidden[d]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hidden.len() != d_model`.
+    pub fn forward(&self, hidden: &[i64]) -> Vec<i64> {
+        assert_eq!(
+            hidden.len(),
+            self.d_model,
+            "LMHead: hidden state has {} dims, expected {}",
+            hidden.len(),
+            self.d_model
+        );
+        self.weights
+            .iter()
+            .map(|w_row| {
+                w_row.iter().zip(hidden.iter()).map(|(&w, &h)| w * h).sum()
+            })
+            .collect()
+    }
+
+    /// Returns the token ID with the highest logit (greedy decoding).
+    pub fn argmax(&self, hidden: &[i64]) -> usize {
+        let logits = self.forward(hidden);
+        logits
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, v)| *v)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+}
+
+/// Loads the LM head weight matrix from a safetensors buffer.
+///
+/// Looks for the tensor named `head_name` (e.g. `"lm_head.weight"`),
+/// which should have shape `[vocab_size, d_model]`.
+///
+/// In many LLaMA-family models, the LM head shares weights with the
+/// embedding table. In that case, pass the embedding tensor name instead.
+pub fn load_lm_head(
+    tensors: &SafeTensors<'_>,
+    head_name: &str,
+    d_model: usize,
+) -> Result<LMHead, ModelLoadError> {
+    let view = tensors.tensor(head_name).map_err(|_| {
+        ModelLoadError::MissingTensor(head_name.to_string())
+    })?;
+
+    let shape = view.shape();
+    if shape.len() != 2 || shape[1] != d_model {
+        return Err(ModelLoadError::ShapeMismatch {
+            tensor_name: head_name.to_string(),
+            expected: vec![0, d_model],
+            actual: shape.to_vec(),
+        });
+    }
+
+    let vocab_size = shape[0];
+    let dtype = view.dtype();
+    let data = view.data();
+
+    let (flat_quantized, quant_info) = if dtype == Dtype::I8 {
+        let values: Vec<i64> = data.iter().map(|&b| (b as i8) as i64).collect();
+        (values, QuantInfo { scale: 1.0, abs_max: 127.0 })
+    } else {
+        let float_values = tensor_to_f64(data, dtype).map_err(|e| {
+            ModelLoadError::UnsupportedDtype {
+                tensor_name: head_name.to_string(),
+                dtype: e,
+            }
+        })?;
+        let (quantized, qi) = quantize_to_int8(&float_values);
+        (quantized, qi)
+    };
+
+    let mut weights = Vec::with_capacity(vocab_size);
+    for i in 0..vocab_size {
+        let start = i * d_model;
+        let end = start + d_model;
+        weights.push(flat_quantized[start..end].to_vec());
+    }
+
+    Ok(LMHead {
+        weights,
+        vocab_size,
+        d_model,
+        quant_info,
+    })
+}
+
+/// Loads the LM head from a safetensors file on disk.
+pub fn load_lm_head_from_file<P: AsRef<Path>>(
+    path: P,
+    head_name: &str,
+    d_model: usize,
+) -> Result<LMHead, ModelLoadError> {
+    let file = std::fs::File::open(path.as_ref())?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let tensors = SafeTensors::deserialize(&mmap)
+        .map_err(|e| ModelLoadError::SafeTensors(e.to_string()))?;
+    load_lm_head(&tensors, head_name, d_model)
+}
+
+/// Loads the final RMSNorm weights (applied after all transformer layers,
+/// before the LM head) from a safetensors buffer.
+///
+/// In LLaMA models, this is `model.norm.weight` (shape `[d_model]`).
+pub fn load_final_norm(
+    tensors: &SafeTensors<'_>,
+    norm_name: &str,
+    d_model: usize,
+) -> Result<(Vec<i64>, QuantInfo), ModelLoadError> {
+    load_norm_weights(tensors, norm_name, d_model)
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1256,7 @@ mod tests {
             d_model: 2,
             d_head: 2,
             n_heads: 1,
+            n_kv_heads: 1,
             d_ffn: 3,
             n_layers: 1,
             n_experts: 1,
@@ -1034,5 +1295,203 @@ mod tests {
         assert!(result.quant_info.contains_key("w_q"));
         assert!(result.quant_info.contains_key("w1_gate"));
         assert!(result.quant_info.contains_key("pre_attn_norm_gamma"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers for EmbeddingTable / LMHead / final norm tests
+    // -----------------------------------------------------------------------
+
+    /// Creates a safetensors buffer with an INT8 embedding table.
+    /// vocab_size=3, d_model=2.  Rows: [1, 2], [3, 4], [5, 6].
+    fn make_test_embedding_int8() -> Vec<u8> {
+        use safetensors::tensor::serialize;
+        use std::collections::HashMap;
+
+        let mut tensors = HashMap::new();
+        // 3×2 INT8: [[1,2],[3,4],[5,6]]
+        let data: Vec<u8> = vec![1u8, 2, 3, 4, 5, 6];
+        tensors.insert(
+            "model.embed_tokens.weight".to_string(),
+            safetensors::tensor::TensorView::new(Dtype::I8, vec![3, 2], &data).unwrap(),
+        );
+        serialize(&tensors, &None).unwrap()
+    }
+
+    /// Creates a safetensors buffer with an FP16 embedding table.
+    /// vocab_size=2, d_model=2.  Rows: [1.0, -0.5], [0.25, 2.0].
+    fn make_test_embedding_fp16() -> Vec<u8> {
+        use safetensors::tensor::serialize;
+        use std::collections::HashMap;
+
+        let mut tensors = HashMap::new();
+        let values = [1.0_f32, -0.5, 0.25, 2.0];
+        let mut data = Vec::new();
+        for &v in &values {
+            let h = half::f16::from_f32(v);
+            data.extend_from_slice(&h.to_le_bytes());
+        }
+        tensors.insert(
+            "model.embed_tokens.weight".to_string(),
+            safetensors::tensor::TensorView::new(Dtype::F16, vec![2, 2], &data).unwrap(),
+        );
+        serialize(&tensors, &None).unwrap()
+    }
+
+    /// Creates a safetensors buffer with a small INT8 LM head weight.
+    /// vocab_size=3, d_model=2.  Rows: [10, 20], [30, 40], [50, 60].
+    fn make_test_lm_head_int8() -> Vec<u8> {
+        use safetensors::tensor::serialize;
+        use std::collections::HashMap;
+
+        let mut tensors = HashMap::new();
+        let data: Vec<u8> = vec![10u8, 20, 30, 40, 50, 60];
+        tensors.insert(
+            "lm_head.weight".to_string(),
+            safetensors::tensor::TensorView::new(Dtype::I8, vec![3, 2], &data).unwrap(),
+        );
+        serialize(&tensors, &None).unwrap()
+    }
+
+    /// Creates a safetensors buffer with a 1D INT8 norm tensor.
+    /// Shape [4], values [10, -5, 127, -128] as i8.
+    fn make_test_final_norm() -> Vec<u8> {
+        use safetensors::tensor::serialize;
+        use std::collections::HashMap;
+
+        let mut tensors = HashMap::new();
+        let data: Vec<u8> = vec![10u8, (-5i8) as u8, 127u8, (-128i8) as u8];
+        tensors.insert(
+            "model.norm.weight".to_string(),
+            safetensors::tensor::TensorView::new(Dtype::I8, vec![4], &data).unwrap(),
+        );
+        serialize(&tensors, &None).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // EmbeddingTable tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_embedding_table_basic() {
+        let buf = make_test_embedding_int8();
+        let tensors = SafeTensors::deserialize(&buf).unwrap();
+
+        let table = load_embedding_table(&tensors, "model.embed_tokens.weight", 2).unwrap();
+
+        assert_eq!(table.vocab_size, 3);
+        assert_eq!(table.d_model, 2);
+        assert_eq!(table.lookup(0), &[1i64, 2]);
+        assert_eq!(table.lookup(1), &[3i64, 4]);
+        assert_eq!(table.lookup(2), &[5i64, 6]);
+    }
+
+    #[test]
+    fn test_embedding_table_fp16() {
+        let buf = make_test_embedding_fp16();
+        let tensors = SafeTensors::deserialize(&buf).unwrap();
+
+        let table = load_embedding_table(&tensors, "model.embed_tokens.weight", 2).unwrap();
+
+        assert_eq!(table.vocab_size, 2);
+        assert_eq!(table.d_model, 2);
+        // FP16 values [1.0, -0.5, 0.25, 2.0], abs_max=2.0, scale=2.0/127.0
+        // 1.0  → round(1.0 / (2.0/127.0)) = round(63.5) = 64
+        // -0.5 → round(-0.5 / (2.0/127.0)) = round(-31.75) = -32
+        // 0.25 → round(0.25 / (2.0/127.0)) = round(15.875) = 16
+        // 2.0  → 127
+        assert!((table.quant_info.abs_max - 2.0).abs() < 0.01);
+        assert_eq!(table.lookup(0), &[64i64, -32]);
+        assert_eq!(table.lookup(1), &[16i64, 127]);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn test_embedding_lookup_panic() {
+        let buf = make_test_embedding_int8();
+        let tensors = SafeTensors::deserialize(&buf).unwrap();
+
+        let table = load_embedding_table(&tensors, "model.embed_tokens.weight", 2).unwrap();
+        // vocab_size=3, so lookup(3) should panic
+        let _ = table.lookup(3);
+    }
+
+    // -----------------------------------------------------------------------
+    // LMHead tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lm_head_forward() {
+        let buf = make_test_lm_head_int8();
+        let tensors = SafeTensors::deserialize(&buf).unwrap();
+
+        let head = load_lm_head(&tensors, "lm_head.weight", 2).unwrap();
+
+        assert_eq!(head.vocab_size, 3);
+        assert_eq!(head.d_model, 2);
+
+        // Weights: [[10,20],[30,40],[50,60]]
+        // forward([1, 0]):
+        //   logit[0] = 10*1 + 20*0 = 10
+        //   logit[1] = 30*1 + 40*0 = 30
+        //   logit[2] = 50*1 + 60*0 = 50
+        let logits = head.forward(&[1, 0]);
+        assert_eq!(logits, vec![10, 30, 50]);
+
+        // forward([0, 1]):
+        //   logit[0] = 10*0 + 20*1 = 20
+        //   logit[1] = 30*0 + 40*1 = 40
+        //   logit[2] = 50*0 + 60*1 = 60
+        let logits = head.forward(&[0, 1]);
+        assert_eq!(logits, vec![20, 40, 60]);
+
+        // forward([1, 1]):
+        //   logit[0] = 10 + 20 = 30
+        //   logit[1] = 30 + 40 = 70
+        //   logit[2] = 50 + 60 = 110
+        let logits = head.forward(&[1, 1]);
+        assert_eq!(logits, vec![30, 70, 110]);
+    }
+
+    #[test]
+    fn test_lm_head_argmax() {
+        let buf = make_test_lm_head_int8();
+        let tensors = SafeTensors::deserialize(&buf).unwrap();
+
+        let head = load_lm_head(&tensors, "lm_head.weight", 2).unwrap();
+
+        // Weights: [[10,20],[30,40],[50,60]]
+        // forward([1, 0]) = [10, 30, 50] → argmax = 2
+        assert_eq!(head.argmax(&[1, 0]), 2);
+
+        // forward([0, 1]) = [20, 40, 60] → argmax = 2
+        assert_eq!(head.argmax(&[0, 1]), 2);
+
+        // forward([1, -1]) = [10-20, 30-40, 50-60] = [-10, -10, -10]
+        // All tied; max_by_key returns last max index = 2
+        assert_eq!(head.argmax(&[1, -1]), 2);
+
+        // forward([2, 1]) = [20+20, 60+40, 100+60] = [40, 100, 160] → argmax = 2
+        assert_eq!(head.argmax(&[2, 1]), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // load_final_norm tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_load_final_norm() {
+        let buf = make_test_final_norm();
+        let tensors = SafeTensors::deserialize(&buf).unwrap();
+
+        let (weights, quant) = load_final_norm(&tensors, "model.norm.weight", 4).unwrap();
+
+        assert_eq!(weights.len(), 4);
+        assert_eq!(weights[0], 10);
+        assert_eq!(weights[1], -5);
+        assert_eq!(weights[2], 127);
+        assert_eq!(weights[3], -128);
+        // INT8 path: scale=1.0, abs_max=127.0
+        assert_eq!(quant.scale, 1.0);
+        assert_eq!(quant.abs_max, 127.0);
     }
 }

@@ -176,8 +176,15 @@ pub struct ModelDims {
     pub d_model: usize,
     /// Attention head dimension (d_head), e.g. 128.
     pub d_head: usize,
-    /// Number of attention heads.
+    /// Number of query attention heads.
     pub n_heads: usize,
+    /// Number of key/value attention heads (for Grouped Query Attention).
+    ///
+    /// When `n_kv_heads == n_heads`, this is standard multi-head attention (MHA).
+    /// When `n_kv_heads < n_heads`, multiple query heads share the same KV head
+    /// (Grouped Query Attention / GQA). For example, TinyLlama has 32 query
+    /// heads but only 4 KV heads, giving a group size of 8.
+    pub n_kv_heads: usize,
     /// FFN intermediate dimension (d_ffn), e.g. 11008.
     pub d_ffn: usize,
     /// Number of transformer layers.
@@ -189,12 +196,15 @@ pub struct ModelDims {
 }
 
 impl ModelDims {
-    /// Returns dimensions for a typical ~7B dense transformer.
+    /// Returns dimensions for a typical ~7B dense transformer (LLaMA-2 7B style).
+    ///
+    /// Uses standard multi-head attention (n_kv_heads == n_heads).
     pub fn dense_7b() -> Self {
         ModelDims {
             d_model: 4096,
             d_head: 128,
             n_heads: 32,
+            n_kv_heads: 32,
             d_ffn: 11008,
             n_layers: 32,
             n_experts: 1,
@@ -203,15 +213,34 @@ impl ModelDims {
     }
 
     /// Returns dimensions for a Mixtral-style ~40B MoE transformer.
+    ///
+    /// Uses GQA with 8 KV heads shared across 32 query heads (group size 4).
     pub fn moe_40b() -> Self {
         ModelDims {
             d_model: 4096,
             d_head: 128,
             n_heads: 32,
+            n_kv_heads: 8,
             d_ffn: 14336,
             n_layers: 32,
             n_experts: 8,
             n_active_experts: 2,
+        }
+    }
+
+    /// Returns dimensions for a TinyLlama-1.1B style model.
+    ///
+    /// Uses GQA with 4 KV heads shared across 32 query heads (group size 8).
+    pub fn tinyllama_1b() -> Self {
+        ModelDims {
+            d_model: 2048,
+            d_head: 64,
+            n_heads: 32,
+            n_kv_heads: 4,
+            d_ffn: 5632,
+            n_layers: 22,
+            n_experts: 1,
+            n_active_experts: 1,
         }
     }
 
@@ -220,16 +249,49 @@ impl ModelDims {
         self.n_experts > 1
     }
 
+    /// Returns whether this model uses Grouped Query Attention (GQA).
+    ///
+    /// GQA is active when `n_kv_heads < n_heads`.
+    pub fn is_gqa(&self) -> bool {
+        self.n_kv_heads < self.n_heads
+    }
+
+    /// Returns the GQA group size: how many query heads share one KV head.
+    ///
+    /// For standard MHA, returns 1. For GQA, returns `n_heads / n_kv_heads`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n_heads` is not divisible by `n_kv_heads`.
+    pub fn gqa_group_size(&self) -> usize {
+        assert!(
+            self.n_heads % self.n_kv_heads == 0,
+            "n_heads ({}) must be divisible by n_kv_heads ({})",
+            self.n_heads, self.n_kv_heads
+        );
+        self.n_heads / self.n_kv_heads
+    }
+
+    /// Returns the total KV projection dimension: `n_kv_heads * d_head`.
+    ///
+    /// For standard MHA this equals `d_model`. For GQA this is smaller.
+    pub fn d_kv(&self) -> usize {
+        self.n_kv_heads * self.d_head
+    }
+
     /// Returns the approximate total parameter count (in elements).
     pub fn total_params(&self) -> usize {
-        let attn_params = self.n_layers * (4 * self.d_model * self.d_model); // Q,K,V,O
+        // Q and O projections are [d_model, d_model]; K and V are [d_kv, d_model]
+        let d_kv = self.d_kv();
+        let attn_params = self.n_layers * (self.d_model * self.d_model + 2 * d_kv * self.d_model + self.d_model * self.d_model);
         let ffn_params = self.n_layers * self.n_experts * (2 * self.d_model * self.d_ffn);
         attn_params + ffn_params
     }
 
     /// Returns the approximate active parameter count per token.
     pub fn active_params(&self) -> usize {
-        let attn_params = self.n_layers * (4 * self.d_model * self.d_model);
+        let d_kv = self.d_kv();
+        let attn_params = self.n_layers * (self.d_model * self.d_model + 2 * d_kv * self.d_model + self.d_model * self.d_model);
         let ffn_params = self.n_layers * self.n_active_experts * (2 * self.d_model * self.d_ffn);
         attn_params + ffn_params
     }
@@ -297,5 +359,51 @@ mod tests {
         assert!(params.supports_no_bootstrap(4));
         // Very deep model should need bootstrapping
         assert!(!params.supports_no_bootstrap(100));
+    }
+
+    #[test]
+    fn test_gqa_helpers_dense_7b() {
+        let dims = ModelDims::dense_7b();
+        assert!(!dims.is_gqa(), "dense_7b should be standard MHA");
+        assert_eq!(dims.gqa_group_size(), 1);
+        assert_eq!(dims.d_kv(), dims.d_model);
+        assert_eq!(dims.n_kv_heads, 32);
+    }
+
+    #[test]
+    fn test_gqa_helpers_moe_40b() {
+        let dims = ModelDims::moe_40b();
+        assert!(dims.is_gqa(), "moe_40b should use GQA");
+        assert_eq!(dims.gqa_group_size(), 4); // 32 / 8 = 4
+        assert_eq!(dims.d_kv(), 8 * 128); // n_kv_heads * d_head = 1024
+        assert!(dims.d_kv() < dims.d_model); // 1024 < 4096
+    }
+
+    #[test]
+    fn test_gqa_helpers_tinyllama_1b() {
+        let dims = ModelDims::tinyllama_1b();
+        assert!(dims.is_gqa(), "tinyllama_1b should use GQA");
+        assert_eq!(dims.gqa_group_size(), 8); // 32 / 4 = 8
+        assert_eq!(dims.d_kv(), 4 * 64); // n_kv_heads * d_head = 256
+        assert_eq!(dims.d_model, 2048);
+        assert!(dims.d_kv() < dims.d_model); // 256 < 2048
+    }
+
+    #[test]
+    fn test_gqa_total_params_accounts_for_kv_reduction() {
+        // For GQA, total_params should be less than if all projections were d_model×d_model.
+        let dims_gqa = ModelDims::moe_40b();
+        let d = dims_gqa.d_model;
+        let d_kv = dims_gqa.d_kv();
+
+        // With GQA: attn = n_layers * (d*d + 2*d_kv*d + d*d) per layer
+        // Without GQA (if d_kv == d): attn = n_layers * (4*d*d)
+        // Since d_kv < d for GQA, GQA should have fewer params
+        let gqa_attn_per_layer = d * d + 2 * d_kv * d + d * d;
+        let full_attn_per_layer = 4 * d * d;
+        assert!(
+            gqa_attn_per_layer < full_attn_per_layer,
+            "GQA attention params ({gqa_attn_per_layer}) should be less than full MHA ({full_attn_per_layer})"
+        );
     }
 }

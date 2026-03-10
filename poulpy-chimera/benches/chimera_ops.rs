@@ -3,6 +3,13 @@
 //! Measures latency and noise budget consumption across representative
 //! transformer operations: encoding, encryption, addition, plaintext
 //! multiplication, activation approximation, and planning.
+//!
+//! ## Benchmark groups
+//!
+//! - **Plaintext-domain**: encoding, decoding, polynomial eval, LUT eval,
+//!   planning, LayerNorm, noise tracking.
+//! - **FHE-domain**: encrypt/decrypt, add/sub, mul_const, ct*ct mul,
+//!   polynomial activation, matmul (single-ct), standard FFN.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -133,6 +140,110 @@ fn bench_noise_tracking(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// FHE-domain benchmarks
+// ---------------------------------------------------------------------------
+
+/// Benchmarks ciphertext-plaintext multiplication (chimera_mul_const).
+fn bench_mul_const(c: &mut Criterion) {
+    let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+    let module: Module<BE> = Module::new(params.n());
+    let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+
+    let pt = encode_int8(&module, &params, &[3i8; 64]);
+    let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+    let weight = vec![7i64; 1]; // single-coefficient polynomial
+
+    c.bench_function("chimera/mul_const_scalar", |b| {
+        b.iter(|| chimera_mul_const(&module, black_box(&ct), black_box(&weight)))
+    });
+}
+
+/// Benchmarks ciphertext × ciphertext multiplication (tensor product + relinearization).
+fn bench_ct_ct_mul(c: &mut Criterion) {
+    let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+    let module: Module<BE> = Module::new(params.n());
+    let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+    let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [50u8; 32], [60u8; 32]);
+
+    let pt = encode_int8(&module, &params, &[3i8; 64]);
+    let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+    c.bench_function("chimera/ct_ct_mul", |b| {
+        b.iter(|| chimera_ct_mul(&module, &eval_key, black_box(&ct), black_box(&ct)))
+    });
+}
+
+/// Benchmarks polynomial activation evaluation on ciphertexts.
+fn bench_poly_activation_fhe(c: &mut Criterion) {
+    let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+    let module: Module<BE> = Module::new(params.n());
+    let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+    let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [50u8; 32], [60u8; 32]);
+
+    let pt = encode_int8(&module, &params, &[3i8; 64]);
+    let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+    // Squared ReLU (degree-2, 1 ct*ct mul)
+    let sqrelu = squared_relu_approx();
+    c.bench_function("chimera/activation_sqrelu_fhe", |b| {
+        b.iter(|| apply_poly_activation(&module, &eval_key, black_box(&ct), &sqrelu))
+    });
+
+    // GELU (effective degree 2 since c3=0, same cost as SqReLU)
+    let gelu = gelu_poly_approx();
+    c.bench_function("chimera/activation_gelu_fhe", |b| {
+        b.iter(|| apply_poly_activation(&module, &eval_key, black_box(&ct), &gelu))
+    });
+}
+
+/// Benchmarks single-ciphertext matrix-vector product (ct-pt matmul).
+fn bench_matmul_fhe(c: &mut Criterion) {
+    let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+    let module: Module<BE> = Module::new(params.n());
+    let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+
+    let pt = encode_int8(&module, &params, &[3i8; 64]);
+    let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+    // Small matmul: 4 output rows, each a single-coefficient scalar
+    let weight_rows: Vec<Vec<i64>> = (0..4).map(|i| vec![(i + 1) as i64]).collect();
+
+    c.bench_function("chimera/matmul_single_ct_4rows", |b| {
+        b.iter(|| chimera_matmul_single_ct(&module, black_box(&ct), black_box(&weight_rows)))
+    });
+}
+
+/// Benchmarks a minimal standard FFN pipeline (up-project → activation → down-project).
+fn bench_ffn_standard_fhe(c: &mut Criterion) {
+    let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+    let module: Module<BE> = Module::new(params.n());
+    let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+    let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [50u8; 32], [60u8; 32]);
+
+    let pt = encode_int8(&module, &params, &[2i8; 1]);
+    let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+    // Minimal FFN: d_model=1, d_ffn=2 (2 hidden units)
+    let weights = FFNWeights {
+        w1: vec![vec![1], vec![2]],    // 2 hidden units
+        w2: vec![vec![1, 1]],          // 1 output, summing both hidden
+        w3: None,
+    };
+
+    c.bench_function("chimera/ffn_standard_d1h2", |b| {
+        b.iter(|| {
+            chimera_ffn_standard(
+                &module,
+                &eval_key,
+                black_box(&ct),
+                black_box(&weights),
+                &ActivationChoice::SquaredReLU,
+            )
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_encoding,
@@ -142,5 +253,10 @@ criterion_group!(
     bench_planning,
     bench_layernorm,
     bench_noise_tracking,
+    bench_mul_const,
+    bench_ct_ct_mul,
+    bench_poly_activation_fhe,
+    bench_matmul_fhe,
+    bench_ffn_standard_fhe,
 );
 criterion_main!(benches);

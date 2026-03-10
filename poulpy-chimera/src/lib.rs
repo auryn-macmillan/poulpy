@@ -61,6 +61,7 @@ pub mod attention;
 pub mod transformer;
 pub mod moe;
 pub mod noise;
+pub mod bootstrapping;
 
 #[cfg(test)]
 mod tests;

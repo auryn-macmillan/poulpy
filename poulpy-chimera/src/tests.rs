@@ -422,6 +422,11 @@ mod integration {
             output_layout: glwe_out.clone(),
             tensor_layout: glwe_out.clone(),
             res_offset: scale,
+            tensor_key_l2_prepared: None,
+            tensor_key_l2_layout: None,
+            output_l2_layout: None,
+            tensor_l2_layout: None,
+            res_offset_l2: None,
             auto_keys: std::collections::HashMap::new(),
             auto_key_layout: poulpy_core::layouts::GLWEAutomorphismKeyLayout {
                 n: Degree(n as u32),
@@ -563,6 +568,11 @@ mod integration {
             output_layout: glwe_out.clone(),
             tensor_layout: glwe_out.clone(),
             res_offset: 2 * in_base2k,
+            tensor_key_l2_prepared: None,
+            tensor_key_l2_layout: None,
+            output_l2_layout: None,
+            tensor_l2_layout: None,
+            res_offset_l2: None,
             auto_keys: std::collections::HashMap::new(),
             auto_key_layout: poulpy_core::layouts::GLWEAutomorphismKeyLayout {
                 n: Degree(n as u32),
@@ -836,6 +846,11 @@ mod integration {
             output_layout: glwe_out.clone(),
             tensor_layout: glwe_out.clone(),
             res_offset: 2 * in_base2k,
+            tensor_key_l2_prepared: None,
+            tensor_key_l2_layout: None,
+            output_l2_layout: None,
+            tensor_l2_layout: None,
+            res_offset_l2: None,
             auto_keys: std::collections::HashMap::new(),
             auto_key_layout: poulpy_core::layouts::GLWEAutomorphismKeyLayout {
                 n: Degree(n as u32),
@@ -891,6 +906,268 @@ mod integration {
             decoded[0], diff
         );
     }
+
+    // ---- Rescale validation tests ----
+
+    /// Tests a single rescale: encrypt → mul_const → rescale → decrypt.
+    ///
+    /// After mul_const the torus precision has been "used" at one level;
+    /// rescale drops the lowest limb, reducing k by base2k. The decoded
+    /// value should still match the original multiplication result.
+    #[test]
+    fn test_rescale_single() {
+        use crate::arithmetic::{chimera_mul_const, chimera_rescale};
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+
+        let values: Vec<i8> = vec![10, -20, 30];
+        let pt = encode_int8(&module, &params, &values);
+        let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+        // Multiply by scalar 3
+        let ct_mul = chimera_mul_const(&module, &ct, &[3i64]);
+
+        // Rescale (drops lowest limb)
+        let ct_rescaled = chimera_rescale(&module, &ct_mul, &params);
+
+        // Decrypt and decode
+        let pt_dec = chimera_decrypt(&module, &key, &ct_rescaled, &params);
+        let decoded = decode_int8(&module, &params, &pt_dec, 3);
+
+        // Expected: [30, -60, 90]
+        for (i, &v) in values.iter().enumerate() {
+            let expected = v as i16 * 3;
+            let diff = (expected - decoded[i] as i16).unsigned_abs();
+            assert!(
+                diff <= 2,
+                "rescale_single error at {i}: expected {expected}, got {}, diff={diff}",
+                decoded[i]
+            );
+        }
+    }
+
+    /// Tests chained rescale: encrypt → mul_const → rescale → mul_const → rescale → decrypt.
+    ///
+    /// Two successive mul_const + rescale operations. The key validation here is
+    /// that the second rescale operates correctly on a ciphertext whose k has
+    /// already been reduced by the first rescale.
+    #[test]
+    fn test_rescale_chained_two_levels() {
+        use crate::arithmetic::{chimera_mul_const, chimera_rescale};
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+
+        let values: Vec<i8> = vec![4, -8, 12];
+        let pt = encode_int8(&module, &params, &values);
+        let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+        // Level 1: multiply by 2, then rescale
+        let ct_mul1 = chimera_mul_const(&module, &ct, &[2i64]);
+        let ct_rescaled1 = chimera_rescale(&module, &ct_mul1, &params);
+
+        // Level 2: multiply by 3, then rescale
+        let ct_mul2 = chimera_mul_const(&module, &ct_rescaled1, &[3i64]);
+        let ct_rescaled2 = chimera_rescale(&module, &ct_mul2, &params);
+
+        // Decrypt and decode
+        let pt_dec = chimera_decrypt(&module, &key, &ct_rescaled2, &params);
+        let decoded = decode_int8(&module, &params, &pt_dec, 3);
+
+        // Expected: [4*2*3, -8*2*3, 12*2*3] = [24, -48, 72]
+        for (i, &v) in values.iter().enumerate() {
+            let expected = v as i16 * 6;
+            let diff = (expected - decoded[i] as i16).unsigned_abs();
+            assert!(
+                diff <= 4,
+                "rescale_chained error at {i}: expected {expected}, got {}, diff={diff}",
+                decoded[i]
+            );
+        }
+    }
+
+    /// Tests that rescale correctly tracks precision: verifies that k decreases
+    /// by the ciphertext's base2k after each rescale and that we cannot rescale past k=0.
+    #[test]
+    fn test_rescale_precision_tracking() {
+        use crate::arithmetic::{chimera_mul_const, chimera_rescale};
+        use poulpy_core::layouts::LWEInfos;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+
+        let values: Vec<i8> = vec![10];
+        let pt = encode_int8(&module, &params, &values);
+        let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+        let initial_k = ct.k().as_u32();
+        // The ciphertext's actual base2k is in_base2k (= params.base2k - 1),
+        // NOT params.base2k. chimera_rescale drops base2k bits based on
+        // the ciphertext's own base2k value.
+        let ct_base2k = ct.base2k().as_u32();
+
+        // First mul_const + rescale
+        let ct_mul1 = chimera_mul_const(&module, &ct, &[2i64]);
+        let ct_r1 = chimera_rescale(&module, &ct_mul1, &params);
+        let k_after_1 = ct_r1.k().as_u32();
+        assert_eq!(
+            k_after_1,
+            initial_k - ct_base2k,
+            "k should decrease by ct.base2k ({ct_base2k}) after first rescale: expected {}, got {}",
+            initial_k - ct_base2k,
+            k_after_1
+        );
+
+        // Second mul_const + rescale (the rescaled ct still has the same base2k)
+        let ct_mul2 = chimera_mul_const(&module, &ct_r1, &[2i64]);
+        let ct_r2 = chimera_rescale(&module, &ct_mul2, &params);
+        let k_after_2 = ct_r2.k().as_u32();
+        assert_eq!(
+            k_after_2,
+            initial_k - 2 * ct_base2k,
+            "k should decrease by 2*ct.base2k after two rescales: expected {}, got {}",
+            initial_k - 2 * ct_base2k,
+            k_after_2
+        );
+    }
+
+    /// Tests rescale after addition: (ct_a + ct_b) * scalar → rescale.
+    ///
+    /// Validates that rescale works correctly after an add operation
+    /// (which does not change the noise budget but adds variances).
+    #[test]
+    fn test_rescale_after_add() {
+        use crate::arithmetic::{chimera_add, chimera_mul_const, chimera_rescale};
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+
+        let a_vals: Vec<i8> = vec![10, 20];
+        let b_vals: Vec<i8> = vec![5, -10];
+        let pt_a = encode_int8(&module, &params, &a_vals);
+        let pt_b = encode_int8(&module, &params, &b_vals);
+        let ct_a = chimera_encrypt(&module, &key, &pt_a, [1u8; 32], [2u8; 32]);
+        let ct_b = chimera_encrypt(&module, &key, &pt_b, [3u8; 32], [4u8; 32]);
+
+        // Add, then multiply by 2, then rescale
+        let ct_sum = chimera_add(&module, &ct_a, &ct_b);
+        let ct_mul = chimera_mul_const(&module, &ct_sum, &[2i64]);
+        let ct_rescaled = chimera_rescale(&module, &ct_mul, &params);
+
+        let pt_dec = chimera_decrypt(&module, &key, &ct_rescaled, &params);
+        let decoded = decode_int8(&module, &params, &pt_dec, 2);
+
+        // Expected: [(10+5)*2, (20-10)*2] = [30, 20]
+        let expected = vec![30i16, 20];
+        for i in 0..2 {
+            let diff = (expected[i] - decoded[i] as i16).unsigned_abs();
+            assert!(
+                diff <= 2,
+                "rescale_after_add error at {i}: expected {}, got {}, diff={diff}",
+                expected[i], decoded[i]
+            );
+        }
+    }
+
+    /// Tests that rescale saturates gracefully when k is too small.
+    ///
+    /// When k < base2k, rescale should not panic and should return a
+    /// ciphertext with k unchanged (the minimum floor).
+    #[test]
+    fn test_rescale_saturation() {
+        use crate::arithmetic::{chimera_mul_const, chimera_rescale};
+        use poulpy_core::layouts::LWEInfos;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+
+        let values: Vec<i8> = vec![5];
+        let pt = encode_int8(&module, &params, &values);
+        let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+        // Chain many rescales until k bottoms out
+        let mut current = chimera_mul_const(&module, &ct, &[1i64]);
+        let mut prev_k = current.k().as_u32();
+
+        for _ in 0..20 {
+            let rescaled = chimera_rescale(&module, &current, &params);
+            let new_k = rescaled.k().as_u32();
+
+            // k should never go below 0 and should not panic
+            assert!(
+                new_k <= prev_k,
+                "k should not increase after rescale: was {prev_k}, now {new_k}"
+            );
+
+            if new_k == prev_k {
+                // We've hit the floor — rescale is a no-op now
+                break;
+            }
+
+            prev_k = new_k;
+            current = chimera_mul_const(&module, &rescaled, &[1i64]);
+        }
+    }
+
+    /// End-to-end rescale with noise tracker correlation.
+    ///
+    /// Validates that the NoiseTracker predictions are consistent with
+    /// actual decryption success. After a chain of operations, if the
+    /// noise tracker says the budget is positive, decryption should
+    /// still produce approximately correct results.
+    #[test]
+    fn test_rescale_noise_tracker_consistency() {
+        use crate::arithmetic::{chimera_mul_const, chimera_rescale};
+        use crate::noise::NoiseTracker;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+
+        let values: Vec<i8> = vec![10];
+        let pt = encode_int8(&module, &params, &values);
+        let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+        let mut tracker = NoiseTracker::fresh();
+        let mut current_ct = ct;
+
+        // Chain 3 rounds of mul_const(2) + rescale
+        for round in 0..3 {
+            current_ct = chimera_mul_const(&module, &current_ct, &[2i64]);
+            tracker.mul_const(2.0);
+
+            current_ct = chimera_rescale(&module, &current_ct, &params);
+            tracker.rescale(params.base2k.0);
+
+            let budget = tracker.budget_bits(&params);
+
+            // If the tracker says we still have budget, decryption should work
+            if budget > 2.0 {
+                let pt_dec = chimera_decrypt(&module, &key, &current_ct, &params);
+                let decoded = decode_int8(&module, &params, &pt_dec, 1);
+                let expected = 10i16 * (1 << (round + 1));
+
+                // Allow larger tolerance as noise accumulates
+                let max_error = 2u16.pow(round as u32 + 1);
+                let diff = (expected - decoded[0] as i16).unsigned_abs();
+                assert!(
+                    diff <= max_error,
+                    "round {round}: noise tracker says budget={budget:.1} bits \
+                     but decryption error is {diff} (max allowed: {max_error}). \
+                     expected={expected}, got={}",
+                    decoded[0]
+                );
+            }
+        }
+    }
+
+    // ---- Regression tests ----
 
     /// Regression test: validates glwe_mul_const res_offset behaviour on
     /// post-tensor-product ciphertexts (mixed base2k scenarios).
@@ -976,6 +1253,11 @@ mod integration {
             output_layout: glwe_out.clone(),
             tensor_layout: glwe_out.clone(),
             res_offset: 2 * in_base2k,
+            tensor_key_l2_prepared: None,
+            tensor_key_l2_layout: None,
+            output_l2_layout: None,
+            tensor_l2_layout: None,
+            res_offset_l2: None,
             auto_keys: std::collections::HashMap::new(),
             auto_key_layout: poulpy_core::layouts::GLWEAutomorphismKeyLayout {
                 n: Degree(n as u32),

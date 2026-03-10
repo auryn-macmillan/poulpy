@@ -19,7 +19,20 @@
 //! FFN(x) = W_2 · activation(W_1 · x)                        // standard
 //! ```
 
+use poulpy_core::{
+    GLWEAdd, GLWEMulConst, GLWETensoring,
+    layouts::GLWE,
+};
+use poulpy_hal::{
+    api::{ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
+    layouts::{Backend, Module, Scratch, ScratchOwned},
+};
+use poulpy_core::ScratchTakeCore;
+
+use crate::activations::{apply_poly_activation, chimera_ct_mul, gelu_poly_approx, silu_poly_approx, squared_relu_approx, PolyApprox};
+use crate::arithmetic::{chimera_add, chimera_matmul_single_ct, chimera_project_layout};
 use crate::attention::{AttentionConfig, AttentionPlan, SoftmaxStrategy, plan_attention};
+use crate::encrypt::ChimeraEvalKey;
 use crate::layernorm::{LayerNormConfig, LayerNormPlan, plan_layernorm};
 use crate::params::{ChimeraParams, ModelDims};
 
@@ -266,10 +279,276 @@ pub fn default_block_config(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Homomorphic FFN evaluation
+// ---------------------------------------------------------------------------
+
+/// Returns the polynomial approximation corresponding to an [`ActivationChoice`].
+pub fn activation_to_poly(choice: &ActivationChoice) -> PolyApprox {
+    match choice {
+        ActivationChoice::PolyGELU => gelu_poly_approx(),
+        ActivationChoice::SquaredReLU => squared_relu_approx(),
+        ActivationChoice::PolySiLU => silu_poly_approx(),
+        ActivationChoice::LutGELU => {
+            // LUT-based GELU is not yet implemented as a ciphertext operation.
+            // Fall back to the polynomial GELU for now.
+            gelu_poly_approx()
+        }
+    }
+}
+
+/// Computes a standard FFN on encrypted input: `y = W2 · activation(W1 · x)`.
+///
+/// The computation proceeds in three phases:
+///
+/// 1. **Up-projection**: `h = W1 · x` — ciphertext-plaintext matmul.
+///    Each row of `W1` is multiplied with the input ciphertext via
+///    [`chimera_matmul_single_ct`], producing one intermediate ciphertext per
+///    hidden dimension.
+///
+/// 2. **Activation**: `h' = activation(h)` — polynomial evaluation on each
+///    intermediate ciphertext using the tensor product infrastructure.
+///
+/// 3. **Down-projection**: `y = W2 · h'` — the activated intermediates are
+///    linearly combined per output dimension. Because each `h'_j` is a
+///    separate ciphertext and `W2[i]` is a row of scalar weights, this is
+///    a sum of scaled ciphertexts: `y_i = Σ_j W2[i][j] · h'_j`.
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key containing tensor key for the activation.
+/// * `x` - Encrypted input vector (single ciphertext).
+/// * `weights` - FFN weight matrices. `w1` rows are up-projection weights,
+///   `w2` rows are down-projection weights. `w3` is ignored.
+/// * `activation` - Which polynomial activation to apply.
+///
+/// # Returns
+///
+/// A vector of ciphertexts, one per output dimension (one per row of `w2`).
+///
+/// # Panics
+///
+/// Panics if `weights.w1` or `weights.w2` is empty.
+pub fn chimera_ffn_standard<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x: &GLWE<Vec<u8>>,
+    weights: &FFNWeights,
+    activation: &ActivationChoice,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    assert!(!weights.w1.is_empty(), "W1 must have at least one row");
+    assert!(!weights.w2.is_empty(), "W2 must have at least one row");
+
+    // Phase 1: Up-projection — h_j = W1[j] · x
+    let w1_rows: Vec<Vec<i64>> = weights.w1.iter().map(|r| r.clone()).collect();
+    let h = chimera_matmul_single_ct(module, x, &w1_rows);
+
+    // Phase 2: Activation — h'_j = activation(h_j)
+    let approx = activation_to_poly(activation);
+    let h_act: Vec<GLWE<Vec<u8>>> = h
+        .iter()
+        .map(|hj| apply_poly_activation(module, eval_key, hj, &approx))
+        .collect();
+
+    // Phase 3: Down-projection — y_i = Σ_j W2[i][j] * h'_j
+    //
+    // Each W2[i][j] is a scalar weight for hidden dimension j.
+    // We encode it as a single-coefficient polynomial [w] and compute
+    // chimera_mul_const(h'_j, [w]), then accumulate with chimera_add.
+    let mut outputs = Vec::with_capacity(weights.w2.len());
+    for w2_row in &weights.w2 {
+        assert_eq!(
+            w2_row.len(),
+            h_act.len(),
+            "W2 row length must match hidden dimension (number of W1 rows)"
+        );
+
+        // Compute Σ_j w2_row[j] * h'_j
+        let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
+        let dot = crate::arithmetic::chimera_dot_product(module, &h_act, &w2_vecs);
+        outputs.push(dot);
+    }
+
+    outputs
+}
+
+/// Computes a SwiGLU FFN on encrypted input:
+///
+/// ```text
+/// y = W_down · (SiLU(W_gate · x) ⊙ (W_up · x))
+/// ```
+///
+/// This is the FFN variant used in LLaMA, Mixtral, and most modern
+/// transformer architectures. It has three weight matrices and one
+/// element-wise ct×ct product.
+///
+/// The computation proceeds in four phases:
+///
+/// 1. **Gate projection**: `gate = W_gate · x` — ct-pt matmul.
+/// 2. **Up projection**: `up = W_up · x` — ct-pt matmul.
+/// 3. **SiLU + element-wise product**: `h = SiLU(gate) ⊙ up` — polynomial
+///    activation on each gate element, then ct×ct multiplication with the
+///    corresponding up element.
+/// 4. **Down projection**: `y = W_down · h` — sum of scaled ciphertexts.
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key (tensor key for SiLU activation + ct×ct mul).
+/// * `x` - Encrypted input vector (single ciphertext).
+/// * `weights` - FFN weight matrices. `w1` is W_gate, `w2` is W_down,
+///   `w3` must be `Some(W_up)`.
+///
+/// # Returns
+///
+/// A vector of ciphertexts, one per output dimension (one per row of `w2`).
+///
+/// # Panics
+///
+/// Panics if `weights.w3` is `None` or if dimensions are inconsistent.
+pub fn chimera_ffn_swiglu<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x: &GLWE<Vec<u8>>,
+    weights: &FFNWeights,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    assert!(!weights.w1.is_empty(), "W_gate must have at least one row");
+    assert!(!weights.w2.is_empty(), "W_down must have at least one row");
+    let w_up = weights.w3.as_ref().expect("SwiGLU requires w3 (W_up)");
+    assert_eq!(
+        weights.w1.len(),
+        w_up.len(),
+        "W_gate and W_up must have the same number of rows (d_ffn)"
+    );
+
+    // Phase 1: Gate projection — gate_j = W_gate[j] · x
+    let w_gate_rows: Vec<Vec<i64>> = weights.w1.iter().map(|r| r.clone()).collect();
+    let gate = chimera_matmul_single_ct(module, x, &w_gate_rows);
+
+    // Phase 2: Up projection — up_j = W_up[j] · x
+    let w_up_rows: Vec<Vec<i64>> = w_up.iter().map(|r| r.clone()).collect();
+    let up = chimera_matmul_single_ct(module, x, &w_up_rows);
+
+    // Phase 3: SiLU activation + element-wise product
+    // h_j = SiLU(gate_j) ⊙ up_j
+    //
+    // After SiLU activation, gate_activated is at a lower base2k (out_base2k)
+    // due to the tensor product. The up projections are still at in_base2k.
+    // We must project up_j to the same layout before the ct*ct multiply.
+    let silu_approx = silu_poly_approx();
+    let d_ffn = gate.len();
+    let mut h = Vec::with_capacity(d_ffn);
+    for j in 0..d_ffn {
+        // SiLU(gate_j)
+        let gate_activated = apply_poly_activation(module, eval_key, &gate[j], &silu_approx);
+
+        // Project up_j to match gate_activated's layout (potentially lower base2k)
+        use poulpy_core::layouts::{GLWEInfos, LWEInfos};
+        let gate_layout = poulpy_core::layouts::GLWELayout {
+            n: gate_activated.n(),
+            base2k: gate_activated.base2k(),
+            k: gate_activated.k(),
+            rank: gate_activated.rank(),
+        };
+        let up_projected = if up[j].base2k() == gate_activated.base2k() {
+            // No projection needed — layouts already match
+            up[j].clone()
+        } else {
+            chimera_project_layout(module, &up[j], &gate_layout)
+        };
+
+        // Element-wise product: SiLU(gate_j) ⊙ up_j
+        let hj = chimera_ct_mul(module, eval_key, &gate_activated, &up_projected);
+        h.push(hj);
+    }
+
+    // Phase 4: Down projection — y_i = Σ_j W_down[i][j] * h_j
+    let mut outputs = Vec::with_capacity(weights.w2.len());
+    for w2_row in &weights.w2 {
+        assert_eq!(
+            w2_row.len(),
+            h.len(),
+            "W_down row length must match hidden dimension (d_ffn)"
+        );
+        let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
+        let dot = crate::arithmetic::chimera_dot_product(module, &h, &w2_vecs);
+        outputs.push(dot);
+    }
+
+    outputs
+}
+
+/// Dispatches to the appropriate FFN variant based on the configuration.
+///
+/// Calls [`chimera_ffn_standard`] for `FFNConfig::Standard` or
+/// [`chimera_ffn_swiglu`] for `FFNConfig::SwiGLU`.
+pub fn chimera_ffn<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x: &GLWE<Vec<u8>>,
+    weights: &FFNWeights,
+    config: &FFNConfig,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    match config {
+        FFNConfig::Standard { activation } => {
+            chimera_ffn_standard(module, eval_key, x, weights, activation)
+        }
+        FFNConfig::SwiGLU => chimera_ffn_swiglu(module, eval_key, x, weights),
+    }
+}
+
+/// Adds two encrypted vectors element-wise (residual connection).
+///
+/// Given two vectors of ciphertexts of the same length, computes
+/// `result[i] = a[i] + b[i]` for each element.
+///
+/// # Panics
+///
+/// Panics if the vectors have different lengths.
+pub fn chimera_residual_add<BE: Backend>(
+    module: &Module<BE>,
+    a: &[GLWE<Vec<u8>>],
+    b: &[GLWE<Vec<u8>>],
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWEAdd,
+{
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "residual add: vectors must have the same length"
+    );
+    a.iter()
+        .zip(b.iter())
+        .map(|(ai, bi)| chimera_add(module, ai, bi))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::params::{Precision, SecurityLevel};
+
+    #[cfg(not(all(feature = "enable-avx", target_arch = "x86_64")))]
+    type BE = poulpy_cpu_ref::FFT64Ref;
+    #[cfg(all(feature = "enable-avx", target_arch = "x86_64"))]
+    type BE = poulpy_cpu_avx::FFT64Avx;
 
     #[test]
     fn test_transformer_block_plan() {
@@ -336,5 +615,174 @@ mod tests {
         assert_eq!(ActivationChoice::SquaredReLU.depth(), 1);
         assert_eq!(ActivationChoice::PolySiLU.depth(), 2);
         assert_eq!(ActivationChoice::LutGELU.depth(), 0);
+    }
+
+    #[test]
+    fn test_activation_to_poly() {
+        // Verify that activation_to_poly returns the correct approximations.
+        let gelu = activation_to_poly(&ActivationChoice::PolyGELU);
+        assert_eq!(gelu.degree(), 3);
+
+        let sqrelu = activation_to_poly(&ActivationChoice::SquaredReLU);
+        assert_eq!(sqrelu.degree(), 2);
+
+        let silu = activation_to_poly(&ActivationChoice::PolySiLU);
+        assert_eq!(silu.degree(), 3);
+
+        let lut_gelu = activation_to_poly(&ActivationChoice::LutGELU);
+        // Falls back to polynomial GELU for now
+        assert_eq!(lut_gelu.degree(), 3);
+    }
+
+    #[test]
+    fn test_ffn_standard_homomorphic() {
+        // Test a minimal standard FFN: y = W2 · activation(W1 · x)
+        // With:
+        //   x = [3] (single value)
+        //   W1 = [[2]] (d_model=1, d_ffn=1): h = 2 * 3 = 6
+        //   activation = SquaredReLU (x²): h' = 6² = 36 (on the torus)
+        //   W2 = [[1]] (d_ffn=1, d_model=1): y = 1 * h' = 36
+        //
+        // This test verifies the pipeline completes without panicking.
+        // Full numerical verification of chained operations (mul_const + tensor
+        // product + mul_const) requires careful torus precision tracking.
+        use crate::encoding::encode_int8;
+        use crate::encrypt::{chimera_encrypt, ChimeraEvalKey, ChimeraKey};
+        use poulpy_hal::api::ModuleNew;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [1u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [4u8; 32], [5u8; 32],
+        );
+
+        let vals: Vec<i8> = vec![3];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [2u8; 32], [3u8; 32]);
+
+        let weights = FFNWeights {
+            w1: vec![vec![2]],
+            w2: vec![vec![1]],
+            w3: None,
+        };
+
+        let result = chimera_ffn_standard(
+            &module,
+            &eval_key,
+            &ct,
+            &weights,
+            &ActivationChoice::SquaredReLU,
+        );
+        assert_eq!(result.len(), 1, "FFN should produce one output ciphertext");
+    }
+
+    #[test]
+    fn test_ffn_swiglu_homomorphic() {
+        // Test a minimal SwiGLU FFN: y = W_down · (SiLU(W_gate · x) ⊙ W_up · x)
+        // With:
+        //   x = [2] (single value)
+        //   W_gate = [[1]] (d_model=1, d_ffn=1): gate = 1 * 2 = 2
+        //   W_up   = [[1]] (d_model=1, d_ffn=1): up   = 1 * 2 = 2
+        //   SiLU(gate) ⊙ up = SiLU(2) * 2 ≈ 1.76 * 2 = 3.52 (on torus)
+        //   W_down = [[1]] (d_ffn=1, d_model=1): y = 1 * h = 3.52
+        //
+        // This test verifies the SwiGLU pipeline completes without panicking.
+        use crate::encoding::encode_int8;
+        use crate::encrypt::{chimera_encrypt, ChimeraEvalKey, ChimeraKey};
+        use poulpy_hal::api::ModuleNew;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [1u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [4u8; 32], [5u8; 32],
+        );
+
+        let vals: Vec<i8> = vec![2];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [2u8; 32], [3u8; 32]);
+
+        let weights = FFNWeights {
+            w1: vec![vec![1]],                       // W_gate
+            w2: vec![vec![1]],                       // W_down
+            w3: Some(vec![vec![1]]),                  // W_up
+        };
+
+        let result = chimera_ffn_swiglu(&module, &eval_key, &ct, &weights);
+        assert_eq!(result.len(), 1, "SwiGLU FFN should produce one output ciphertext");
+    }
+
+    #[test]
+    fn test_chimera_ffn_dispatch() {
+        // Test the chimera_ffn dispatch function routes correctly.
+        use crate::encoding::encode_int8;
+        use crate::encrypt::{chimera_encrypt, ChimeraEvalKey, ChimeraKey};
+        use poulpy_hal::api::ModuleNew;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [1u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [4u8; 32], [5u8; 32],
+        );
+
+        let vals: Vec<i8> = vec![2];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [2u8; 32], [3u8; 32]);
+
+        // Standard FFN
+        let std_weights = FFNWeights {
+            w1: vec![vec![1]],
+            w2: vec![vec![1]],
+            w3: None,
+        };
+        let config_std = FFNConfig::Standard {
+            activation: ActivationChoice::SquaredReLU,
+        };
+        let result_std = chimera_ffn(&module, &eval_key, &ct, &std_weights, &config_std);
+        assert_eq!(result_std.len(), 1);
+
+        // SwiGLU FFN
+        let swiglu_weights = FFNWeights {
+            w1: vec![vec![1]],
+            w2: vec![vec![1]],
+            w3: Some(vec![vec![1]]),
+        };
+        let config_swiglu = FFNConfig::SwiGLU;
+        let result_swiglu = chimera_ffn(&module, &eval_key, &ct, &swiglu_weights, &config_swiglu);
+        assert_eq!(result_swiglu.len(), 1);
+    }
+
+    #[test]
+    fn test_residual_add() {
+        // Test chimera_residual_add on a pair of ciphertext vectors.
+        use crate::encoding::{decode_int8, encode_int8};
+        use crate::encrypt::{chimera_decrypt, chimera_encrypt, ChimeraKey};
+        use poulpy_hal::api::ModuleNew;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [1u8; 32]);
+
+        let a_vals: Vec<i8> = vec![10];
+        let b_vals: Vec<i8> = vec![5];
+
+        let pt_a = encode_int8(&module, &params, &a_vals);
+        let pt_b = encode_int8(&module, &params, &b_vals);
+
+        let ct_a = chimera_encrypt(&module, &key, &pt_a, [2u8; 32], [3u8; 32]);
+        let ct_b = chimera_encrypt(&module, &key, &pt_b, [4u8; 32], [5u8; 32]);
+
+        let result = chimera_residual_add(&module, &[ct_a], &[ct_b]);
+        assert_eq!(result.len(), 1);
+
+        let pt_dec = chimera_decrypt(&module, &key, &result[0], &params);
+        let decoded = decode_int8(&module, &params, &pt_dec, 1);
+        let diff = (decoded[0] as i16 - 15).unsigned_abs();
+        assert!(
+            diff <= 1,
+            "residual_add: expected 15, got {}", decoded[0]
+        );
     }
 }

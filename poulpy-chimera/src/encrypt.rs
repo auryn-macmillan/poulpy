@@ -91,10 +91,17 @@ where
 
 /// Evaluation key material for homomorphic operations that require
 /// ciphertext-ciphertext multiplication (tensor product + relinearization)
-/// and slot rotation/summation (automorphism keys for trace).
+/// and slot rotation/summation (automorphism keys for trace and rotation).
 ///
 /// This includes polynomial activation evaluation, attention score computation,
 /// and any other operation that multiplies two ciphertexts together.
+///
+/// ## Multi-level tensor keys
+///
+/// Deep computations like SwiGLU require chaining tensor products: the output
+/// of one tensor product (at `out_base2k`) becomes the input to the next.
+/// The primary tensor key handles fresh ciphertexts at `in_base2k`; the
+/// secondary (level-2) tensor key handles ciphertexts at `out_base2k`.
 pub struct ChimeraEvalKey<BE: Backend> {
     /// Prepared tensor key for relinearization after tensor product.
     pub tensor_key_prepared: GLWETensorKeyPrepared<Vec<u8>, BE>,
@@ -107,8 +114,25 @@ pub struct ChimeraEvalKey<BE: Backend> {
     pub tensor_layout: GLWELayout,
     /// The res_offset parameter for tensor_apply (= 2 * in_base2k).
     pub res_offset: usize,
-    /// Prepared automorphism keys for slot rotation/summation (trace).
+
+    // --- Level-2 tensor key (for chained tensor products) ---
+
+    /// Prepared level-2 tensor key for operations on post-tensor-product ciphertexts.
+    /// Accepts inputs at `out_base2k` and produces outputs at `out_base2k - 1`.
+    /// `None` if chained tensor products are not needed.
+    pub tensor_key_l2_prepared: Option<GLWETensorKeyPrepared<Vec<u8>, BE>>,
+    /// Layout of the level-2 tensor key.
+    pub tensor_key_l2_layout: Option<GLWETensorKeyLayout>,
+    /// Layout of the output after level-2 tensor product + relinearization.
+    pub output_l2_layout: Option<GLWELayout>,
+    /// Layout of the level-2 tensor product intermediate result.
+    pub tensor_l2_layout: Option<GLWELayout>,
+    /// The res_offset for level-2 tensor_apply (= 2 * out_base2k).
+    pub res_offset_l2: Option<usize>,
+
+    /// Prepared automorphism keys for slot rotation/summation (trace + rotation).
     /// Keyed by Galois element (e.g. -1, g^1, g^2, ...).
+    /// Contains both trace Galois elements and any additional rotation keys.
     pub auto_keys: HashMap<i64, GLWEAutomorphismKeyPrepared<Vec<u8>, BE>>,
     /// Layout of the automorphism keys.
     pub auto_key_layout: GLWEAutomorphismKeyLayout,
@@ -208,6 +232,55 @@ where
 
         let res_offset = 2 * in_base2k;
 
+        // --- Level-2 tensor key generation ---
+        // For chained tensor products (e.g. SwiGLU: SiLU activation then ct*ct mul).
+        // Level-2 accepts inputs at out_base2k and produces outputs at out_base2k - 1.
+        let l2_in_base2k = out_base2k;
+        let l2_out_base2k = if out_base2k > 1 { out_base2k - 1 } else { out_base2k };
+        let l2_tsk_base2k = out_base2k + 1; // = in_base2k
+        let l2_k = k; // same torus precision
+
+        let tsk_l2_layout = GLWETensorKeyLayout {
+            n: params.degree,
+            base2k: poulpy_core::layouts::Base2K(l2_tsk_base2k as u32),
+            k: poulpy_core::layouts::TorusPrecision((l2_k + l2_tsk_base2k) as u32),
+            rank,
+            dnum: poulpy_core::layouts::Dnum(l2_k.div_ceil(l2_tsk_base2k) as u32),
+            dsize: Dsize(1),
+        };
+
+        let mut tsk_l2 = GLWETensorKey::<Vec<u8>>::alloc_from_infos(&tsk_l2_layout);
+        let l2_encrypt_bytes = GLWETensorKey::encrypt_sk_tmp_bytes(module, &tsk_l2_layout);
+        let mut l2_scratch: ScratchOwned<BE> = ScratchOwned::alloc(l2_encrypt_bytes);
+        tsk_l2.encrypt_sk(
+            module,
+            &key.secret,
+            &mut source_xa,
+            &mut source_xe,
+            l2_scratch.borrow(),
+        );
+
+        let mut tsk_l2_prep = GLWETensorKeyPrepared::<Vec<u8>, BE>::alloc_from_infos(module, &tsk_l2_layout);
+        let l2_prep_bytes = tsk_l2_prep.prepare_tmp_bytes(module, &tsk_l2_layout);
+        let mut l2_prep_scratch: ScratchOwned<BE> = ScratchOwned::alloc(l2_prep_bytes);
+        tsk_l2_prep.prepare(module, &tsk_l2, l2_prep_scratch.borrow());
+
+        let output_l2_layout = GLWELayout {
+            n: params.degree,
+            base2k: poulpy_core::layouts::Base2K(l2_out_base2k as u32),
+            k: params.k_ct,
+            rank,
+        };
+
+        let tensor_l2_layout = GLWELayout {
+            n: params.degree,
+            base2k: poulpy_core::layouts::Base2K(l2_out_base2k as u32),
+            k: params.k_ct,
+            rank,
+        };
+
+        let res_offset_l2 = 2 * l2_in_base2k;
+
         // --- Automorphism key generation ---
         // The automorphism key uses key_base2k = base2k - 1 (following the trace test pattern).
         let key_base2k = if base2k > 1 { base2k - 1 } else { base2k };
@@ -255,8 +328,73 @@ where
             output_layout,
             tensor_layout,
             res_offset,
+            tensor_key_l2_prepared: Some(tsk_l2_prep),
+            tensor_key_l2_layout: Some(tsk_l2_layout),
+            output_l2_layout: Some(output_l2_layout),
+            tensor_l2_layout: Some(tensor_l2_layout),
+            res_offset_l2: Some(res_offset_l2),
             auto_keys,
             auto_key_layout,
+        }
+    }
+
+    /// Generates additional automorphism keys for slot rotation by the given
+    /// positions, adding them to the existing `auto_keys` map.
+    ///
+    /// Each rotation position `k` requires an automorphism key for the Galois
+    /// element `5^k mod 2N`. Positions that already have keys (e.g. from the
+    /// trace set) are skipped.
+    ///
+    /// # Arguments
+    ///
+    /// * `module` - The backend module.
+    /// * `key` - The CHIMERA secret key.
+    /// * `rotation_positions` - Signed rotation amounts. Positive = left rotate,
+    ///   negative = right rotate.
+    /// * `seed_a` - Seed for mask sampling.
+    /// * `seed_e` - Seed for error sampling.
+    pub fn add_rotation_keys(
+        &mut self,
+        module: &Module<BE>,
+        key: &ChimeraKey<BE>,
+        rotation_positions: &[i64],
+        seed_a: [u8; 32],
+        seed_e: [u8; 32],
+    ) {
+        use poulpy_hal::layouts::GaloisElement;
+
+        let mut source_xa = Source::new(seed_a);
+        let mut source_xe = Source::new(seed_e);
+
+        let auto_encrypt_bytes =
+            GLWEAutomorphismKey::encrypt_sk_tmp_bytes(module, &self.auto_key_layout);
+        let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(auto_encrypt_bytes);
+        let mut tmp_key =
+            GLWEAutomorphismKey::<Vec<u8>>::alloc_from_infos(&self.auto_key_layout);
+
+        for &pos in rotation_positions {
+            let gal_el = module.galois_element(pos);
+
+            // Skip if we already have this key (e.g. from trace generation)
+            if self.auto_keys.contains_key(&gal_el) {
+                continue;
+            }
+
+            tmp_key.encrypt_sk(
+                module,
+                gal_el,
+                &key.secret,
+                &mut source_xa,
+                &mut source_xe,
+                scratch.borrow(),
+            );
+            let mut atk_prepared =
+                GLWEAutomorphismKeyPrepared::<Vec<u8>, BE>::alloc_from_infos(
+                    module,
+                    &tmp_key,
+                );
+            atk_prepared.prepare(module, &tmp_key, scratch.borrow());
+            self.auto_keys.insert(gal_el, atk_prepared);
         }
     }
 }

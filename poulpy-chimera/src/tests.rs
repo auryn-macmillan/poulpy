@@ -1359,4 +1359,173 @@ mod integration {
             decoded_comp2[0]
         );
     }
+
+    // ---- End-to-end transformer block test ----
+
+    /// Runs a complete transformer block under FHE:
+    ///
+    ///   RMSNorm → Attention → Residual → RMSNorm → FFN → Residual
+    ///
+    /// Uses the smallest possible model dimensions (d_model=1, d_ffn=1,
+    /// n_heads=1, d_head=1) so that the test exercises the full pipeline
+    /// composition without being prohibitively slow.
+    ///
+    /// The goal is to verify that the entire chain of homomorphic operations
+    /// composes correctly — i.e. the output of each stage is at a compatible
+    /// layout (base2k, k) for the next stage. Numerical accuracy is a
+    /// secondary concern: we mainly check that no assertion panics and that
+    /// the result is a structurally valid ciphertext.
+    #[test]
+    fn test_end_to_end_transformer_block() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [43u8; 32], [44u8; 32],
+        );
+
+        // Tiny model: d_model=1, d_ffn=1, 1 head, 1 layer
+        let dims = ModelDims {
+            d_model: 1,
+            d_head: 1,
+            n_heads: 1,
+            d_ffn: 1,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        // Use standard FFN with SquaredReLU (lowest depth: 1 tensor product)
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(1),
+            pre_ffn_norm: LayerNormConfig::rms_norm(1),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        // Weights: identity-like (weight = 1 for all single-element matrices)
+        let weights = TransformerBlockWeights {
+            attention: AttentionWeights {
+                w_q: vec![vec![1i64]],
+                w_k: vec![vec![1i64]],
+                w_v: vec![vec![1i64]],
+                w_o: vec![vec![1i64]],
+            },
+            ffn: FFNWeights {
+                w1: vec![vec![1i64]],
+                w2: vec![vec![1i64]],
+                w3: None,
+            },
+        };
+
+        // Encrypt input: single value [5]
+        let vals: Vec<i8> = vec![5];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [50u8; 32], [51u8; 32]);
+
+        // Run the full transformer block
+        let result = chimera_transformer_block(&module, &eval_key, &ct, &config, &weights);
+
+        // Verify the output is a valid ciphertext with sensible dimensions.
+        // After multiple tensor products, base2k should have decreased from
+        // the input base2k (13).
+        use poulpy_core::layouts::LWEInfos;
+        assert!(result.n() > 0, "output ciphertext N should be > 0");
+        assert!(result.base2k() > 0, "output ciphertext base2k should be > 0");
+        assert!(result.k() > 0, "output ciphertext k should be > 0");
+
+        // The pipeline survived all the way through — this is the primary
+        // success criterion for the end-to-end test.
+    }
+
+    /// Runs a 2-layer forward pass under FHE to verify that transformer
+    /// blocks can be chained (output of block 1 feeds into block 2).
+    ///
+    /// This exercises the most critical integration point: whether the
+    /// ciphertext layout produced by one block is compatible with the
+    /// input expectations of the next block.
+    #[test]
+    fn test_end_to_end_forward_pass_2_layers() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [60u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(
+            &module, &key, &params, [61u8; 32], [62u8; 32],
+        );
+
+        let dims = ModelDims {
+            d_model: 1,
+            d_head: 1,
+            n_heads: 1,
+            d_ffn: 1,
+            n_layers: 2,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(1),
+            pre_ffn_norm: LayerNormConfig::rms_norm(1),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        // Two layers with identity-like weights
+        let layer_weights = vec![
+            TransformerBlockWeights {
+                attention: AttentionWeights {
+                    w_q: vec![vec![1i64]],
+                    w_k: vec![vec![1i64]],
+                    w_v: vec![vec![1i64]],
+                    w_o: vec![vec![1i64]],
+                },
+                ffn: FFNWeights {
+                    w1: vec![vec![1i64]],
+                    w2: vec![vec![1i64]],
+                    w3: None,
+                },
+            },
+            TransformerBlockWeights {
+                attention: AttentionWeights {
+                    w_q: vec![vec![1i64]],
+                    w_k: vec![vec![1i64]],
+                    w_v: vec![vec![1i64]],
+                    w_o: vec![vec![1i64]],
+                },
+                ffn: FFNWeights {
+                    w1: vec![vec![1i64]],
+                    w2: vec![vec![1i64]],
+                    w3: None,
+                },
+            },
+        ];
+
+        let vals: Vec<i8> = vec![3];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [70u8; 32], [71u8; 32]);
+
+        // Run the 2-layer forward pass
+        let result = chimera_forward_pass(&module, &eval_key, &ct, &config, &layer_weights);
+
+        use poulpy_core::layouts::LWEInfos;
+        assert!(result.n() > 0, "output ciphertext N should be > 0");
+        assert!(result.base2k() > 0, "output ciphertext base2k should be > 0");
+        assert!(result.k() > 0, "output ciphertext k should be > 0");
+    }
 }

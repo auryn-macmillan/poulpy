@@ -14,7 +14,19 @@
 //! - **RMSNorm**: Simplified variant that skips mean subtraction (used by LLaMA
 //!   and other modern architectures). ~30% cheaper under FHE.
 
-use crate::activations::PolyApprox;
+use poulpy_core::{
+    GLWEAdd, GLWEMulConst, GLWETensoring, GLWETrace,
+    layouts::{GLWE, GLWEInfos, LWEInfos},
+};
+use poulpy_hal::{
+    api::{ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
+    layouts::{Backend, Module, Scratch, ScratchOwned},
+};
+use poulpy_core::ScratchTakeCore;
+
+use crate::activations::{apply_poly_activation, chimera_ct_mul, PolyApprox};
+use crate::arithmetic::{chimera_mul_const, chimera_project_layout, chimera_slot_sum};
+use crate::encrypt::ChimeraEvalKey;
 
 /// Configuration for LayerNorm/RMSNorm evaluation under FHE.
 #[derive(Clone, Debug)]
@@ -186,6 +198,119 @@ pub fn layernorm_plaintext(values: &[f64], config: &LayerNormConfig) -> Vec<f64>
     }
 
     result
+}
+
+/// Computes RMSNorm homomorphically on an encrypted vector.
+///
+/// RMSNorm(x) = x * (1 / √(mean(x²) + ε))
+///
+/// The computation proceeds in five stages:
+///
+/// 1. **Square**: `ct_sq = ct * ct` via tensor product (element-wise x²).
+/// 2. **Sum**: `sum_sq = trace(ct_sq)` — sums all slots via rotation-and-add,
+///    producing a ciphertext where every slot holds the same scalar Σxᵢ².
+/// 3. **Mean**: `mean_sq = sum_sq * (1/N)` — scales by the inverse of the
+///    normalisation size (encoded as a fixed-point constant).
+/// 4. **Inverse sqrt**: `inv_rms = inv_sqrt_poly(mean_sq)` — evaluates a
+///    polynomial approximation of 1/√x on the replicated scalar.
+/// 5. **Normalise**: `result = ct * inv_rms` — element-wise product of the
+///    original vector with the broadcast normalisation factor.
+///
+/// Optionally applies a learnable scale (gamma) via plaintext multiplication.
+///
+/// # Noise budget consumption
+///
+/// - Step 1 (square): 1 tensor product depth level
+/// - Step 4 (inv_sqrt): polynomial degree levels (typically 2-3 for degree-3 poly)
+/// - Step 5 (normalise): 1 tensor product depth level
+/// - Total: ~4 depth levels for a degree-3 inv_sqrt polynomial
+///
+/// # Arguments
+///
+/// * `module` - Backend module for ring arithmetic.
+/// * `eval_key` - Evaluation key (tensor key for ct×ct, auto keys for trace).
+/// * `ct` - Input ciphertext encrypting the vector to normalise.
+/// * `config` - RMSNorm configuration (norm_size, inv_sqrt polynomial, etc.).
+///
+/// # Returns
+///
+/// A new ciphertext encrypting the normalised vector.
+///
+/// # Panics
+///
+/// Panics if `config.use_rms_norm` is false (full LayerNorm not yet implemented
+/// under FHE — use `chimera_rms_norm` with a RMSNorm config instead).
+pub fn chimera_rms_norm<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    ct: &GLWE<Vec<u8>>,
+    config: &LayerNormConfig,
+) -> GLWE<Vec<u8>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    assert!(
+        config.use_rms_norm,
+        "chimera_rms_norm: full LayerNorm is not yet implemented under FHE. \
+         Use LayerNormConfig::rms_norm() instead."
+    );
+
+    // Step 1: Square — ct_sq = ct * ct (element-wise x²)
+    let ct_sq = chimera_ct_mul(module, eval_key, ct, ct);
+
+    // Step 2: Sum all slots — trace(ct_sq) produces a ciphertext where
+    // every slot holds the same scalar Σxᵢ².
+    // skip=0 means full trace (sum all N slots).
+    let sum_sq = chimera_slot_sum(module, eval_key, &ct_sq, 0);
+
+    // Step 3: Mean — multiply by 1/N encoded as fixed-point.
+    // We use COEFF_SCALE_BITS for the scaling factor so it integrates
+    // cleanly with the subsequent polynomial evaluation.
+    let inv_n_scaled = ((1i64 << crate::activations::COEFF_SCALE_BITS) as f64
+        / config.norm_size as f64)
+        .round() as i64;
+    let mean_sq = chimera_mul_const(module, &sum_sq, &[inv_n_scaled]);
+
+    // Step 4: Inverse square root — evaluate polynomial approx of 1/√x
+    // on the replicated scalar (all slots hold the same mean(x²) value).
+    let inv_rms = apply_poly_activation(module, eval_key, &mean_sq, &config.inv_sqrt_approx);
+
+    // Step 5: Normalise — ct * inv_rms (element-wise broadcast multiplication).
+    // The original ct is at in_base2k; inv_rms is at a lower base2k after
+    // multiple tensor products and mul_const operations. We need to project
+    // the original ct to match inv_rms's layout before the ct×ct multiply.
+    let inv_rms_layout = poulpy_core::layouts::GLWELayout {
+        n: inv_rms.n(),
+        base2k: inv_rms.base2k(),
+        k: inv_rms.k(),
+        rank: inv_rms.rank(),
+    };
+    let ct_projected = if ct.base2k() == inv_rms.base2k() && ct.k() == inv_rms.k() {
+        // Layouts already match — no projection needed
+        use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+        let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(ct);
+        let ct_ref = ct.to_ref();
+        let src: &[u8] = ct_ref.data().data;
+        let mut cloned_mut = cloned.to_mut();
+        let dst: &mut [u8] = cloned_mut.data_mut().data;
+        let len = src.len().min(dst.len());
+        dst[..len].copy_from_slice(&src[..len]);
+        cloned
+    } else {
+        chimera_project_layout(module, ct, &inv_rms_layout)
+    };
+
+    let normalised = chimera_ct_mul(module, eval_key, &ct_projected, &inv_rms);
+
+    // Optional: apply learnable scale (gamma) via plaintext multiplication.
+    // Gamma is stored as fixed-point i64 values (one per slot).
+    if let Some(gamma) = &config.gamma {
+        chimera_mul_const(module, &normalised, gamma)
+    } else {
+        normalised
+    }
 }
 
 #[cfg(test)]

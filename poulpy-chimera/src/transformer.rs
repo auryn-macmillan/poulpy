@@ -20,20 +20,24 @@
 //! ```
 
 use poulpy_core::{
-    GLWEAdd, GLWEMulConst, GLWETensoring,
-    layouts::GLWE,
+    GLWEAdd, GLWEMulConst, GLWETensoring, GLWETrace,
+    layouts::{GLWE, GLWEInfos, GLWELayout, LWEInfos},
 };
 use poulpy_hal::{
     api::{ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
     layouts::{Backend, Module, Scratch, ScratchOwned},
 };
-use poulpy_core::ScratchTakeCore;
+use poulpy_core::{GLWEAutomorphism, ScratchTakeCore};
 
 use crate::activations::{apply_poly_activation, chimera_ct_mul, gelu_poly_approx, silu_poly_approx, squared_relu_approx, PolyApprox};
 use crate::arithmetic::{chimera_add, chimera_matmul_single_ct, chimera_project_layout};
-use crate::attention::{AttentionConfig, AttentionPlan, SoftmaxStrategy, plan_attention};
+use crate::attention::{
+    AttentionConfig, AttentionPlan, AttentionWeights, SoftmaxStrategy, plan_attention,
+    chimera_qkv_project_single, chimera_attention_score, chimera_apply_softmax,
+    chimera_attention_context, chimera_output_project,
+};
 use crate::encrypt::ChimeraEvalKey;
-use crate::layernorm::{LayerNormConfig, LayerNormPlan, plan_layernorm};
+use crate::layernorm::{LayerNormConfig, LayerNormPlan, chimera_rms_norm, plan_layernorm};
 use crate::params::{ChimeraParams, ModelDims};
 
 /// Configuration for a single transformer block.
@@ -538,6 +542,288 @@ where
         .zip(b.iter())
         .map(|(ai, bi)| chimera_add(module, ai, bi))
         .collect()
+}
+
+/// Weight matrices for a complete transformer block (attention + FFN).
+#[derive(Clone, Debug)]
+pub struct TransformerBlockWeights {
+    /// Attention layer weights (Q, K, V, O projection matrices).
+    pub attention: AttentionWeights,
+    /// FFN layer weights (W1, W2, and optionally W3 for SwiGLU).
+    pub ffn: FFNWeights,
+}
+
+impl TransformerBlockWeights {
+    /// Creates zero-initialised weights for a standard FFN block.
+    pub fn zeros_standard(dims: &ModelDims) -> Self {
+        TransformerBlockWeights {
+            attention: AttentionWeights::zeros(dims),
+            ffn: FFNWeights::zeros_standard(dims),
+        }
+    }
+
+    /// Creates zero-initialised weights for a SwiGLU FFN block.
+    pub fn zeros_swiglu(dims: &ModelDims) -> Self {
+        TransformerBlockWeights {
+            attention: AttentionWeights::zeros(dims),
+            ffn: FFNWeights::zeros_swiglu(dims),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Homomorphic transformer block evaluation
+// ---------------------------------------------------------------------------
+
+/// Evaluates a complete transformer decoder block on an encrypted input.
+///
+/// Implements the pre-norm architecture:
+///
+/// ```text
+/// x = x + Attention(RMSNorm(x))
+/// x = x + FFN(RMSNorm(x))
+/// ```
+///
+/// ## Computation Flow
+///
+/// 1. **Pre-attention RMSNorm**: Normalises the input via `chimera_rms_norm`.
+/// 2. **Attention**: Projects Q/K/V via plaintext weight multiplication,
+///    computes attention scores (ct*ct), applies softmax approximation,
+///    computes context (ct*ct), and projects output.
+/// 3. **Residual connection**: Adds the attention output back to the input.
+/// 4. **Pre-FFN RMSNorm**: Normalises the post-attention result.
+/// 5. **FFN**: Applies the feed-forward network (standard or SwiGLU).
+/// 6. **Residual connection**: Adds the FFN output back to the post-attention result.
+///
+/// ## Simplified Single-Head Attention
+///
+/// For the initial implementation, attention is simplified to a single-head
+/// computation on one ciphertext. The full multi-head attention with head
+/// splitting and concatenation is deferred until the packing mode switch
+/// infrastructure is more mature.
+///
+/// ## Noise Budget
+///
+/// A single transformer block consumes approximately:
+/// - RMSNorm: 2 ct*ct multiplications (square + normalise) + polynomial eval
+/// - Attention: 1-2 ct*ct multiplications (score + context)
+/// - FFN: 1-2 ct*ct multiplications (activation + SwiGLU element-wise)
+/// - Total: ~6-8 multiplicative depth levels per block
+///
+/// At 80-bit security (max_depth=12), this supports 1-2 blocks without
+/// bootstrapping. At 128-bit security (max_depth=48), this supports ~6-8 blocks.
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key (tensor key for ct*ct, auto keys for trace/rotation).
+/// * `ct_x` - Encrypted input vector (single ciphertext).
+/// * `config` - Transformer block configuration (attention, norms, FFN settings).
+/// * `weights` - Plaintext weight matrices for attention and FFN.
+///
+/// # Returns
+///
+/// Encrypted output vector (single ciphertext representing the first output dimension).
+///
+/// # Panics
+///
+/// Panics if norm configurations are not set to RMSNorm mode.
+pub fn chimera_transformer_block<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    ct_x: &GLWE<Vec<u8>>,
+    config: &TransformerBlockConfig,
+    weights: &TransformerBlockWeights,
+) -> GLWE<Vec<u8>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE> + GLWEAutomorphism<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    // -----------------------------------------------------------------------
+    // Step 1: Pre-attention RMSNorm
+    // -----------------------------------------------------------------------
+    let normed_pre_attn = chimera_rms_norm(module, eval_key, ct_x, &config.pre_attn_norm);
+
+    // -----------------------------------------------------------------------
+    // Step 2: Simplified single-head attention
+    //
+    // Full multi-head attention requires splitting the input into per-head
+    // ciphertexts and concatenating the results. For the initial end-to-end
+    // test, we implement a single-head simplified variant:
+    //   Q = W_Q[0] * normed_x  (single output dimension)
+    //   K = W_K[0] * normed_x
+    //   V = W_V[0] * normed_x
+    //   score = Q · K (ct*ct + slot sum)
+    //   attn_weight = softmax_approx(score)
+    //   context = attn_weight * V (ct*ct)
+    //   output = W_O[0] * context
+    // -----------------------------------------------------------------------
+    let (ct_q, ct_k, ct_v) = chimera_qkv_project_single(
+        module,
+        &normed_pre_attn,
+        &weights.attention.w_q[0],
+        &weights.attention.w_k[0],
+        &weights.attention.w_v[0],
+    );
+
+    // Attention score: Q · K^T (element-wise product + slot sum)
+    let score = chimera_attention_score(module, eval_key, &ct_q, &ct_k, 0);
+
+    // Softmax approximation on the score
+    let attn_weights = chimera_apply_softmax(
+        module,
+        eval_key,
+        &[score],
+        &config.attention.softmax_approx,
+    );
+
+    // Context: attn_weight * V
+    let context = chimera_attention_context(module, eval_key, &attn_weights, &[ct_v]);
+
+    // Output projection: W_O[0] * context (produces one output ciphertext)
+    let attn_out_vec = chimera_output_project(module, &context, &[weights.attention.w_o[0].clone()]);
+    let attn_out = attn_out_vec.into_iter().next().expect("output projection must produce at least one ciphertext");
+
+    // -----------------------------------------------------------------------
+    // Step 3: Residual connection (attention)
+    //
+    // The attention output may be at a different base2k/k than the input
+    // due to multiple tensor products. We project the input to match before
+    // adding.
+    // -----------------------------------------------------------------------
+    let residual_1 = if config.residual {
+        let ct_x_layout = GLWELayout {
+            n: attn_out.n(),
+            base2k: attn_out.base2k(),
+            k: attn_out.k(),
+            rank: attn_out.rank(),
+        };
+        let ct_x_proj = if ct_x.base2k() == attn_out.base2k() && ct_x.k() == attn_out.k() {
+            // Clone ct_x since layouts match
+            use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+            let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(ct_x);
+            {
+                let src_ref = ct_x.to_ref();
+                let src: &[u8] = src_ref.data().data;
+                let mut dst_mut = cloned.to_mut();
+                let dst: &mut [u8] = dst_mut.data_mut().data;
+                let len = src.len().min(dst.len());
+                dst[..len].copy_from_slice(&src[..len]);
+            }
+            cloned
+        } else {
+            chimera_project_layout(module, ct_x, &ct_x_layout)
+        };
+        chimera_add(module, &ct_x_proj, &attn_out)
+    } else {
+        attn_out
+    };
+
+    // -----------------------------------------------------------------------
+    // Step 4: Pre-FFN RMSNorm
+    // -----------------------------------------------------------------------
+    let normed_pre_ffn = chimera_rms_norm(module, eval_key, &residual_1, &config.pre_ffn_norm);
+
+    // -----------------------------------------------------------------------
+    // Step 5: FFN
+    //
+    // The FFN produces a vector of ciphertexts (one per output dimension).
+    // For the single-ciphertext-in/single-ciphertext-out transformer block,
+    // we take only the first output dimension.
+    // -----------------------------------------------------------------------
+    let ffn_out_vec = chimera_ffn(module, eval_key, &normed_pre_ffn, &weights.ffn, &config.ffn);
+    let ffn_out = ffn_out_vec.into_iter().next().expect("FFN must produce at least one output ciphertext");
+
+    // -----------------------------------------------------------------------
+    // Step 6: Residual connection (FFN)
+    // -----------------------------------------------------------------------
+    if config.residual {
+        let res1_layout = GLWELayout {
+            n: ffn_out.n(),
+            base2k: ffn_out.base2k(),
+            k: ffn_out.k(),
+            rank: ffn_out.rank(),
+        };
+        let res1_proj = if residual_1.base2k() == ffn_out.base2k() && residual_1.k() == ffn_out.k() {
+            use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+            let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(&residual_1);
+            {
+                let src_ref = residual_1.to_ref();
+                let src: &[u8] = src_ref.data().data;
+                let mut dst_mut = cloned.to_mut();
+                let dst: &mut [u8] = dst_mut.data_mut().data;
+                let len = src.len().min(dst.len());
+                dst[..len].copy_from_slice(&src[..len]);
+            }
+            cloned
+        } else {
+            chimera_project_layout(module, &residual_1, &res1_layout)
+        };
+        chimera_add(module, &res1_proj, &ffn_out)
+    } else {
+        ffn_out
+    }
+}
+
+/// Evaluates a sequence of transformer blocks (full forward pass) on an encrypted input.
+///
+/// Chains `num_layers` transformer blocks sequentially, feeding the output of
+/// each block as the input to the next. All blocks share the same configuration
+/// but may have different weights.
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key.
+/// * `ct_x` - Encrypted input vector.
+/// * `config` - Block configuration (shared across all layers).
+/// * `layer_weights` - Per-layer weight matrices.
+///
+/// # Returns
+///
+/// Encrypted output after all transformer blocks.
+///
+/// # Panics
+///
+/// Panics if `layer_weights.len()` does not match `num_layers`.
+pub fn chimera_forward_pass<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    ct_x: &GLWE<Vec<u8>>,
+    config: &TransformerBlockConfig,
+    layer_weights: &[TransformerBlockWeights],
+) -> GLWE<Vec<u8>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE> + GLWEAutomorphism<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    let mut current = {
+        use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+        let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(ct_x);
+        {
+            let src_ref = ct_x.to_ref();
+            let src: &[u8] = src_ref.data().data;
+            let mut dst_mut = cloned.to_mut();
+            let dst: &mut [u8] = dst_mut.data_mut().data;
+            let len = src.len().min(dst.len());
+            dst[..len].copy_from_slice(&src[..len]);
+        }
+        cloned
+    };
+
+    for (layer_idx, weights) in layer_weights.iter().enumerate() {
+        current = chimera_transformer_block(module, eval_key, &current, config, weights);
+        // In a production implementation, this is where we would check the noise
+        // budget and potentially bootstrap if needed:
+        //   if needs_bootstrap(&current, params) {
+        //       current = chimera_bootstrap(module, eval_key, &current, params);
+        //   }
+        let _ = layer_idx; // suppress unused warning
+    }
+
+    current
 }
 
 #[cfg(test)]

@@ -271,7 +271,7 @@ Agents should treat the following as active research questions and document find
 
 > Last updated: 2026-03-10
 
-### Crate: `poulpy-chimera` (15 source files, 139 tests passing)
+### Crate: `poulpy-chimera` (16 source files, 175 tests passing)
 
 The CHIMERA scheme is implemented as a new crate in the Poulpy workspace, reusing
 `poulpy-hal` (backend traits, FFT) and `poulpy-core` (RLWE encryption, keyswitching,
@@ -305,7 +305,8 @@ tensor products, automorphisms).
 | `noise.rs` | Noise tracking and budget estimation | ✅ |
 | `bootstrapping.rs` | Full bootstrap pipeline: sample extract → LWE keyswitch → blind rotation | ✅ |
 | `model_loader.rs` | Safetensors loading, INT8/FP16/BF16/FP32 quantization, transpose, sharded models | ✅ |
-| `tests.rs` | 139 integration tests (including 8 accuracy + 3 security sweep tests) | ✅ |
+| `verification.rs` | MAC-based user-side computation verification (linear ops) | ✅ |
+| `tests.rs` | 175 integration tests (including 8 accuracy + 3 security sweep + 11 MAC verification tests) | ✅ |
 | `benches/chimera_ops.rs` | Criterion benchmarks for all operations (toy + d_model=128 + security sweep) | ✅ |
 
 ### Key Design Decisions Implemented
@@ -369,10 +370,14 @@ tensor products, automorphisms).
    - `docs/chimera_security.md` and `docs/chimera_comparison.md` updated with
      measured (not estimated) multi-security-level data
 
-8. **User-side verification prototype**
-   - Design a lightweight proof of correct inference (not publicly verifiable)
-   - Evaluate proof size and verification cost on typical user device
-   - If impractical, document the trust model explicitly
+8. ~~**User-side verification prototype**~~ ✅ Done
+   - MAC-based user-side computation verification for linear operations
+   - User tags ciphertexts with scalar MAC key α; provider maintains tags through
+     homomorphic operations (add, mul_const, dot product, matmul)
+   - User verifies `tag ≡ α·result (mod 2^scale_bits)` after decryption
+   - 11 tests: 3 key management, 6 honest computation (all exact match), 2 tamper detection
+   - Honest computations produce zero MAC error; tampered outputs detected with high probability
+   - `docs/chimera_verification.md` updated with prototype implementation section
 
 ### Path to Real Model Inference
 

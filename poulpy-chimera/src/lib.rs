@@ -38,6 +38,7 @@
 //! | [`transformer`]| Full transformer block and forward pass                  |
 //! | [`moe`]        | Mixture-of-Experts routing under FHE                     |
 //! | [`noise`]      | Noise tracking and budget estimation                     |
+//! | [`verification`]| MAC-based user-side computation verification             |
 //!
 //! ## Backend Selection
 //!
@@ -63,6 +64,7 @@ pub mod moe;
 pub mod noise;
 pub mod bootstrapping;
 pub mod model_loader;
+pub mod verification;
 
 #[cfg(test)]
 mod tests;

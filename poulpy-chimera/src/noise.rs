@@ -114,8 +114,7 @@ impl NoiseTracker {
         // relin_noise ≈ N * dnum * σ²_fresh / 2^(2 * tsk_base2k)
         let dnum_approx = 4.0;
         let tsk_base2k = 14.0;
-        let relin_noise = ring_degree as f64 * dnum_approx * (SIGMA_FRESH * SIGMA_FRESH)
-            / (2.0_f64).powf(2.0 * tsk_base2k);
+        let relin_noise = ring_degree as f64 * dnum_approx * (SIGMA_FRESH * SIGMA_FRESH) / (2.0_f64).powf(2.0 * tsk_base2k);
         self.variance = self.variance * other.variance * ring_degree as f64 + relin_noise;
         self.num_ops += 1;
         self.depth = self.depth.max(other.depth) + 1;
@@ -178,10 +177,7 @@ impl NoiseTracker {
 }
 
 /// Estimates total noise growth for a sequence of transformer operations.
-pub fn estimate_transformer_layer_noise(
-    params: &ChimeraParams,
-    d_model: usize,
-) -> NoiseTracker {
+pub fn estimate_transformer_layer_noise(params: &ChimeraParams, d_model: usize) -> NoiseTracker {
     let mut tracker = NoiseTracker::fresh();
 
     // QKV projection: matmul with d_model accumulations

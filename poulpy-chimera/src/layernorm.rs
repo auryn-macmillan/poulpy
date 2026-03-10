@@ -14,15 +14,15 @@
 //! - **RMSNorm**: Simplified variant that skips mean subtraction (used by LLaMA
 //!   and other modern architectures). ~30% cheaper under FHE.
 
+use poulpy_core::ScratchTakeCore;
 use poulpy_core::{
+    layouts::{GLWEInfos, LWEInfos, GLWE},
     GLWEAdd, GLWEMulConst, GLWETensoring, GLWETrace,
-    layouts::{GLWE, GLWEInfos, LWEInfos},
 };
 use poulpy_hal::{
     api::{ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
     layouts::{Backend, Module, Scratch, ScratchOwned},
 };
-use poulpy_core::ScratchTakeCore;
 
 use crate::activations::{apply_poly_activation, chimera_ct_mul, PolyApprox};
 use crate::arithmetic::{chimera_add, chimera_mul_const, chimera_project_layout, chimera_slot_sum};
@@ -249,10 +249,7 @@ where
     let d = x_cts.len();
 
     // Step 1: Square each dimension — sq_i = x_i * x_i
-    let sq: Vec<GLWE<Vec<u8>>> = x_cts
-        .iter()
-        .map(|xi| chimera_ct_mul(module, eval_key, xi, xi))
-        .collect();
+    let sq: Vec<GLWE<Vec<u8>>> = x_cts.iter().map(|xi| chimera_ct_mul(module, eval_key, xi, xi)).collect();
 
     // Step 2: Sum all squared values — sum_sq = Σ_i sq_i
     // All sq_i should have the same layout after ct*ct (out_base2k).
@@ -274,9 +271,7 @@ where
     }
 
     // Step 3: Mean — multiply by 1/d_model
-    let inv_n_scaled = ((1i64 << crate::activations::COEFF_SCALE_BITS) as f64
-        / d as f64)
-        .round() as i64;
+    let inv_n_scaled = ((1i64 << crate::activations::COEFF_SCALE_BITS) as f64 / d as f64).round() as i64;
     let mean_sq = chimera_mul_const(module, &sum_sq, &[inv_n_scaled]);
 
     // Step 4: Inverse square root — evaluate polynomial approx of 1/√x
@@ -392,9 +387,7 @@ where
     // Step 3: Mean — multiply by 1/N encoded as fixed-point.
     // We use COEFF_SCALE_BITS for the scaling factor so it integrates
     // cleanly with the subsequent polynomial evaluation.
-    let inv_n_scaled = ((1i64 << crate::activations::COEFF_SCALE_BITS) as f64
-        / config.norm_size as f64)
-        .round() as i64;
+    let inv_n_scaled = ((1i64 << crate::activations::COEFF_SCALE_BITS) as f64 / config.norm_size as f64).round() as i64;
     let mean_sq = chimera_mul_const(module, &sum_sq, &[inv_n_scaled]);
 
     // Step 4: Inverse square root — evaluate polynomial approx of 1/√x

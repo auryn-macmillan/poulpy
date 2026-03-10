@@ -59,25 +59,21 @@ use crate::noise::NoiseTracker;
 use crate::params::ChimeraParams;
 
 use poulpy_core::{
-    LWEKeySwitch, LWESampleExtract, LWESwitchingKeyEncrypt, ScratchTakeCore,
     layouts::{
-        Base2K, Degree, Dnum, GLWE, GLWELayout, GLWESecret, LWE, LWELayout, LWESecret,
-        LWESwitchingKey, LWESwitchingKeyLayout, Rank, TorusPrecision,
-        prepared::{
-            GLWESecretPrepared, GLWESecretPreparedFactory, LWESwitchingKeyPrepared,
-            LWESwitchingKeyPreparedFactory,
-        },
+        prepared::{GLWESecretPrepared, GLWESecretPreparedFactory, LWESwitchingKeyPrepared, LWESwitchingKeyPreparedFactory},
+        Base2K, Degree, Dnum, GLWELayout, GLWESecret, LWELayout, LWESecret, LWESwitchingKey, LWESwitchingKeyLayout, Rank,
+        TorusPrecision, GLWE, LWE,
     },
+    LWEKeySwitch, LWESampleExtract, LWESwitchingKeyEncrypt, ScratchTakeCore,
 };
 use poulpy_hal::{
     api::{ModuleN, ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
-    layouts::{Backend, Module, Scratch, ScratchOwned, ScalarZnxToMut, ScalarZnxToRef, ZnxView, ZnxViewMut},
+    layouts::{Backend, Module, ScalarZnxToMut, ScalarZnxToRef, Scratch, ScratchOwned, ZnxView, ZnxViewMut},
     source::Source,
 };
 use poulpy_schemes::bin_fhe::blind_rotation::{
-    BlindRotationExecute, BlindRotationKey, BlindRotationKeyEncryptSk,
-    BlindRotationKeyFactory, BlindRotationKeyLayout, BlindRotationKeyPrepared,
-    BlindRotationKeyPreparedFactory, CGGI, LookUpTableLayout, LookupTable, LookupTableFactory,
+    BlindRotationExecute, BlindRotationKey, BlindRotationKeyEncryptSk, BlindRotationKeyFactory, BlindRotationKeyLayout,
+    BlindRotationKeyPrepared, BlindRotationKeyPreparedFactory, LookUpTableLayout, LookupTable, LookupTableFactory, CGGI,
 };
 
 /// Configuration for bootstrapping decisions.
@@ -171,11 +167,7 @@ impl BootstrappingConfig {
 /// * `tracker` - Current noise state of the ciphertext.
 /// * `params` - CHIMERA parameter set (for budget calculation).
 /// * `config` - Bootstrapping configuration.
-pub fn needs_bootstrap(
-    tracker: &NoiseTracker,
-    params: &ChimeraParams,
-    config: &BootstrappingConfig,
-) -> bool {
+pub fn needs_bootstrap(tracker: &NoiseTracker, params: &ChimeraParams, config: &BootstrappingConfig) -> bool {
     if !config.enabled {
         return false;
     }
@@ -429,10 +421,7 @@ pub struct ChimeraBootstrapKey<BE: Backend> {
 
 impl<BE: Backend> ChimeraBootstrapKey<BE>
 where
-    Module<BE>: ModuleN
-        + GLWESecretPreparedFactory<BE>
-        + BlindRotationKeyEncryptSk<CGGI, BE>
-        + LWESwitchingKeyEncrypt<BE>,
+    Module<BE>: ModuleN + GLWESecretPreparedFactory<BE> + BlindRotationKeyEncryptSk<CGGI, BE> + LWESwitchingKeyEncrypt<BE>,
     BlindRotationKey<Vec<u8>, CGGI>: BlindRotationKeyFactory<CGGI>,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE>,
@@ -553,8 +542,8 @@ where
         let mut ksk = LWESwitchingKey::<Vec<u8>>::alloc_from_infos(&ksk_layout);
         ksk.encrypt_sk(
             module,
-            &sk_lwe_big,  // sk_lwe_in: N-dim ternary (from GLWE)
-            &sk_lwe,       // sk_lwe_out: n_lwe-dim binary
+            &sk_lwe_big, // sk_lwe_in: N-dim ternary (from GLWE)
+            &sk_lwe,     // sk_lwe_out: n_lwe-dim binary
             &mut source_xa,
             &mut source_xe,
             ksk_scratch.borrow(),
@@ -591,9 +580,7 @@ pub struct ChimeraBootstrapKeyPrepared<BE: Backend> {
 
 impl<BE: Backend> ChimeraBootstrapKeyPrepared<BE>
 where
-    Module<BE>: ModuleN
-        + BlindRotationKeyPreparedFactory<CGGI, BE>
-        + LWESwitchingKeyPreparedFactory<BE>,
+    Module<BE>: ModuleN + BlindRotationKeyPreparedFactory<CGGI, BE> + LWESwitchingKeyPreparedFactory<BE>,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
@@ -667,11 +654,7 @@ pub fn chimera_bootstrap<BE: Backend>(
     _config: &BootstrappingConfig,
 ) -> GLWE<Vec<u8>>
 where
-    Module<BE>: ModuleN
-        + LWESampleExtract
-        + LWEKeySwitch<BE>
-        + BlindRotationExecute<CGGI, BE>
-        + LookupTableFactory,
+    Module<BE>: ModuleN + LWESampleExtract + LWEKeySwitch<BE> + BlindRotationExecute<CGGI, BE> + LookupTableFactory,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
@@ -717,12 +700,7 @@ where
 
     let mut lwe_small = LWE::<Vec<u8>>::alloc_from_infos(&lwe_small_layout);
 
-    let ks_bytes = LWE::keyswitch_tmp_bytes(
-        module,
-        &lwe_small_layout,
-        &lwe_big_layout,
-        &bsk_prepared.ksk_prepared,
-    );
+    let ks_bytes = LWE::keyswitch_tmp_bytes(module, &lwe_small_layout, &lwe_big_layout, &bsk_prepared.ksk_prepared);
     let mut ks_scratch: ScratchOwned<BE> = ScratchOwned::alloc(ks_bytes);
     lwe_small.keyswitch(module, &lwe_big, &bsk_prepared.ksk_prepared, ks_scratch.borrow());
 
@@ -773,13 +751,9 @@ where
     );
     let mut br_scratch: ScratchOwned<BE> = ScratchOwned::alloc(br_bytes);
 
-    bsk_prepared.brk_prepared.execute(
-        module,
-        &mut res_glwe,
-        &lwe_small,
-        &lut,
-        br_scratch.borrow(),
-    );
+    bsk_prepared
+        .brk_prepared
+        .execute(module, &mut res_glwe, &lwe_small, &lut, br_scratch.borrow());
 
     // -----------------------------------------------------------------------
     // Step 4: Update noise tracker
@@ -910,8 +884,8 @@ mod tests {
     // End-to-end test: encrypt → bootstrap → decrypt
     #[test]
     fn test_chimera_bootstrap_roundtrip() {
-        use crate::encrypt::{ChimeraKey, chimera_decrypt, chimera_encrypt};
         use crate::encoding::encode_int8;
+        use crate::encrypt::{chimera_decrypt, chimera_encrypt, ChimeraKey};
         use poulpy_hal::api::ModuleNew;
 
         #[cfg(not(all(feature = "enable-avx", target_arch = "x86_64")))]
@@ -971,9 +945,7 @@ mod tests {
             base2k: Base2K(bp.base2k_lwe_small as u32),
         };
         let mut lwe_small = LWE::<Vec<u8>>::alloc_from_infos(&lwe_small_layout);
-        let ks_bytes = LWE::keyswitch_tmp_bytes(
-            &module, &lwe_small_layout, &lwe_big_layout, &bsk_prepared.ksk_prepared,
-        );
+        let ks_bytes = LWE::keyswitch_tmp_bytes(&module, &lwe_small_layout, &lwe_big_layout, &bsk_prepared.ksk_prepared);
         let mut ks_scratch: ScratchOwned<BE> = ScratchOwned::alloc(ks_bytes);
         lwe_small.keyswitch(&module, &lwe_big, &bsk_prepared.ksk_prepared, ks_scratch.borrow());
 
@@ -1000,19 +972,22 @@ mod tests {
         };
         let mut res_glwe = GLWE::<Vec<u8>>::alloc_from_infos(&res_glwe_layout);
         let br_bytes = BlindRotationKeyPrepared::execute_tmp_bytes(
-            &module, bp.block_size, bp.extension_factor, &res_glwe_layout, &bsk_prepared.brk_prepared,
+            &module,
+            bp.block_size,
+            bp.extension_factor,
+            &res_glwe_layout,
+            &bsk_prepared.brk_prepared,
         );
         let mut br_scratch: ScratchOwned<BE> = ScratchOwned::alloc(br_bytes);
-        bsk_prepared.brk_prepared.execute(&module, &mut res_glwe, &lwe_small, &lut, br_scratch.borrow());
+        bsk_prepared
+            .brk_prepared
+            .execute(&module, &mut res_glwe, &lwe_small, &lut, br_scratch.borrow());
 
         // Decrypt and verify
         let mut pt_dec = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&res_glwe_layout);
         res_glwe.decrypt(&module, &mut pt_dec, &key.prepared, br_scratch.borrow());
 
-        let decoded = pt_dec.decode_coeff_i64(
-            TorusPrecision((bp.log_message_modulus + 1) as u32),
-            0,
-        );
+        let decoded = pt_dec.decode_coeff_i64(TorusPrecision((bp.log_message_modulus + 1) as u32), 0);
 
         let diff = (decoded - 5i64).unsigned_abs();
         assert!(
@@ -1026,12 +1001,7 @@ mod tests {
     /// the keyswitch + blind rotation is correct.
     #[test]
     fn test_bootstrap_native_lwe_encoding() {
-        use poulpy_core::{
-            layouts::{
-                GLWEPlaintext, LWEPlaintext,
-                prepared::GLWESecretPrepared,
-            },
-        };
+        use poulpy_core::layouts::{prepared::GLWESecretPrepared, GLWEPlaintext, LWEPlaintext};
         use poulpy_hal::api::ModuleNew;
 
         #[cfg(not(all(feature = "enable-avx", target_arch = "x86_64")))]
@@ -1054,9 +1024,7 @@ mod tests {
         };
         let mut sk_glwe = GLWESecret::<Vec<u8>>::alloc_from_infos(&layout);
         sk_glwe.fill_ternary_prob(0.5, &mut source_xs);
-        let mut sk_glwe_dft = GLWESecretPrepared::<Vec<u8>, BE>::alloc(
-            &module, params.rank,
-        );
+        let mut sk_glwe_dft = GLWESecretPrepared::<Vec<u8>, BE>::alloc(&module, params.rank);
         sk_glwe_dft.prepare(&module, &sk_glwe);
 
         // Binary LWE secret (small key)
@@ -1132,9 +1100,8 @@ mod tests {
         };
         let mut res_glwe = GLWE::<Vec<u8>>::alloc_from_infos(&res_layout);
 
-        let br_bytes = BlindRotationKeyPrepared::execute_tmp_bytes(
-            &module, bp.block_size, bp.extension_factor, &res_layout, &brk_prepared,
-        );
+        let br_bytes =
+            BlindRotationKeyPrepared::execute_tmp_bytes(&module, bp.block_size, bp.extension_factor, &res_layout, &brk_prepared);
         let mut br_scratch2: ScratchOwned<BE> = ScratchOwned::alloc(br_bytes);
         brk_prepared.execute(&module, &mut res_glwe, &lwe, &lut, br_scratch2.borrow());
 

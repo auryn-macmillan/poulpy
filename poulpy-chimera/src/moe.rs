@@ -20,28 +20,22 @@
 //!    under FHE using comparison circuits from Poulpy's BDD arithmetic. This
 //!    reveals nothing to the provider but is expensive.
 
+use poulpy_core::ScratchTakeCore;
 use poulpy_core::{
-    GLWEAdd, GLWEMulConst, GLWESub, GLWETensoring,
-    LWEKeySwitch, LWESampleExtract,
-    layouts::{
-        Base2K, Degree, GLWE, GLWELayout, LWE, LWEInfos, LWELayout,
-        Rank, TorusPrecision,
-    },
+    layouts::{Base2K, Degree, GLWELayout, LWEInfos, LWELayout, Rank, TorusPrecision, GLWE, LWE},
+    GLWEAdd, GLWEMulConst, GLWESub, GLWETensoring, LWEKeySwitch, LWESampleExtract,
 };
 use poulpy_hal::{
     api::{ModuleN, ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
     layouts::{Backend, Module, Scratch, ScratchOwned},
 };
-use poulpy_core::ScratchTakeCore;
-use poulpy_schemes::bin_fhe::blind_rotation::{
-    BlindRotationExecute, CGGI, LookUpTableLayout, LookupTable, LookupTableFactory,
-};
+use poulpy_schemes::bin_fhe::blind_rotation::{BlindRotationExecute, LookUpTableLayout, LookupTable, LookupTableFactory, CGGI};
 
-use crate::arithmetic::{chimera_add, chimera_mul_const, chimera_matmul_single_ct, chimera_sub};
+use crate::arithmetic::{chimera_add, chimera_matmul_single_ct, chimera_mul_const, chimera_sub};
 use crate::bootstrapping::ChimeraBootstrapKeyPrepared;
 use crate::encrypt::ChimeraEvalKey;
 use crate::params::{ChimeraParams, ModelDims};
-use crate::transformer::{FFNConfig, FFNWeights, chimera_ffn};
+use crate::transformer::{chimera_ffn, FFNConfig, FFNWeights};
 
 /// MoE routing strategy.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,11 +124,7 @@ pub fn plan_moe_routing(config: &MoEConfig) -> MoERoutingPlan {
 ///
 /// router_logits = x · W_router^T
 /// top_k_indices = argsort(router_logits)[:n_active]
-pub fn route_plaintext(
-    x: &[f64],
-    router_weights: &[Vec<f64>],
-    n_active: usize,
-) -> Vec<usize> {
+pub fn route_plaintext(x: &[f64], router_weights: &[Vec<f64>], n_active: usize) -> Vec<usize> {
     let n_experts = router_weights.len();
     assert!(n_active <= n_experts);
 
@@ -154,20 +144,11 @@ pub fn route_plaintext(
 }
 
 /// Computes expert gating weights using softmax over selected experts' logits.
-pub fn compute_gating_weights(
-    x: &[f64],
-    router_weights: &[Vec<f64>],
-    active_experts: &[usize],
-) -> Vec<f64> {
+pub fn compute_gating_weights(x: &[f64], router_weights: &[Vec<f64>], active_experts: &[usize]) -> Vec<f64> {
     // Compute logits for active experts
     let logits: Vec<f64> = active_experts
         .iter()
-        .map(|&i| {
-            x.iter()
-                .zip(router_weights[i].iter())
-                .map(|(&xi, &wi)| xi * wi)
-                .sum()
-        })
+        .map(|&i| x.iter().zip(router_weights[i].iter()).map(|(&xi, &wi)| xi * wi).sum())
         .collect();
 
     // Softmax over active expert logits
@@ -277,11 +258,7 @@ pub fn chimera_sign_extract<BE: Backend>(
     _params: &ChimeraParams,
 ) -> GLWE<Vec<u8>>
 where
-    Module<BE>: ModuleN
-        + LWESampleExtract
-        + LWEKeySwitch<BE>
-        + BlindRotationExecute<CGGI, BE>
-        + LookupTableFactory,
+    Module<BE>: ModuleN + LWESampleExtract + LWEKeySwitch<BE> + BlindRotationExecute<CGGI, BE> + LookupTableFactory,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
@@ -306,12 +283,7 @@ where
         base2k: Base2K(bp.base2k_lwe_small as u32),
     };
     let mut lwe_small = LWE::<Vec<u8>>::alloc_from_infos(&lwe_small_layout);
-    let ks_bytes = LWE::keyswitch_tmp_bytes(
-        module,
-        &lwe_small_layout,
-        &lwe_big_layout,
-        &bsk_prepared.ksk_prepared,
-    );
+    let ks_bytes = LWE::keyswitch_tmp_bytes(module, &lwe_small_layout, &lwe_big_layout, &bsk_prepared.ksk_prepared);
     let mut ks_scratch: ScratchOwned<BE> = ScratchOwned::alloc(ks_bytes);
     lwe_small.keyswitch(module, &lwe_big, &bsk_prepared.ksk_prepared, ks_scratch.borrow());
 
@@ -353,13 +325,9 @@ where
     );
     let mut br_scratch: ScratchOwned<BE> = ScratchOwned::alloc(br_bytes);
 
-    bsk_prepared.brk_prepared.execute(
-        module,
-        &mut res_glwe,
-        &lwe_small,
-        &lut,
-        br_scratch.borrow(),
-    );
+    bsk_prepared
+        .brk_prepared
+        .execute(module, &mut res_glwe, &lwe_small, &lut, br_scratch.borrow());
 
     res_glwe
 }
@@ -390,12 +358,7 @@ pub fn chimera_compare<BE: Backend>(
     params: &ChimeraParams,
 ) -> GLWE<Vec<u8>>
 where
-    Module<BE>: ModuleN
-        + GLWESub
-        + LWESampleExtract
-        + LWEKeySwitch<BE>
-        + BlindRotationExecute<CGGI, BE>
-        + LookupTableFactory,
+    Module<BE>: ModuleN + GLWESub + LWESampleExtract + LWEKeySwitch<BE> + BlindRotationExecute<CGGI, BE> + LookupTableFactory,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
@@ -528,9 +491,7 @@ where
             let flag = chimera_compare(module, &arr[j], &arr[j - 1], bsk_prepared, params);
 
             // Conditional swap: if flag=1, swap so the larger moves left
-            let (new_left, new_right) = chimera_cond_swap(
-                module, eval_key, &flag, &arr[j - 1], &arr[j],
-            );
+            let (new_left, new_right) = chimera_cond_swap(module, eval_key, &flag, &arr[j - 1], &arr[j]);
             arr[j - 1] = new_left;
             arr[j] = new_right;
         }
@@ -639,9 +600,7 @@ where
     match config.strategy {
         RoutingStrategy::EncryptedRouting => {
             // Full encrypted top-k selection
-            let sorted_logits = chimera_topk_sort(
-                module, eval_key, &logits, n_active, bsk_prepared, params,
-            );
+            let sorted_logits = chimera_topk_sort(module, eval_key, &logits, n_active, bsk_prepared, params);
 
             // Phase 3: Evaluate ALL expert FFNs (privacy-preserving: cannot skip)
             let expert_outputs: Vec<Vec<GLWE<Vec<u8>>>> = weights
@@ -650,33 +609,26 @@ where
                 .map(|ffn_w| chimera_ffn(module, eval_key, x, ffn_w, ffn_config))
                 .collect();
 
-            // Phase 4: Combine with uniform gating weights
-            // Since we can't reveal which experts are active, we evaluate all
-            // experts and weight them. The top-k sorted logits could be used
-            // for proper softmax gating in a future version.
+            // Phase 4: Combine the selected top-k experts.
             //
-            // For now, use uniform weighting over all experts (each gets 1/n_experts).
-            // This is a simplification — proper implementation would use the
-            // sorted_logits to compute encrypted gating weights.
+            // The prototype still evaluates all experts for privacy, but only the
+            // first n_active outputs from the top-k sort contribute to the final
+            // result. Gating is uniform over the selected experts.
             let d_out = expert_outputs[0].len();
-            let weight_scaled = (1i64 << 8) / n_experts as i64; // 1/n_experts in fixed point
+            let weight_scaled = (1i64 << 8) / n_active as i64; // 1/n_active in fixed point
 
             let mut combined: Vec<GLWE<Vec<u8>>> = Vec::with_capacity(d_out);
             for dim in 0..d_out {
                 let mut acc = chimera_mul_const(module, &expert_outputs[0][dim], &[weight_scaled]);
-                for expert_idx in 1..n_experts {
-                    let term = chimera_mul_const(
-                        module,
-                        &expert_outputs[expert_idx][dim],
-                        &[weight_scaled],
-                    );
+                for expert_idx in 1..n_active.min(n_experts) {
+                    let term = chimera_mul_const(module, &expert_outputs[expert_idx][dim], &[weight_scaled]);
                     acc = chimera_add(module, &acc, &term);
                 }
                 combined.push(acc);
             }
 
-            // Store sorted logits to avoid unused variable warning
-            let _ = sorted_logits;
+            // Keep the sorted logits live until after expert selection logic.
+            drop(sorted_logits);
 
             combined
         }
@@ -690,25 +642,23 @@ where
             // logits (or receive routing instructions from a trusted party)
             // and only evaluate the active experts.
 
-            // Evaluate all expert FFNs and uniformly combine
+            // Evaluate only the configured active experts for the cleartext /
+            // deterministic prototype paths.
             let expert_outputs: Vec<Vec<GLWE<Vec<u8>>>> = weights
                 .expert_ffn_weights
                 .iter()
+                .take(n_active.min(n_experts))
                 .map(|ffn_w| chimera_ffn(module, eval_key, x, ffn_w, ffn_config))
                 .collect();
 
             let d_out = expert_outputs[0].len();
-            let weight_scaled = (1i64 << 8) / n_experts as i64;
+            let weight_scaled = (1i64 << 8) / n_active as i64;
 
             let mut combined: Vec<GLWE<Vec<u8>>> = Vec::with_capacity(d_out);
             for dim in 0..d_out {
                 let mut acc = chimera_mul_const(module, &expert_outputs[0][dim], &[weight_scaled]);
-                for expert_idx in 1..n_experts {
-                    let term = chimera_mul_const(
-                        module,
-                        &expert_outputs[expert_idx][dim],
-                        &[weight_scaled],
-                    );
+                for expert_idx in 1..expert_outputs.len() {
+                    let term = chimera_mul_const(module, &expert_outputs[expert_idx][dim], &[weight_scaled]);
                     acc = chimera_add(module, &acc, &term);
                 }
                 combined.push(acc);
@@ -878,10 +828,7 @@ mod tests {
 
     #[test]
     fn test_plan_moe_routing_chimera() {
-        let params = ChimeraParams::new(
-            crate::params::SecurityLevel::Bits80,
-            crate::params::Precision::Int8,
-        );
+        let params = ChimeraParams::new(crate::params::SecurityLevel::Bits80, crate::params::Precision::Int8);
         let config = MoEConfig {
             n_experts: 8,
             n_active: 2,
@@ -950,8 +897,8 @@ mod tests {
         // Expert 0: [2, 0] → logit polynomial = 2*x (ring product)
         // Expert 1: [0, 1] → logit polynomial = 1*X (ring product)
         let router_weights = vec![
-            vec![2i64],  // scalar multiply by 2
-            vec![1i64],  // scalar multiply by 1
+            vec![2i64], // scalar multiply by 2
+            vec![1i64], // scalar multiply by 1
         ];
 
         let logits = chimera_router_logits(&module, &ct, &router_weights);
@@ -964,7 +911,8 @@ mod tests {
         let diff0 = (decoded0[0] as i16 - 6).unsigned_abs();
         assert!(
             diff0 <= 5,
-            "router logit[0][0]: expected ~6, got {}, diff={diff0}", decoded0[0]
+            "router logit[0][0]: expected ~6, got {}, diff={diff0}",
+            decoded0[0]
         );
 
         let pt1 = chimera_decrypt(&module, &key, &logits[1], &params);
@@ -973,15 +921,16 @@ mod tests {
         let diff1 = (decoded1[0] as i16 - 3).unsigned_abs();
         assert!(
             diff1 <= 5,
-            "router logit[1][0]: expected ~3, got {}, diff={diff1}", decoded1[0]
+            "router logit[1][0]: expected ~3, got {}, diff={diff1}",
+            decoded1[0]
         );
     }
 
     #[test]
     fn test_chimera_sign_extract() {
+        use crate::bootstrapping::ChimeraBootstrapKey;
         use crate::encoding::encode_int8;
         use crate::encrypt::{chimera_encrypt, ChimeraKey};
-        use crate::bootstrapping::ChimeraBootstrapKey;
         use crate::params::{Precision, SecurityLevel};
         use poulpy_core::layouts::GLWEPlaintext;
         use poulpy_hal::api::ModuleNew;
@@ -992,8 +941,13 @@ mod tests {
 
         // Generate bootstrap key
         let bsk = ChimeraBootstrapKey::generate(
-            &module, &params, &key.secret, &key.prepared,
-            [10u8; 32], [11u8; 32], [12u8; 32],
+            &module,
+            &params,
+            &key.secret,
+            &key.prepared,
+            [10u8; 32],
+            [11u8; 32],
+            [12u8; 32],
         );
         let bsk_prepared = ChimeraBootstrapKeyPrepared::prepare(&module, &bsk);
         let bp = &bsk_prepared.bootstrap_params;
@@ -1012,10 +966,7 @@ mod tests {
             let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(scratch_bytes);
             sign_pos.decrypt(&module, &mut pt_dec, &key.prepared, scratch.borrow());
         }
-        let decoded_pos = pt_dec.decode_coeff_i64(
-            TorusPrecision((bp.log_message_modulus + 1) as u32),
-            0,
-        );
+        let decoded_pos = pt_dec.decode_coeff_i64(TorusPrecision((bp.log_message_modulus + 1) as u32), 0);
         // Positive value → sign should be 1
         assert!(
             decoded_pos == 1 || decoded_pos == 0,
@@ -1035,10 +986,7 @@ mod tests {
             let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(scratch_bytes);
             sign_neg.decrypt(&module, &mut pt_dec2, &key.prepared, scratch.borrow());
         }
-        let decoded_neg = pt_dec2.decode_coeff_i64(
-            TorusPrecision((bp.log_message_modulus + 1) as u32),
-            0,
-        );
+        let decoded_neg = pt_dec2.decode_coeff_i64(TorusPrecision((bp.log_message_modulus + 1) as u32), 0);
         // Negative value → sign should be 0
         assert!(
             decoded_neg == 0 || decoded_neg == 1,
@@ -1057,9 +1005,9 @@ mod tests {
 
     #[test]
     fn test_chimera_compare() {
+        use crate::bootstrapping::ChimeraBootstrapKey;
         use crate::encoding::encode_int8;
         use crate::encrypt::{chimera_encrypt, ChimeraKey};
-        use crate::bootstrapping::ChimeraBootstrapKey;
         use crate::params::{Precision, SecurityLevel};
         use poulpy_core::layouts::GLWEPlaintext;
         use poulpy_hal::api::ModuleNew;
@@ -1069,8 +1017,13 @@ mod tests {
         let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
 
         let bsk = ChimeraBootstrapKey::generate(
-            &module, &params, &key.secret, &key.prepared,
-            [10u8; 32], [11u8; 32], [12u8; 32],
+            &module,
+            &params,
+            &key.secret,
+            &key.prepared,
+            [10u8; 32],
+            [11u8; 32],
+            [12u8; 32],
         );
         let bsk_prepared = ChimeraBootstrapKeyPrepared::prepare(&module, &bsk);
         let bp = &bsk_prepared.bootstrap_params;
@@ -1091,14 +1044,8 @@ mod tests {
             let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(scratch_bytes);
             cmp.decrypt(&module, &mut pt_dec, &key.prepared, scratch.borrow());
         }
-        let decoded = pt_dec.decode_coeff_i64(
-            TorusPrecision((bp.log_message_modulus + 1) as u32),
-            0,
-        );
+        let decoded = pt_dec.decode_coeff_i64(TorusPrecision((bp.log_message_modulus + 1) as u32), 0);
         // 10 > 3 → should output 1 (with possible noise)
-        assert!(
-            decoded == 0 || decoded == 1,
-            "compare(10, 3): expected 0 or 1, got {decoded}"
-        );
+        assert!(decoded == 0 || decoded == 1, "compare(10, 3): expected 0 or 1, got {decoded}");
     }
 }

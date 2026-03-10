@@ -44,19 +44,21 @@
 //! - **Context**: `chimera_ct_mul` (attn_weights · V) per head
 //! - **Output projection**: `chimera_matmul_single_ct` with plaintext W_O
 
-use crate::activations::{PolyApprox, apply_poly_activation, chimera_ct_mul, squared_relu_approx};
-use crate::arithmetic::{chimera_add, chimera_sub, chimera_mul_const, chimera_matmul_single_ct, chimera_project_layout, chimera_slot_sum};
+use crate::activations::{apply_poly_activation, chimera_ct_mul, squared_relu_approx, PolyApprox};
+use crate::arithmetic::{
+    chimera_add, chimera_matmul_single_ct, chimera_mul_const, chimera_project_layout, chimera_slot_sum, chimera_sub,
+};
 use crate::encrypt::ChimeraEvalKey;
 use crate::params::{ChimeraParams, ModelDims};
+use poulpy_core::ScratchTakeCore;
 use poulpy_core::{
+    layouts::{GLWEInfos, GLWELayout, LWEInfos, GLWE},
     GLWEAdd, GLWEMulConst, GLWESub, GLWETensoring, GLWETrace,
-    layouts::{GLWE, GLWEInfos, GLWELayout, LWEInfos},
 };
 use poulpy_hal::{
     api::{ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
     layouts::{Backend, Module, Scratch, ScratchOwned},
 };
-use poulpy_core::ScratchTakeCore;
 
 /// Configuration for a single attention layer under FHE.
 #[derive(Clone, Debug)]
@@ -171,11 +173,7 @@ pub fn precompute_rope(position: usize, d_head: usize, scale_bits: u32, base: f6
 ///
 /// # Panics
 /// Panics if `q_or_k.len()` is odd or doesn't match `rope.cos_table.len() * 2`
-pub fn chimera_apply_rope_vec<BE: Backend>(
-    module: &Module<BE>,
-    q_or_k: &[GLWE<Vec<u8>>],
-    rope: &RoPEConfig,
-) -> Vec<GLWE<Vec<u8>>>
+pub fn chimera_apply_rope_vec<BE: Backend>(module: &Module<BE>, q_or_k: &[GLWE<Vec<u8>>], rope: &RoPEConfig) -> Vec<GLWE<Vec<u8>>>
 where
     Module<BE>: GLWEMulConst<BE> + GLWEAdd + GLWESub,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
@@ -523,12 +521,10 @@ where
                 .map(|s| apply_poly_activation(module, eval_key, s, &approx))
                 .collect()
         }
-        SoftmaxStrategy::Custom(approx) => {
-            scores
-                .iter()
-                .map(|s| apply_poly_activation(module, eval_key, s, approx))
-                .collect()
-        }
+        SoftmaxStrategy::Custom(approx) => scores
+            .iter()
+            .map(|s| apply_poly_activation(module, eval_key, s, approx))
+            .collect(),
     }
 }
 
@@ -750,9 +746,7 @@ where
         // Each Q_h[i] and K_h[i] are ciphertexts encoding a single projected
         // dimension. Their ct*ct product gives that dimension's contribution to
         // the score. We accumulate all d_head contributions.
-        let head_context = chimera_single_head_attention(
-            module, eval_key, q_h, k_h, v_h, &config.softmax_approx,
-        );
+        let head_context = chimera_single_head_attention(module, eval_key, q_h, k_h, v_h, &config.softmax_approx);
 
         // head_context is a Vec of d_head ciphertexts
         all_head_contexts.extend(head_context);
@@ -1036,9 +1030,7 @@ where
         let k_h = &k_all[kv_start..kv_end];
         let v_h = &v_all[kv_start..kv_end];
 
-        let head_context = chimera_single_head_attention(
-            module, eval_key, q_h, k_h, v_h, &config.softmax_approx,
-        );
+        let head_context = chimera_single_head_attention(module, eval_key, q_h, k_h, v_h, &config.softmax_approx);
         all_head_contexts.extend(head_context);
     }
 
@@ -1179,13 +1171,7 @@ mod tests {
         let ct = chimera_encrypt(&module, &key, &pt, [2u8; 32], [3u8; 32]);
 
         // W_Q scales by 2, W_K scales by 3, W_V scales by 1
-        let (ct_q, ct_k, ct_v) = chimera_qkv_project_single(
-            &module,
-            &ct,
-            &[2i64],
-            &[3i64],
-            &[1i64],
-        );
+        let (ct_q, ct_k, ct_v) = chimera_qkv_project_single(&module, &ct, &[2i64], &[3i64], &[1i64]);
 
         let pt_q = chimera_decrypt(&module, &key, &ct_q, &params);
         let pt_k = chimera_decrypt(&module, &key, &ct_k, &params);
@@ -1197,11 +1183,23 @@ mod tests {
 
         // Q = [4*2, 5*2] = [8, 10]
         assert!((dec_q[0] as i16 - 8).unsigned_abs() <= 1, "Q[0] expected 8, got {}", dec_q[0]);
-        assert!((dec_q[1] as i16 - 10).unsigned_abs() <= 1, "Q[1] expected 10, got {}", dec_q[1]);
+        assert!(
+            (dec_q[1] as i16 - 10).unsigned_abs() <= 1,
+            "Q[1] expected 10, got {}",
+            dec_q[1]
+        );
 
         // K = [4*3, 5*3] = [12, 15]
-        assert!((dec_k[0] as i16 - 12).unsigned_abs() <= 1, "K[0] expected 12, got {}", dec_k[0]);
-        assert!((dec_k[1] as i16 - 15).unsigned_abs() <= 1, "K[1] expected 15, got {}", dec_k[1]);
+        assert!(
+            (dec_k[0] as i16 - 12).unsigned_abs() <= 1,
+            "K[0] expected 12, got {}",
+            dec_k[0]
+        );
+        assert!(
+            (dec_k[1] as i16 - 15).unsigned_abs() <= 1,
+            "K[1] expected 15, got {}",
+            dec_k[1]
+        );
 
         // V = [4*1, 5*1] = [4, 5]
         assert!((dec_v[0] as i16 - 4).unsigned_abs() <= 1, "V[0] expected 4, got {}", dec_v[0]);
@@ -1213,16 +1211,14 @@ mod tests {
         // Test attention score computation: Q·K element-wise + slot sum.
         // This verifies the core ct*ct + trace pipeline.
         use crate::encoding::encode_int8;
-        use crate::encrypt::{chimera_encrypt, ChimeraKey, ChimeraEvalKey};
+        use crate::encrypt::{chimera_encrypt, ChimeraEvalKey, ChimeraKey};
         use poulpy_core::layouts::LWEInfos;
         use poulpy_hal::api::ModuleNew;
 
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [1u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [4u8; 32], [5u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [4u8; 32], [5u8; 32]);
 
         // Encode Q = [2, 0, 0, ...] and K = [3, 0, 0, ...]
         // Expected score = 2*3 = 6 (at coefficient 0 after slot sum)
@@ -1248,17 +1244,15 @@ mod tests {
     #[test]
     fn test_apply_softmax_linear() {
         // Linear softmax should be an identity (just clone).
-        use crate::encoding::encode_int8;
-        use crate::encrypt::{chimera_encrypt, chimera_decrypt, ChimeraKey, ChimeraEvalKey};
         use crate::encoding::decode_int8;
+        use crate::encoding::encode_int8;
+        use crate::encrypt::{chimera_decrypt, chimera_encrypt, ChimeraEvalKey, ChimeraKey};
         use poulpy_hal::api::ModuleNew;
 
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [1u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [4u8; 32], [5u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [4u8; 32], [5u8; 32]);
 
         let vals: Vec<i8> = vec![3, 5];
         let pt = encode_int8(&module, &params, &vals);
@@ -1270,8 +1264,16 @@ mod tests {
         // Linear softmax should preserve the values
         let pt_dec = chimera_decrypt(&module, &key, &results[0], &params);
         let decoded = decode_int8(&module, &params, &pt_dec, 2);
-        assert!((decoded[0] as i16 - 3).unsigned_abs() <= 1, "linear softmax[0] expected 3, got {}", decoded[0]);
-        assert!((decoded[1] as i16 - 5).unsigned_abs() <= 1, "linear softmax[1] expected 5, got {}", decoded[1]);
+        assert!(
+            (decoded[0] as i16 - 3).unsigned_abs() <= 1,
+            "linear softmax[0] expected 3, got {}",
+            decoded[0]
+        );
+        assert!(
+            (decoded[1] as i16 - 5).unsigned_abs() <= 1,
+            "linear softmax[1] expected 5, got {}",
+            decoded[1]
+        );
     }
 
     #[test]
@@ -1285,11 +1287,13 @@ mod tests {
         for i in 0..2 {
             assert!(
                 (rope0.cos_table[i] - scale).abs() <= 1,
-                "pos=0 cos[{i}] expected {scale}, got {}", rope0.cos_table[i]
+                "pos=0 cos[{i}] expected {scale}, got {}",
+                rope0.cos_table[i]
             );
             assert!(
                 rope0.sin_table[i].abs() <= 1,
-                "pos=0 sin[{i}] expected 0, got {}", rope0.sin_table[i]
+                "pos=0 sin[{i}] expected 0, got {}",
+                rope0.sin_table[i]
             );
         }
 
@@ -1303,11 +1307,13 @@ mod tests {
         let expected_sin0 = (5.0f64.sin() * 128.0).round() as i64;
         assert!(
             (rope5.cos_table[0] - expected_cos0).abs() <= 1,
-            "pos=5 cos[0] expected {expected_cos0}, got {}", rope5.cos_table[0]
+            "pos=5 cos[0] expected {expected_cos0}, got {}",
+            rope5.cos_table[0]
         );
         assert!(
             (rope5.sin_table[0] - expected_sin0).abs() <= 1,
-            "pos=5 sin[0] expected {expected_sin0}, got {}", rope5.sin_table[0]
+            "pos=5 sin[0] expected {expected_sin0}, got {}",
+            rope5.sin_table[0]
         );
     }
 

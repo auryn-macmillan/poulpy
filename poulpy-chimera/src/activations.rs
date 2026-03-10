@@ -17,16 +17,17 @@
 //! All approximation coefficients are pre-computed for the typical activation
 //! range [-8, 8] encountered in transformer inference at INT8/FP16 precision.
 
+use poulpy_core::ScratchTakeCore;
 use poulpy_core::{
+    layouts::{GLWEInfos, GLWETensor, LWEInfos, GLWE},
     GLWEAdd, GLWEMulConst, GLWETensoring,
-    layouts::{GLWE, GLWEInfos, GLWETensor, LWEInfos},
 };
 use poulpy_hal::{
     api::{ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
-    layouts::{Backend, Module, Scratch, ScratchOwned},
+    layouts::{Backend, Module, Scratch, ScratchOwned, ZnxViewMut},
 };
-use poulpy_core::ScratchTakeCore;
 
+use crate::arithmetic::chimera_project_layout;
 use crate::encrypt::ChimeraEvalKey;
 
 /// Number of bits used for fixed-point scaling of polynomial coefficients.
@@ -58,6 +59,17 @@ pub const COEFF_SCALE_BITS: usize = 8;
 /// the output must be decoded at `TorusPrecision(18)`.
 pub fn activation_decode_precision(encoding_scale: usize) -> usize {
     encoding_scale - COEFF_SCALE_BITS
+}
+
+/// Returns the torus precision needed to encode a constant term into the
+/// ciphertext output of [`apply_poly_activation`].
+///
+/// The polynomial coefficients are scaled by `2^COEFF_SCALE_BITS`, so a
+/// constant `c0` must be encoded at the same effective precision as the other
+/// terms. If the input was encoded at `encoding_scale`, the constant should be
+/// encoded at `encoding_scale - COEFF_SCALE_BITS`.
+pub fn activation_constant_precision(encoding_scale: usize) -> usize {
+    activation_decode_precision(encoding_scale)
 }
 
 /// Coefficients for a polynomial approximation.
@@ -256,7 +268,10 @@ where
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
     let degree = approx.effective_degree();
-    assert!(degree >= 1, "polynomial must have at least one non-zero coefficient above degree 0");
+    assert!(
+        degree >= 1,
+        "polynomial must have at least one non-zero coefficient above degree 0"
+    );
     assert!(degree <= 4, "polynomials above degree 4 are not supported");
 
     // For degree 1: result = c₀ + c₁·ct (no tensor product needed)
@@ -273,8 +288,14 @@ where
         return combine_terms_deg2(module, ct, &ct_sq, approx);
     }
 
-    // For degree >= 3: compute ct³ = ct² * ct
-    let ct_cube = chimera_ct_mul(module, eval_key, &ct_sq, ct);
+    // For degree >= 3: compute ct³ = ct² * ct.
+    // Align ct to ct²'s layout before multiplying.
+    let ct_for_cube = if ct.base2k() == ct_sq.base2k() && ct.k() == ct_sq.k() {
+        ct.clone()
+    } else {
+        chimera_project_layout(module, ct, &ct_sq.glwe_layout())
+    };
+    let ct_cube = chimera_ct_mul(module, eval_key, &ct_sq, &ct_for_cube);
 
     if degree == 3 {
         // p(x) = c₀ + c₁·x + c₂·x² + c₃·x³
@@ -282,8 +303,33 @@ where
     }
 
     // degree == 4: ct⁴ = ct² * ct²
-    let ct_fourth = chimera_ct_mul(module, eval_key, &ct_sq, &ct_sq);
+    let ct_sq_for_fourth = if ct_sq.base2k() == ct_cube.base2k() && ct_sq.k() == ct_cube.k() {
+        ct_sq.clone()
+    } else {
+        chimera_project_layout(module, &ct_sq, &ct_cube.glwe_layout())
+    };
+    let ct_fourth = chimera_ct_mul(module, eval_key, &ct_sq_for_fourth, &ct_sq_for_fourth);
     combine_terms_deg4(module, ct, &ct_sq, &ct_cube, &ct_fourth, approx)
+}
+
+/// Adds a public constant term to a ciphertext by injecting it into the GLWE
+/// body polynomial.
+///
+/// The constant is encoded in coefficient 0 at torus precision
+/// `activation_constant_precision(encoding_scale)` so it matches the fixed-point
+/// scaling used by the non-constant polynomial terms.
+fn add_constant_term(ct: &mut GLWE<Vec<u8>>, c0: f64, encoding_scale: usize) {
+    let coeff_scale = 1i64 << COEFF_SCALE_BITS;
+    let c0_scaled = (c0 * coeff_scale as f64).round() as i64;
+    if c0_scaled == 0 {
+        return;
+    }
+
+    let const_precision = activation_constant_precision(encoding_scale);
+    let shift = const_precision.saturating_sub(ct.base2k().0 as usize);
+
+    let body = ct.data_mut().at_mut(0, 0);
+    body[0] = body[0].wrapping_add(c0_scaled << shift);
 }
 
 /// Computes the homomorphic product of two ciphertexts using tensor product + relinearization.
@@ -304,37 +350,50 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
+    let use_l2 = a.base2k() == b.base2k() && eval_key.output_l2_layout.is_some() && a.base2k() == eval_key.output_layout.base2k;
+
+    let (tensor_layout, output_layout, res_offset, tensor_key_layout, tensor_key_prepared) = if use_l2 {
+        (
+            eval_key.tensor_l2_layout.as_ref().expect("missing level-2 tensor layout"),
+            eval_key.output_l2_layout.as_ref().expect("missing level-2 output layout"),
+            eval_key.res_offset_l2.expect("missing level-2 res_offset"),
+            eval_key
+                .tensor_key_l2_layout
+                .as_ref()
+                .expect("missing level-2 tensor key layout"),
+            eval_key.tensor_key_l2_prepared.as_ref().expect("missing level-2 tensor key"),
+        )
+    } else {
+        (
+            &eval_key.tensor_layout,
+            &eval_key.output_layout,
+            eval_key.res_offset,
+            &eval_key.tensor_key_layout,
+            &eval_key.tensor_key_prepared,
+        )
+    };
+
     // Allocate tensor intermediate
-    let mut res_tensor = GLWETensor::<Vec<u8>>::alloc_from_infos(&eval_key.tensor_layout);
+    let mut res_tensor = GLWETensor::<Vec<u8>>::alloc_from_infos(tensor_layout);
 
     // Allocate output ciphertext
-    let mut res_relin = GLWE::<Vec<u8>>::alloc_from_infos(&eval_key.output_layout);
+    let mut res_relin = GLWE::<Vec<u8>>::alloc_from_infos(output_layout);
 
     // Compute scratch size
-    let tensor_apply_bytes = module.glwe_tensor_apply_tmp_bytes(&res_tensor, eval_key.res_offset, a, b);
-    let tensor_relin_bytes = module.glwe_tensor_relinearize_tmp_bytes(
-        &res_relin,
-        &res_tensor,
-        &eval_key.tensor_key_layout,
-    );
+    let tensor_apply_bytes = module.glwe_tensor_apply_tmp_bytes(&res_tensor, res_offset, a, b);
+    let tensor_relin_bytes = module.glwe_tensor_relinearize_tmp_bytes(&res_relin, &res_tensor, tensor_key_layout);
     let scratch_bytes = tensor_apply_bytes.max(tensor_relin_bytes);
     let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(scratch_bytes);
 
     // Step 1: Tensor product
-    module.glwe_tensor_apply(
-        &mut res_tensor,
-        eval_key.res_offset,
-        a,
-        b,
-        scratch.borrow(),
-    );
+    module.glwe_tensor_apply(&mut res_tensor, res_offset, a, b, scratch.borrow());
 
     // Step 2: Relinearize back to standard GLWE
     module.glwe_tensor_relinearize(
         &mut res_relin,
         &res_tensor,
-        &eval_key.tensor_key_prepared,
-        eval_key.tensor_key_prepared.size(),
+        tensor_key_prepared,
+        tensor_key_prepared.size(),
         scratch.borrow(),
     );
 
@@ -342,16 +401,13 @@ where
 }
 
 /// Applies a degree-1 polynomial: p(x) = c₀ + c₁·x
-fn apply_degree1<BE: Backend>(
-    module: &Module<BE>,
-    ct: &GLWE<Vec<u8>>,
-    approx: &PolyApprox,
-) -> GLWE<Vec<u8>>
+fn apply_degree1<BE: Backend>(module: &Module<BE>, ct: &GLWE<Vec<u8>>, approx: &PolyApprox) -> GLWE<Vec<u8>>
 where
     Module<BE>: GLWEMulConst<BE> + GLWEAdd,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchAvailable,
 {
+    let c0 = approx.coeffs[0];
     let c1 = approx.coeffs[1];
 
     // Scale the fractional coefficient to a fixed-point integer.
@@ -372,9 +428,7 @@ where
     let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp_bytes);
     module.glwe_mul_const(&mut result, res_offset, ct, &c1_vec, scratch.borrow());
 
-    // Note: c₀ is skipped. For GELU and SqReLU, c₀ = 0 exactly.
-    // Supporting nonzero c₀ would require encoding it as a plaintext and
-    // adding it to the ciphertext body.
+    add_constant_term(&mut result, c0, ct.k().0 as usize);
 
     result
 }
@@ -384,10 +438,7 @@ where
 /// When building a term from `ct_source` that needs to be added to a term from
 /// `ct_target`, and their base2k values differ, this returns `Some(layout)` matching
 /// `ct_target`'s parameters. Otherwise returns `None` (no layout conversion needed).
-fn get_target_layout(
-    ct_source: &GLWE<Vec<u8>>,
-    ct_target: &GLWE<Vec<u8>>,
-) -> Option<poulpy_core::layouts::GLWELayout> {
+fn get_target_layout(ct_source: &GLWE<Vec<u8>>, ct_target: &GLWE<Vec<u8>>) -> Option<poulpy_core::layouts::GLWELayout> {
     if ct_source.base2k() != ct_target.base2k() || ct_source.k() != ct_target.k() {
         Some(poulpy_core::layouts::GLWELayout {
             n: ct_target.n(),
@@ -421,6 +472,7 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchAvailable,
 {
+    let c0 = approx.coeffs[0];
     let c1 = approx.coeffs[1];
     let c2 = approx.coeffs[2];
 
@@ -436,7 +488,9 @@ where
     let term1 = build_scaled_term(module, ct, c1, c1_scaled, target_layout.as_ref());
 
     // Combine available terms via addition.
-    combine_two_terms(module, term1, term2, ct_sq)
+    let mut result = combine_two_terms(module, term1, term2, ct_sq);
+    add_constant_term(&mut result, c0, ct.k().0 as usize);
+    result
 }
 
 /// Helper: builds a single scaled term `coeff * ct` using glwe_mul_const,
@@ -510,9 +564,13 @@ where
                 module.glwe_add(&mut result, &t1, &t2);
                 result
             } else {
-                // Layouts differ; return the higher-degree term.
-                // This is a limitation — ideally we'd rescale to match layouts.
-                t2
+                panic!(
+                    "combine_two_terms: layout mismatch after projection (lhs base2k={}, k={}, rhs base2k={}, k={})",
+                    t1.base2k().0,
+                    t1.k().0,
+                    t2.base2k().0,
+                    t2.k().0,
+                );
             }
         }
         (Some(t1), None) => t1,
@@ -541,6 +599,7 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchAvailable,
 {
+    let c0 = approx.coeffs[0];
     let c1 = approx.coeffs[1];
     let c2 = approx.coeffs[2];
     let c3 = approx.coeffs[3];
@@ -574,7 +633,9 @@ where
         // but fall back gracefully if it does.
     }
 
-    partial
+    let mut result = partial;
+    add_constant_term(&mut result, c0, ct.k().0 as usize);
+    result
 }
 
 /// Combines terms for a degree-4 polynomial: p(x) = c₀ + c₁·x + c₂·x² + c₃·x³ + c₄·x⁴
@@ -594,6 +655,7 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchAvailable,
 {
+    let c0 = approx.coeffs[0];
     let c1 = approx.coeffs[1];
     let c2 = approx.coeffs[2];
     let c3 = approx.coeffs[3];
@@ -641,7 +703,9 @@ where
         }
     }
 
-    partial_234
+    let mut result = partial_234;
+    add_constant_term(&mut result, c0, ct.k().0 as usize);
+    result
 }
 
 #[cfg(test)]
@@ -660,10 +724,7 @@ mod tests {
         // Test at x=1: GELU(1) ≈ 0.8413
         let at_one = approx.eval(1.0);
         let gelu_one = 0.8413;
-        assert!(
-            (at_one - gelu_one).abs() < 0.1,
-            "GELU(1) ≈ {at_one}, expected ~{gelu_one}"
-        );
+        assert!((at_one - gelu_one).abs() < 0.1, "GELU(1) ≈ {at_one}, expected ~{gelu_one}");
 
         // Test at x=-1: GELU(-1) ≈ -0.1587
         let at_neg_one = approx.eval(-1.0);
@@ -681,17 +742,11 @@ mod tests {
 
         // At x=0: SqReLU(0) = 0
         let at_zero = approx.eval(0.0);
-        assert!(
-            at_zero.abs() < 0.4,
-            "SqReLU(0) ≈ {at_zero}, expected ~0 (polynomial approx)"
-        );
+        assert!(at_zero.abs() < 0.4, "SqReLU(0) ≈ {at_zero}, expected ~0 (polynomial approx)");
 
         // At x=2: SqReLU(2) = 4
         let at_two = approx.eval(2.0);
-        assert!(
-            (at_two - 4.0).abs() < 1.0,
-            "SqReLU(2) ≈ {at_two}, expected ~4"
-        );
+        assert!((at_two - 4.0).abs() < 1.0, "SqReLU(2) ≈ {at_two}, expected ~4");
     }
 
     #[test]
@@ -701,17 +756,11 @@ mod tests {
 
         // At x=0: exp(0) = 1
         let at_zero = approx.eval(0.0);
-        assert!(
-            (at_zero - 1.0).abs() < 0.001,
-            "exp(0) ≈ {at_zero}, expected 1.0"
-        );
+        assert!((at_zero - 1.0).abs() < 0.001, "exp(0) ≈ {at_zero}, expected 1.0");
 
         // At x=-1: exp(-1) ≈ 0.3679
         let at_neg_one = approx.eval(-1.0);
-        assert!(
-            (at_neg_one - 0.3679).abs() < 0.01,
-            "exp(-1) ≈ {at_neg_one}, expected ~0.3679"
-        );
+        assert!((at_neg_one - 0.3679).abs() < 0.01, "exp(-1) ≈ {at_neg_one}, expected ~0.3679");
     }
 
     #[test]
@@ -731,10 +780,7 @@ mod tests {
 
         // At x=1: 1/√1 = 1
         let at_one = approx.eval(1.0);
-        assert!(
-            (at_one - 1.0).abs() < 0.15,
-            "1/√1 ≈ {at_one}, expected 1.0"
-        );
+        assert!((at_one - 1.0).abs() < 0.15, "1/√1 ≈ {at_one}, expected 1.0");
     }
 
     #[test]
@@ -744,9 +790,6 @@ mod tests {
 
         // At x=1: 1/1 = 1
         let at_one = approx.eval(1.0);
-        assert!(
-            (at_one - 1.0).abs() < 0.2,
-            "1/1 ≈ {at_one}, expected 1.0"
-        );
+        assert!((at_one - 1.0).abs() < 0.2, "1/1 ≈ {at_one}, expected 1.0");
     }
 }

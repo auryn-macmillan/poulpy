@@ -123,13 +123,21 @@ impl ChimeraParams {
     /// This matches the pattern from poulpy-core's tensor test.
     pub fn in_base2k(&self) -> usize {
         let b = self.base2k.0 as usize;
-        if b > 1 { b - 1 } else { b }
+        if b > 1 {
+            b - 1
+        } else {
+            b
+        }
     }
 
     /// Returns the output ciphertext base2k after a tensor product (`base2k - 2`).
     pub fn out_base2k(&self) -> usize {
         let b = self.base2k.0 as usize;
-        if b > 2 { b - 2 } else { b }
+        if b > 2 {
+            b - 2
+        } else {
+            b
+        }
     }
 
     /// Returns the encoding scale used for torus encoding (`2 * in_base2k`).
@@ -267,7 +275,8 @@ impl ModelDims {
         assert!(
             self.n_heads % self.n_kv_heads == 0,
             "n_heads ({}) must be divisible by n_kv_heads ({})",
-            self.n_heads, self.n_kv_heads
+            self.n_heads,
+            self.n_kv_heads
         );
         self.n_heads / self.n_kv_heads
     }

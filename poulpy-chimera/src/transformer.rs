@@ -20,28 +20,27 @@
 //! ```
 
 use poulpy_core::{
+    layouts::{GLWEInfos, GLWELayout, LWEInfos, GLWE},
     GLWEAdd, GLWEMulConst, GLWETensoring, GLWETrace,
-    layouts::{GLWE, GLWEInfos, GLWELayout, LWEInfos},
 };
+use poulpy_core::{GLWEAutomorphism, ScratchTakeCore};
 use poulpy_hal::{
     api::{ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
     layouts::{Backend, Module, Scratch, ScratchOwned},
 };
-use poulpy_core::{GLWEAutomorphism, ScratchTakeCore};
 
-use crate::activations::{apply_poly_activation, chimera_ct_mul, gelu_poly_approx, silu_poly_approx, squared_relu_approx, PolyApprox};
+use crate::activations::{
+    apply_poly_activation, chimera_ct_mul, gelu_poly_approx, silu_poly_approx, squared_relu_approx, PolyApprox,
+};
 use crate::arithmetic::{chimera_add, chimera_matmul_single_ct, chimera_project_layout};
 use crate::attention::{
-    AttentionConfig, AttentionPlan, AttentionWeights, SoftmaxStrategy, plan_attention,
-    chimera_qkv_project_single, chimera_attention_score, chimera_apply_softmax,
-    chimera_attention_context, chimera_output_project,
-    chimera_multi_head_attention_vec,
+    chimera_apply_softmax, chimera_attention_context, chimera_attention_score, chimera_multi_head_attention_vec,
+    chimera_output_project, chimera_qkv_project_single, plan_attention, AttentionConfig, AttentionPlan, AttentionWeights,
+    SoftmaxStrategy,
 };
-use crate::bootstrapping::{
-    BootstrappingConfig, ChimeraBootstrapKeyPrepared, chimera_bootstrap, needs_bootstrap,
-};
+use crate::bootstrapping::{chimera_bootstrap, needs_bootstrap, BootstrappingConfig, ChimeraBootstrapKeyPrepared};
 use crate::encrypt::ChimeraEvalKey;
-use crate::layernorm::{LayerNormConfig, LayerNormPlan, chimera_rms_norm, chimera_rms_norm_vec, plan_layernorm};
+use crate::layernorm::{chimera_rms_norm, chimera_rms_norm_vec, plan_layernorm, LayerNormConfig, LayerNormPlan};
 use crate::noise::NoiseTracker;
 use crate::params::{ChimeraParams, ModelDims};
 
@@ -90,10 +89,10 @@ impl ActivationChoice {
     /// Returns the multiplicative depth of this activation.
     pub fn depth(&self) -> usize {
         match self {
-            ActivationChoice::PolyGELU => 2,      // degree-3 via Horner = depth 2 (with squaring)
-            ActivationChoice::SquaredReLU => 1,    // degree-2 = depth 1
-            ActivationChoice::PolySiLU => 2,       // degree-3 = depth 2
-            ActivationChoice::LutGELU => 0,        // LUT resets noise, depth = 0 (but expensive)
+            ActivationChoice::PolyGELU => 2,    // degree-3 via Horner = depth 2 (with squaring)
+            ActivationChoice::SquaredReLU => 1, // degree-2 = depth 1
+            ActivationChoice::PolySiLU => 2,    // degree-3 = depth 2
+            ActivationChoice::LutGELU => 0,     // LUT resets noise, depth = 0 (but expensive)
         }
     }
 }
@@ -122,8 +121,8 @@ impl FFNWeights {
     /// Creates zero-initialised SwiGLU FFN weights.
     pub fn zeros_swiglu(dims: &ModelDims) -> Self {
         FFNWeights {
-            w1: vec![vec![0i64; dims.d_ffn]; dims.d_model],   // W_gate
-            w2: vec![vec![0i64; dims.d_model]; dims.d_ffn],   // W_down
+            w1: vec![vec![0i64; dims.d_ffn]; dims.d_model],       // W_gate
+            w2: vec![vec![0i64; dims.d_model]; dims.d_ffn],       // W_down
             w3: Some(vec![vec![0i64; dims.d_ffn]; dims.d_model]), // W_up
         }
     }
@@ -188,21 +187,18 @@ pub fn plan_transformer_block(config: &TransformerBlockConfig) -> TransformerBlo
         }
         FFNConfig::SwiGLU => {
             let w1_muls = 2 * dims.d_model * dims.d_ffn; // W_gate + W_up
-            let w2_muls = dims.d_ffn * dims.d_model;      // W_down
+            let w2_muls = dims.d_ffn * dims.d_model; // W_down
             FFNPlan {
                 w1_muls,
                 activation_depth: 2, // SiLU depth
                 w2_muls,
                 element_wise_muls: dims.d_ffn, // element-wise product
-                total_depth: 1 + 2 + 1 + 1, // W_gate/W_up + SiLU + element_mul + W_down
+                total_depth: 1 + 2 + 1 + 1,    // W_gate/W_up + SiLU + element_mul + W_down
             }
         }
     };
 
-    let total_depth = pre_attn_norm.total_depth
-        + attention.total_depth
-        + pre_ffn_norm.total_depth
-        + ffn.total_depth;
+    let total_depth = pre_attn_norm.total_depth + attention.total_depth + pre_ffn_norm.total_depth + ffn.total_depth;
 
     let total_ct_pt_muls = attention.qkv_muls + attention.output_muls + ffn.w1_muls + ffn.w2_muls;
     let total_ct_ct_muls = attention.score_muls + attention.context_muls + ffn.element_wise_muls;
@@ -244,11 +240,7 @@ pub struct ForwardPassPlan {
 }
 
 /// Plans a complete model forward pass.
-pub fn plan_forward_pass(
-    config: &TransformerBlockConfig,
-    num_layers: usize,
-    params: &ChimeraParams,
-) -> ForwardPassPlan {
+pub fn plan_forward_pass(config: &TransformerBlockConfig, num_layers: usize, params: &ChimeraParams) -> ForwardPassPlan {
     let block_plan = plan_transformer_block(config);
     let total_depth = block_plan.total_depth * num_layers;
     let needs_bootstrapping = total_depth > params.max_depth;
@@ -270,10 +262,7 @@ pub fn plan_forward_pass(
 }
 
 /// Creates a default transformer block configuration for the given model.
-pub fn default_block_config(
-    dims: ModelDims,
-    params: ChimeraParams,
-) -> TransformerBlockConfig {
+pub fn default_block_config(dims: ModelDims, params: ChimeraParams) -> TransformerBlockConfig {
     TransformerBlockConfig {
         attention: AttentionConfig {
             dims: dims.clone(),
@@ -485,11 +474,7 @@ where
     // Phase 4: Down projection — y_i = Σ_j W_down[i][j] * h_j
     let mut outputs = Vec::with_capacity(weights.w2.len());
     for w2_row in &weights.w2 {
-        assert_eq!(
-            w2_row.len(),
-            h.len(),
-            "W_down row length must match hidden dimension (d_ffn)"
-        );
+        assert_eq!(w2_row.len(), h.len(), "W_down row length must match hidden dimension (d_ffn)");
         let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
         let dot = crate::arithmetic::chimera_dot_product(module, &h, &w2_vecs);
         outputs.push(dot);
@@ -515,9 +500,7 @@ where
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
     match config {
-        FFNConfig::Standard { activation } => {
-            chimera_ffn_standard(module, eval_key, x, weights, activation)
-        }
+        FFNConfig::Standard { activation } => chimera_ffn_standard(module, eval_key, x, weights, activation),
         FFNConfig::SwiGLU => chimera_ffn_swiglu(module, eval_key, x, weights),
     }
 }
@@ -530,23 +513,12 @@ where
 /// # Panics
 ///
 /// Panics if the vectors have different lengths.
-pub fn chimera_residual_add<BE: Backend>(
-    module: &Module<BE>,
-    a: &[GLWE<Vec<u8>>],
-    b: &[GLWE<Vec<u8>>],
-) -> Vec<GLWE<Vec<u8>>>
+pub fn chimera_residual_add<BE: Backend>(module: &Module<BE>, a: &[GLWE<Vec<u8>>], b: &[GLWE<Vec<u8>>]) -> Vec<GLWE<Vec<u8>>>
 where
     Module<BE>: GLWEAdd,
 {
-    assert_eq!(
-        a.len(),
-        b.len(),
-        "residual add: vectors must have the same length"
-    );
-    a.iter()
-        .zip(b.iter())
-        .map(|(ai, bi)| chimera_add(module, ai, bi))
-        .collect()
+    assert_eq!(a.len(), b.len(), "residual add: vectors must have the same length");
+    a.iter().zip(b.iter()).map(|(ai, bi)| chimera_add(module, ai, bi)).collect()
 }
 
 /// Weight matrices for a complete transformer block (attention + FFN).
@@ -708,12 +680,12 @@ where
             &weights.attention.w_v[0],
         );
         let score0 = chimera_attention_score(module, eval_key, &ct_q0, &ct_k0, 0);
-        let attn_wts0 = chimera_apply_softmax(
-            module, eval_key, &[score0], &config.attention.softmax_approx,
-        );
+        let attn_wts0 = chimera_apply_softmax(module, eval_key, &[score0], &config.attention.softmax_approx);
         let context0 = chimera_attention_context(module, eval_key, &attn_wts0, &[ct_v0]);
         let head_out_vec0 = chimera_output_project(module, &context0, &[weights.attention.w_o[0].clone()]);
-        let mut acc = head_out_vec0.into_iter().next()
+        let mut acc = head_out_vec0
+            .into_iter()
+            .next()
             .expect("output projection must produce at least one ciphertext");
 
         // Accumulate remaining heads
@@ -726,12 +698,12 @@ where
                 &weights.attention.w_v[h],
             );
             let score_h = chimera_attention_score(module, eval_key, &ct_q_h, &ct_k_h, 0);
-            let attn_wts_h = chimera_apply_softmax(
-                module, eval_key, &[score_h], &config.attention.softmax_approx,
-            );
+            let attn_wts_h = chimera_apply_softmax(module, eval_key, &[score_h], &config.attention.softmax_approx);
             let context_h = chimera_attention_context(module, eval_key, &attn_wts_h, &[ct_v_h]);
             let head_out_vec_h = chimera_output_project(module, &context_h, &[weights.attention.w_o[h].clone()]);
-            let head_out_h = head_out_vec_h.into_iter().next()
+            let head_out_h = head_out_vec_h
+                .into_iter()
+                .next()
                 .expect("output projection must produce at least one ciphertext");
 
             // The head outputs may be at different layouts after tensor products.
@@ -808,7 +780,10 @@ where
     // we take only the first output dimension.
     // -----------------------------------------------------------------------
     let ffn_out_vec = chimera_ffn(module, eval_key, &normed_pre_ffn, &weights.ffn, &config.ffn);
-    let ffn_out = ffn_out_vec.into_iter().next().expect("FFN must produce at least one output ciphertext");
+    let ffn_out = ffn_out_vec
+        .into_iter()
+        .next()
+        .expect("FFN must produce at least one output ciphertext");
 
     // -----------------------------------------------------------------------
     // Step 6: Residual connection (FFN)
@@ -950,10 +925,7 @@ where
         + poulpy_hal::api::ModuleN
         + poulpy_core::LWESampleExtract
         + poulpy_core::LWEKeySwitch<BE>
-        + poulpy_schemes::bin_fhe::blind_rotation::BlindRotationExecute<
-            poulpy_schemes::bin_fhe::blind_rotation::CGGI,
-            BE,
-        >
+        + poulpy_schemes::bin_fhe::blind_rotation::BlindRotationExecute<poulpy_schemes::bin_fhe::blind_rotation::CGGI, BE>
         + poulpy_schemes::bin_fhe::blind_rotation::LookupTableFactory,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
@@ -987,21 +959,12 @@ where
         if needs_bootstrap(&tracker, params, bootstrap_config) {
             let bsk = bsk_prepared.expect(
                 "chimera_forward_pass_with_bootstrap: bootstrapping triggered \
-                 but no bootstrap key provided (bsk_prepared is None)"
+                 but no bootstrap key provided (bsk_prepared is None)",
             );
 
             // Respect max_bootstraps_per_pass limit
-            if bootstrap_config.max_bootstraps_per_pass == 0
-                || bootstrap_count < bootstrap_config.max_bootstraps_per_pass
-            {
-                current = chimera_bootstrap(
-                    module,
-                    &current,
-                    &mut tracker,
-                    params,
-                    bsk,
-                    bootstrap_config,
-                );
+            if bootstrap_config.max_bootstraps_per_pass == 0 || bootstrap_count < bootstrap_config.max_bootstraps_per_pass {
+                current = chimera_bootstrap(module, &current, &mut tracker, params, bsk, bootstrap_config);
                 bootstrap_count += 1;
             }
             // If we've hit the limit, we continue without bootstrapping
@@ -1024,7 +987,7 @@ where
         // We model this as a sequence of ct*ct multiplications applied to
         // a fresh tracker (representing the "other operand" each time).
         let block_ct_ct_muls = match &config.ffn {
-            FFNConfig::SwiGLU => 8,    // 2 (norm) + 2 (attn) + 2 (norm) + 2 (silu + ew)
+            FFNConfig::SwiGLU => 8, // 2 (norm) + 2 (attn) + 2 (norm) + 2 (silu + ew)
             FFNConfig::Standard { activation } => {
                 6 + activation.depth() // 2 (norm) + 2 (attn) + 2 (norm) + activation
             }
@@ -1190,9 +1153,7 @@ where
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
     match config {
-        FFNConfig::Standard { activation } => {
-            chimera_ffn_standard_vec(module, eval_key, x_cts, weights, activation)
-        }
+        FFNConfig::Standard { activation } => chimera_ffn_standard_vec(module, eval_key, x_cts, weights, activation),
         FFNConfig::SwiGLU => chimera_ffn_swiglu_vec(module, eval_key, x_cts, weights),
     }
 }
@@ -1251,13 +1212,7 @@ where
     // chimera_multi_head_attention_vec takes Vec<GLWE> input (one per dim)
     // and returns Vec<GLWE> output (one per dim). It uses dot products
     // for QKV projection and output projection rather than ring products.
-    let attn_out = chimera_multi_head_attention_vec(
-        module,
-        eval_key,
-        &normed_pre_attn,
-        &weights.attention,
-        &config.attention,
-    );
+    let attn_out = chimera_multi_head_attention_vec(module, eval_key, &normed_pre_attn, &weights.attention, &config.attention);
 
     // Step 3: Residual connection (attention)
     let residual_1 = if config.residual {
@@ -1288,11 +1243,7 @@ where
 ///
 /// Used for residual connections in the vector pipeline. Handles the case
 /// where `a` and `b` may have different base2k/k after tensor products.
-fn project_and_add_vec<BE: Backend>(
-    module: &Module<BE>,
-    a: &[GLWE<Vec<u8>>],
-    b: &[GLWE<Vec<u8>>],
-) -> Vec<GLWE<Vec<u8>>>
+fn project_and_add_vec<BE: Backend>(module: &Module<BE>, a: &[GLWE<Vec<u8>>], b: &[GLWE<Vec<u8>>]) -> Vec<GLWE<Vec<u8>>>
 where
     Module<BE>: GLWEMulConst<BE> + GLWEAdd,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
@@ -1489,9 +1440,7 @@ mod tests {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [1u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [4u8; 32], [5u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [4u8; 32], [5u8; 32]);
 
         let vals: Vec<i8> = vec![3];
         let pt = encode_int8(&module, &params, &vals);
@@ -1503,13 +1452,7 @@ mod tests {
             w3: None,
         };
 
-        let result = chimera_ffn_standard(
-            &module,
-            &eval_key,
-            &ct,
-            &weights,
-            &ActivationChoice::SquaredReLU,
-        );
+        let result = chimera_ffn_standard(&module, &eval_key, &ct, &weights, &ActivationChoice::SquaredReLU);
         assert_eq!(result.len(), 1, "FFN should produce one output ciphertext");
     }
 
@@ -1531,18 +1474,16 @@ mod tests {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [1u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [4u8; 32], [5u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [4u8; 32], [5u8; 32]);
 
         let vals: Vec<i8> = vec![2];
         let pt = encode_int8(&module, &params, &vals);
         let ct = chimera_encrypt(&module, &key, &pt, [2u8; 32], [3u8; 32]);
 
         let weights = FFNWeights {
-            w1: vec![vec![1]],                       // W_gate
-            w2: vec![vec![1]],                       // W_down
-            w3: Some(vec![vec![1]]),                  // W_up
+            w1: vec![vec![1]],       // W_gate
+            w2: vec![vec![1]],       // W_down
+            w3: Some(vec![vec![1]]), // W_up
         };
 
         let result = chimera_ffn_swiglu(&module, &eval_key, &ct, &weights);
@@ -1559,9 +1500,7 @@ mod tests {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [1u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [4u8; 32], [5u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [4u8; 32], [5u8; 32]);
 
         let vals: Vec<i8> = vec![2];
         let pt = encode_int8(&module, &params, &vals);
@@ -1616,9 +1555,6 @@ mod tests {
         let pt_dec = chimera_decrypt(&module, &key, &result[0], &params);
         let decoded = decode_int8(&module, &params, &pt_dec, 1);
         let diff = (decoded[0] as i16 - 15).unsigned_abs();
-        assert!(
-            diff <= 1,
-            "residual_add: expected 15, got {}", decoded[0]
-        );
+        assert!(diff <= 1, "residual_add: expected 15, got {}", decoded[0]);
     }
 }

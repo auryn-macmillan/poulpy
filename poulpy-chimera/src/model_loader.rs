@@ -53,8 +53,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use safetensors::SafeTensors;
 use safetensors::tensor::Dtype;
+use safetensors::SafeTensors;
 
 use crate::attention::AttentionWeights;
 use crate::params::ModelDims;
@@ -76,10 +76,7 @@ pub enum ModelLoadError {
         actual: Vec<usize>,
     },
     /// Unsupported tensor dtype.
-    UnsupportedDtype {
-        tensor_name: String,
-        dtype: String,
-    },
+    UnsupportedDtype { tensor_name: String, dtype: String },
 }
 
 impl std::fmt::Display for ModelLoadError {
@@ -88,7 +85,11 @@ impl std::fmt::Display for ModelLoadError {
             ModelLoadError::Io(e) => write!(f, "I/O error: {e}"),
             ModelLoadError::SafeTensors(e) => write!(f, "safetensors error: {e}"),
             ModelLoadError::MissingTensor(name) => write!(f, "missing tensor: {name}"),
-            ModelLoadError::ShapeMismatch { tensor_name, expected, actual } => {
+            ModelLoadError::ShapeMismatch {
+                tensor_name,
+                expected,
+                actual,
+            } => {
                 write!(f, "shape mismatch for {tensor_name}: expected {expected:?}, got {actual:?}")
             }
             ModelLoadError::UnsupportedDtype { tensor_name, dtype } => {
@@ -172,6 +173,62 @@ pub struct LayerLoadResult {
     pub quant_info: HashMap<String, QuantInfo>,
 }
 
+impl LayerLoadResult {
+    /// Converts loader-oriented weights into the orientation expected by the
+    /// vector pipeline.
+    ///
+    /// The model loader returns attention weights in the standard loader
+    /// orientation and FFN weights in the same orientation used by the single-
+    /// ciphertext path. The vector pipeline expects FFN matrices with rows as
+    /// output dimensions:
+    /// - `w1`: `[d_ffn][d_model]`
+    /// - `w2`: `[d_model][d_ffn]`
+    /// - `w3`: `[d_ffn][d_model]` (if present)
+    pub fn into_vec_pipeline_weights(self) -> TransformerBlockWeights {
+        TransformerBlockWeights {
+            attention: self.weights.attention,
+            ffn: self.weights.ffn.into_vec_pipeline_weights(),
+            pre_attn_norm_gamma: self.weights.pre_attn_norm_gamma,
+            pre_ffn_norm_gamma: self.weights.pre_ffn_norm_gamma,
+        }
+    }
+}
+
+fn transpose_matrix(matrix: &[Vec<i64>]) -> Vec<Vec<i64>> {
+    if matrix.is_empty() {
+        return Vec::new();
+    }
+    let rows = matrix.len();
+    let cols = matrix[0].len();
+    let mut out = vec![vec![0i64; rows]; cols];
+    for (r, row) in matrix.iter().enumerate() {
+        assert_eq!(
+            row.len(),
+            cols,
+            "transpose_matrix: ragged input row {} has len {}, expected {}",
+            r,
+            row.len(),
+            cols,
+        );
+        for (c, &value) in row.iter().enumerate() {
+            out[c][r] = value;
+        }
+    }
+    out
+}
+
+impl FFNWeights {
+    /// Converts FFN weights from loader orientation into the orientation used
+    /// by the vector pipeline.
+    pub fn into_vec_pipeline_weights(self) -> FFNWeights {
+        FFNWeights {
+            w1: transpose_matrix(&self.w1),
+            w2: transpose_matrix(&self.w2),
+            w3: self.w3.map(|w3| transpose_matrix(&w3)),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Core tensor conversion functions
 // ---------------------------------------------------------------------------
@@ -181,9 +238,7 @@ pub struct LayerLoadResult {
 /// Handles INT8, FP16, BF16, and FP32 dtypes.
 fn tensor_to_f64(data: &[u8], dtype: Dtype) -> Result<Vec<f64>, String> {
     match dtype {
-        Dtype::I8 => {
-            Ok(data.iter().map(|&b| (b as i8) as f64).collect())
-        }
+        Dtype::I8 => Ok(data.iter().map(|&b| (b as i8) as f64).collect()),
         Dtype::F16 => {
             if data.len() % 2 != 0 {
                 return Err("F16 data length not a multiple of 2".to_string());
@@ -225,9 +280,7 @@ fn tensor_to_f64(data: &[u8], dtype: Dtype) -> Result<Vec<f64>, String> {
                 .collect();
             Ok(values)
         }
-        other => {
-            Err(format!("unsupported dtype: {other:?}"))
-        }
+        other => Err(format!("unsupported dtype: {other:?}")),
     }
 }
 
@@ -236,16 +289,16 @@ fn tensor_to_f64(data: &[u8], dtype: Dtype) -> Result<Vec<f64>, String> {
 ///
 /// Returns the quantized i64 values and the quantization info.
 fn quantize_to_int8(values: &[f64]) -> (Vec<i64>, QuantInfo) {
-    let abs_max = values
-        .iter()
-        .map(|v| v.abs())
-        .fold(0.0_f64, f64::max);
+    let abs_max = values.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
 
     if abs_max < 1e-30 {
         // All-zero tensor
         return (
             vec![0i64; values.len()],
-            QuantInfo { scale: 1.0, abs_max: 0.0 },
+            QuantInfo {
+                scale: 1.0,
+                abs_max: 0.0,
+            },
         );
     }
 
@@ -273,9 +326,9 @@ fn load_weight_matrix(
     expected_shape: [usize; 2],
     transpose: bool,
 ) -> Result<(Vec<Vec<i64>>, QuantInfo), ModelLoadError> {
-    let view = tensors.tensor(name).map_err(|_| {
-        ModelLoadError::MissingTensor(name.to_string())
-    })?;
+    let view = tensors
+        .tensor(name)
+        .map_err(|_| ModelLoadError::MissingTensor(name.to_string()))?;
 
     let shape = view.shape();
     if shape.len() != 2 {
@@ -313,7 +366,10 @@ fn load_weight_matrix(
     let flat_values = if dtype == Dtype::I8 {
         // INT8: direct conversion, no quantization needed
         let values: Vec<i64> = data.iter().map(|&b| (b as i8) as i64).collect();
-        let quant = QuantInfo { scale: 1.0, abs_max: 127.0 };
+        let quant = QuantInfo {
+            scale: 1.0,
+            abs_max: 127.0,
+        };
 
         // Reshape and optionally transpose
         let matrix = if transpose {
@@ -336,11 +392,9 @@ fn load_weight_matrix(
 
         return Ok((matrix, quant));
     } else {
-        tensor_to_f64(data, dtype).map_err(|e| {
-            ModelLoadError::UnsupportedDtype {
-                tensor_name: name.to_string(),
-                dtype: e,
-            }
+        tensor_to_f64(data, dtype).map_err(|e| ModelLoadError::UnsupportedDtype {
+            tensor_name: name.to_string(),
+            dtype: e,
         })?
     };
 
@@ -377,9 +431,9 @@ fn load_norm_weights(
     name: &str,
     expected_len: usize,
 ) -> Result<(Vec<i64>, QuantInfo), ModelLoadError> {
-    let view = tensors.tensor(name).map_err(|_| {
-        ModelLoadError::MissingTensor(name.to_string())
-    })?;
+    let view = tensors
+        .tensor(name)
+        .map_err(|_| ModelLoadError::MissingTensor(name.to_string()))?;
 
     let shape = view.shape();
     let total: usize = shape.iter().product();
@@ -396,14 +450,18 @@ fn load_norm_weights(
 
     if dtype == Dtype::I8 {
         let values: Vec<i64> = data.iter().map(|&b| (b as i8) as i64).collect();
-        return Ok((values, QuantInfo { scale: 1.0, abs_max: 127.0 }));
+        return Ok((
+            values,
+            QuantInfo {
+                scale: 1.0,
+                abs_max: 127.0,
+            },
+        ));
     }
 
-    let float_values = tensor_to_f64(data, dtype).map_err(|e| {
-        ModelLoadError::UnsupportedDtype {
-            tensor_name: name.to_string(),
-            dtype: e,
-        }
+    let float_values = tensor_to_f64(data, dtype).map_err(|e| ModelLoadError::UnsupportedDtype {
+        tensor_name: name.to_string(),
+        dtype: e,
     })?;
 
     let (quantized, quant) = quantize_to_int8(&float_values);
@@ -431,11 +489,7 @@ fn load_norm_weights(
 /// let tensors = safetensors::SafeTensors::deserialize(&data)?;
 /// let result = load_layer(&tensors, 0, &config)?;
 /// ```
-pub fn load_layer(
-    tensors: &SafeTensors<'_>,
-    layer_idx: usize,
-    config: &LoaderConfig,
-) -> Result<LayerLoadResult, ModelLoadError> {
+pub fn load_layer(tensors: &SafeTensors<'_>, layer_idx: usize, config: &LoaderConfig) -> Result<LayerLoadResult, ModelLoadError> {
     let d = config.dims.d_model;
     let d_kv = config.dims.d_kv();
     let d_ffn = config.dims.d_ffn;
@@ -450,40 +504,20 @@ pub fn load_layer(
     // K and V projections are [d_kv, d_model] where d_kv = n_kv_heads * d_head.
     // For standard MHA (n_kv_heads == n_heads), d_kv == d_model.
     // For GQA (n_kv_heads < n_heads), d_kv < d_model.
-    let (w_q, qi) = load_weight_matrix(
-        tensors,
-        &format!("{prefix}.{attn}.q_proj.weight"),
-        [d, d],
-        config.transpose,
-    )?;
+    let (w_q, qi) = load_weight_matrix(tensors, &format!("{prefix}.{attn}.q_proj.weight"), [d, d], config.transpose)?;
     quant_info.insert("w_q".to_string(), qi);
 
     // K projection: file has [d_kv, d_model] (PyTorch: out_features × in_features).
     // For GQA, d_kv < d_model so this is a non-square matrix.
     // We use transpose=false to load as [d_kv][d_model] directly.
     let kv_transpose = if d_kv == d { config.transpose } else { false };
-    let (w_k, qi) = load_weight_matrix(
-        tensors,
-        &format!("{prefix}.{attn}.k_proj.weight"),
-        [d_kv, d],
-        kv_transpose,
-    )?;
+    let (w_k, qi) = load_weight_matrix(tensors, &format!("{prefix}.{attn}.k_proj.weight"), [d_kv, d], kv_transpose)?;
     quant_info.insert("w_k".to_string(), qi);
 
-    let (w_v, qi) = load_weight_matrix(
-        tensors,
-        &format!("{prefix}.{attn}.v_proj.weight"),
-        [d_kv, d],
-        kv_transpose,
-    )?;
+    let (w_v, qi) = load_weight_matrix(tensors, &format!("{prefix}.{attn}.v_proj.weight"), [d_kv, d], kv_transpose)?;
     quant_info.insert("w_v".to_string(), qi);
 
-    let (w_o, qi) = load_weight_matrix(
-        tensors,
-        &format!("{prefix}.{attn}.o_proj.weight"),
-        [d, d],
-        config.transpose,
-    )?;
+    let (w_o, qi) = load_weight_matrix(tensors, &format!("{prefix}.{attn}.o_proj.weight"), [d, d], config.transpose)?;
     quant_info.insert("w_o".to_string(), qi);
 
     let attention = AttentionWeights { w_q, w_k, w_v, w_o };
@@ -531,27 +565,19 @@ pub fn load_layer(
     };
 
     // ----- Norm weights (optional — may not exist for all models) -----
-    let pre_attn_norm_gamma = load_norm_weights(
-        tensors,
-        &format!("{prefix}.input_layernorm.weight"),
-        d,
-    )
-    .ok()
-    .map(|(gamma, qi)| {
-        quant_info.insert("pre_attn_norm_gamma".to_string(), qi);
-        gamma
-    });
+    let pre_attn_norm_gamma = load_norm_weights(tensors, &format!("{prefix}.input_layernorm.weight"), d)
+        .ok()
+        .map(|(gamma, qi)| {
+            quant_info.insert("pre_attn_norm_gamma".to_string(), qi);
+            gamma
+        });
 
-    let pre_ffn_norm_gamma = load_norm_weights(
-        tensors,
-        &format!("{prefix}.post_attention_layernorm.weight"),
-        d,
-    )
-    .ok()
-    .map(|(gamma, qi)| {
-        quant_info.insert("pre_ffn_norm_gamma".to_string(), qi);
-        gamma
-    });
+    let pre_ffn_norm_gamma = load_norm_weights(tensors, &format!("{prefix}.post_attention_layernorm.weight"), d)
+        .ok()
+        .map(|(gamma, qi)| {
+            quant_info.insert("pre_ffn_norm_gamma".to_string(), qi);
+            gamma
+        });
 
     let weights = TransformerBlockWeights {
         attention,
@@ -566,10 +592,7 @@ pub fn load_layer(
 /// Loads all transformer layers from a single safetensors file.
 ///
 /// Returns one [`LayerLoadResult`] per layer, in layer order.
-pub fn load_all_layers(
-    tensors: &SafeTensors<'_>,
-    config: &LoaderConfig,
-) -> Result<Vec<LayerLoadResult>, ModelLoadError> {
+pub fn load_all_layers(tensors: &SafeTensors<'_>, config: &LoaderConfig) -> Result<Vec<LayerLoadResult>, ModelLoadError> {
     let mut results = Vec::with_capacity(config.dims.n_layers);
     for i in 0..config.dims.n_layers {
         let result = load_layer(tensors, i, config)?;
@@ -594,14 +617,10 @@ pub fn load_all_layers(
 /// let layers = load_model_from_file("model.safetensors", &config)?;
 /// println!("Loaded {} layers", layers.len());
 /// ```
-pub fn load_model_from_file<P: AsRef<Path>>(
-    path: P,
-    config: &LoaderConfig,
-) -> Result<Vec<LayerLoadResult>, ModelLoadError> {
+pub fn load_model_from_file<P: AsRef<Path>>(path: P, config: &LoaderConfig) -> Result<Vec<LayerLoadResult>, ModelLoadError> {
     let file = std::fs::File::open(path.as_ref())?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let tensors = SafeTensors::deserialize(&mmap)
-        .map_err(|e| ModelLoadError::SafeTensors(e.to_string()))?;
+    let tensors = SafeTensors::deserialize(&mmap).map_err(|e| ModelLoadError::SafeTensors(e.to_string()))?;
     load_all_layers(&tensors, config)
 }
 
@@ -613,8 +632,7 @@ pub fn load_layer_from_file<P: AsRef<Path>>(
 ) -> Result<LayerLoadResult, ModelLoadError> {
     let file = std::fs::File::open(path.as_ref())?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let tensors = SafeTensors::deserialize(&mmap)
-        .map_err(|e| ModelLoadError::SafeTensors(e.to_string()))?;
+    let tensors = SafeTensors::deserialize(&mmap).map_err(|e| ModelLoadError::SafeTensors(e.to_string()))?;
     load_layer(&tensors, layer_idx, config)
 }
 
@@ -622,21 +640,14 @@ pub fn load_layer_from_file<P: AsRef<Path>>(
 ///
 /// Useful for debugging and verifying that the naming convention matches
 /// the expected format.
-pub fn inspect_model<P: AsRef<Path>>(
-    path: P,
-) -> Result<Vec<(String, Vec<usize>, String)>, ModelLoadError> {
+pub fn inspect_model<P: AsRef<Path>>(path: P) -> Result<Vec<(String, Vec<usize>, String)>, ModelLoadError> {
     let file = std::fs::File::open(path.as_ref())?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let tensors = SafeTensors::deserialize(&mmap)
-        .map_err(|e| ModelLoadError::SafeTensors(e.to_string()))?;
+    let tensors = SafeTensors::deserialize(&mmap).map_err(|e| ModelLoadError::SafeTensors(e.to_string()))?;
 
     let mut info = Vec::new();
     for (name, view) in tensors.tensors() {
-        info.push((
-            name.to_string(),
-            view.shape().to_vec(),
-            format!("{:?}", view.dtype()),
-        ));
+        info.push((name.to_string(), view.shape().to_vec(), format!("{:?}", view.dtype())));
     }
     info.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(info)
@@ -753,9 +764,9 @@ pub fn load_embedding_table(
     embed_name: &str,
     d_model: usize,
 ) -> Result<EmbeddingTable, ModelLoadError> {
-    let view = tensors.tensor(embed_name).map_err(|_| {
-        ModelLoadError::MissingTensor(embed_name.to_string())
-    })?;
+    let view = tensors
+        .tensor(embed_name)
+        .map_err(|_| ModelLoadError::MissingTensor(embed_name.to_string()))?;
 
     let shape = view.shape();
     if shape.len() != 2 || shape[1] != d_model {
@@ -772,13 +783,17 @@ pub fn load_embedding_table(
 
     let (flat_quantized, quant_info) = if dtype == Dtype::I8 {
         let values: Vec<i64> = data.iter().map(|&b| (b as i8) as i64).collect();
-        (values, QuantInfo { scale: 1.0, abs_max: 127.0 })
+        (
+            values,
+            QuantInfo {
+                scale: 1.0,
+                abs_max: 127.0,
+            },
+        )
     } else {
-        let float_values = tensor_to_f64(data, dtype).map_err(|e| {
-            ModelLoadError::UnsupportedDtype {
-                tensor_name: embed_name.to_string(),
-                dtype: e,
-            }
+        let float_values = tensor_to_f64(data, dtype).map_err(|e| ModelLoadError::UnsupportedDtype {
+            tensor_name: embed_name.to_string(),
+            dtype: e,
         })?;
         let (quantized, qi) = quantize_to_int8(&float_values);
         (quantized, qi)
@@ -808,8 +823,7 @@ pub fn load_embedding_from_file<P: AsRef<Path>>(
 ) -> Result<EmbeddingTable, ModelLoadError> {
     let file = std::fs::File::open(path.as_ref())?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let tensors = SafeTensors::deserialize(&mmap)
-        .map_err(|e| ModelLoadError::SafeTensors(e.to_string()))?;
+    let tensors = SafeTensors::deserialize(&mmap).map_err(|e| ModelLoadError::SafeTensors(e.to_string()))?;
     load_embedding_table(&tensors, embed_name, d_model)
 }
 
@@ -852,9 +866,7 @@ impl LMHead {
         );
         self.weights
             .iter()
-            .map(|w_row| {
-                w_row.iter().zip(hidden.iter()).map(|(&w, &h)| w * h).sum()
-            })
+            .map(|w_row| w_row.iter().zip(hidden.iter()).map(|(&w, &h)| w * h).sum())
             .collect()
     }
 
@@ -877,14 +889,10 @@ impl LMHead {
 ///
 /// In many LLaMA-family models, the LM head shares weights with the
 /// embedding table. In that case, pass the embedding tensor name instead.
-pub fn load_lm_head(
-    tensors: &SafeTensors<'_>,
-    head_name: &str,
-    d_model: usize,
-) -> Result<LMHead, ModelLoadError> {
-    let view = tensors.tensor(head_name).map_err(|_| {
-        ModelLoadError::MissingTensor(head_name.to_string())
-    })?;
+pub fn load_lm_head(tensors: &SafeTensors<'_>, head_name: &str, d_model: usize) -> Result<LMHead, ModelLoadError> {
+    let view = tensors
+        .tensor(head_name)
+        .map_err(|_| ModelLoadError::MissingTensor(head_name.to_string()))?;
 
     let shape = view.shape();
     if shape.len() != 2 || shape[1] != d_model {
@@ -901,13 +909,17 @@ pub fn load_lm_head(
 
     let (flat_quantized, quant_info) = if dtype == Dtype::I8 {
         let values: Vec<i64> = data.iter().map(|&b| (b as i8) as i64).collect();
-        (values, QuantInfo { scale: 1.0, abs_max: 127.0 })
+        (
+            values,
+            QuantInfo {
+                scale: 1.0,
+                abs_max: 127.0,
+            },
+        )
     } else {
-        let float_values = tensor_to_f64(data, dtype).map_err(|e| {
-            ModelLoadError::UnsupportedDtype {
-                tensor_name: head_name.to_string(),
-                dtype: e,
-            }
+        let float_values = tensor_to_f64(data, dtype).map_err(|e| ModelLoadError::UnsupportedDtype {
+            tensor_name: head_name.to_string(),
+            dtype: e,
         })?;
         let (quantized, qi) = quantize_to_int8(&float_values);
         (quantized, qi)
@@ -929,15 +941,10 @@ pub fn load_lm_head(
 }
 
 /// Loads the LM head from a safetensors file on disk.
-pub fn load_lm_head_from_file<P: AsRef<Path>>(
-    path: P,
-    head_name: &str,
-    d_model: usize,
-) -> Result<LMHead, ModelLoadError> {
+pub fn load_lm_head_from_file<P: AsRef<Path>>(path: P, head_name: &str, d_model: usize) -> Result<LMHead, ModelLoadError> {
     let file = std::fs::File::open(path.as_ref())?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    let tensors = SafeTensors::deserialize(&mmap)
-        .map_err(|e| ModelLoadError::SafeTensors(e.to_string()))?;
+    let tensors = SafeTensors::deserialize(&mmap).map_err(|e| ModelLoadError::SafeTensors(e.to_string()))?;
     load_lm_head(&tensors, head_name, d_model)
 }
 
@@ -972,11 +979,7 @@ mod tests {
         let data: Vec<u8> = vec![1u8, 2, 3, 4, 5, 6];
         tensors.insert(
             "test_weight".to_string(),
-            safetensors::tensor::TensorView::new(
-                Dtype::I8,
-                vec![2, 3],
-                &data,
-            ).unwrap(),
+            safetensors::tensor::TensorView::new(Dtype::I8, vec![2, 3], &data).unwrap(),
         );
 
         serialize(&tensors, &None).unwrap()
@@ -998,11 +1001,7 @@ mod tests {
         }
         tensors.insert(
             "test_weight".to_string(),
-            safetensors::tensor::TensorView::new(
-                Dtype::F16,
-                vec![2, 2],
-                &data,
-            ).unwrap(),
+            safetensors::tensor::TensorView::new(Dtype::F16, vec![2, 2], &data).unwrap(),
         );
 
         serialize(&tensors, &None).unwrap()
@@ -1052,9 +1051,9 @@ mod tests {
         assert!((quant.abs_max - 1.0).abs() < 1e-10);
         assert!((quant.scale - 1.0 / 127.0).abs() < 1e-10);
         assert_eq!(quantized[0], 0);
-        assert_eq!(quantized[3], 127);  // 1.0 → 127
+        assert_eq!(quantized[3], 127); // 1.0 → 127
         assert_eq!(quantized[4], -127); // -1.0 → -127
-        // 0.5 → 0.5 / (1.0/127.0) = 63.5 → rounds to 64
+                                        // 0.5 → 0.5 / (1.0/127.0) = 63.5 → rounds to 64
         assert!((quantized[1] - 64).abs() <= 1);
     }
 
@@ -1073,12 +1072,7 @@ mod tests {
         let tensors = SafeTensors::deserialize(&buf).unwrap();
 
         // Load [2, 3] tensor without transpose, expecting [2, 3]
-        let (matrix, quant) = load_weight_matrix(
-            &tensors,
-            "test_weight",
-            [2, 3],
-            false,
-        ).unwrap();
+        let (matrix, quant) = load_weight_matrix(&tensors, "test_weight", [2, 3], false).unwrap();
 
         assert_eq!(matrix.len(), 2);
         assert_eq!(matrix[0].len(), 3);
@@ -1094,16 +1088,11 @@ mod tests {
 
         // File has [2, 3] (out=2, in=3). After transpose we want [3, 2].
         // Expected shape [3, 2] means file should be [2, 3] ✓
-        let (matrix, _quant) = load_weight_matrix(
-            &tensors,
-            "test_weight",
-            [3, 2],
-            true,
-        ).unwrap();
+        let (matrix, _quant) = load_weight_matrix(&tensors, "test_weight", [3, 2], true).unwrap();
 
         assert_eq!(matrix.len(), 3); // 3 rows (in_features)
         assert_eq!(matrix[0].len(), 2); // 2 cols (out_features)
-        // Transposed: col 0 of file = [1, 4], col 1 = [2, 5], col 2 = [3, 6]
+                                        // Transposed: col 0 of file = [1, 4], col 1 = [2, 5], col 2 = [3, 6]
         assert_eq!(matrix[0], vec![1, 4]);
         assert_eq!(matrix[1], vec![2, 5]);
         assert_eq!(matrix[2], vec![3, 6]);
@@ -1120,20 +1109,15 @@ mod tests {
         //  -0.5  → round(-0.5 / (2.0/127.0)) = round(-31.75) = -32
         //   0.25 → round(0.25 / (2.0/127.0)) = round(15.875) = 16
         //   2.0  → round(2.0 / (2.0/127.0)) = 127
-        let (matrix, quant) = load_weight_matrix(
-            &tensors,
-            "test_weight",
-            [2, 2],
-            false,
-        ).unwrap();
+        let (matrix, quant) = load_weight_matrix(&tensors, "test_weight", [2, 2], false).unwrap();
 
         assert_eq!(matrix.len(), 2);
         assert_eq!(matrix[0].len(), 2);
         assert!((quant.abs_max - 2.0).abs() < 0.01);
-        assert_eq!(matrix[0][0], 64);   // 1.0
-        assert_eq!(matrix[0][1], -32);  // -0.5
-        assert_eq!(matrix[1][0], 16);   // 0.25
-        assert_eq!(matrix[1][1], 127);  // 2.0
+        assert_eq!(matrix[0][0], 64); // 1.0
+        assert_eq!(matrix[0][1], -32); // -0.5
+        assert_eq!(matrix[1][0], 16); // 0.25
+        assert_eq!(matrix[1][1], 127); // 2.0
     }
 
     #[test]
@@ -1142,12 +1126,7 @@ mod tests {
         let tensors = SafeTensors::deserialize(&buf).unwrap();
 
         // Expect [4, 4] but file has [2, 3]
-        let result = load_weight_matrix(
-            &tensors,
-            "test_weight",
-            [4, 4],
-            false,
-        );
+        let result = load_weight_matrix(&tensors, "test_weight", [4, 4], false);
         assert!(result.is_err());
     }
 
@@ -1156,12 +1135,7 @@ mod tests {
         let buf = make_test_safetensors_int8();
         let tensors = SafeTensors::deserialize(&buf).unwrap();
 
-        let result = load_weight_matrix(
-            &tensors,
-            "nonexistent",
-            [2, 3],
-            false,
-        );
+        let result = load_weight_matrix(&tensors, "nonexistent", [2, 3], false);
         assert!(matches!(result, Err(ModelLoadError::MissingTensor(_))));
     }
 
@@ -1197,15 +1171,17 @@ mod tests {
             data
         };
 
-        let make_1d = |len: usize, base: i8| -> Vec<u8> {
-            (0..len).map(|i| (base.wrapping_add(i as i8)) as u8).collect()
-        };
+        let make_1d = |len: usize, base: i8| -> Vec<u8> { (0..len).map(|i| (base.wrapping_add(i as i8)) as u8).collect() };
 
         let prefix = "model.layers.0";
 
         // Pre-allocate all data buffers so they live long enough for TensorView borrows
-        let attn_names = ["self_attn.q_proj.weight", "self_attn.k_proj.weight",
-                          "self_attn.v_proj.weight", "self_attn.o_proj.weight"];
+        let attn_names = [
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+        ];
         let attn_data: Vec<Vec<u8>> = attn_names.iter().map(|_| make_2d(2, 2, 1)).collect();
 
         for (name, data) in attn_names.iter().zip(attn_data.iter()) {

@@ -101,9 +101,10 @@ single-server computation.
 4. **Verification**: User decrypts both the result ct_out and tag_out, and
    checks that tag_out = α · ct_out
 
-If the provider deviates from the prescribed circuit, the MAC check will
-fail with overwhelming probability (the adversary would need to find a
-consistent manipulation that preserves the MAC relation without knowing α).
+If the provider deviates from the prescribed linear circuit, the MAC check will
+fail with probability determined by the plaintext MAC domain and the alpha
+distribution used by the prototype. This is useful as a lightweight integrity
+check, but it is not equivalent to a large-field algebraic MAC.
 
 **Cost analysis**:
 
@@ -114,7 +115,7 @@ consistent manipulation that preserves the MAC relation without knowing α).
 | Communication        | 2x (send/receive tags alongside cts)|
 | Verification         | O(N) multiplications + comparison  |
 | Proof size           | 0 (implicit in the computation)    |
-| Soundness            | 1 - 1/q ≈ 1 - 2^(-54)            |
+| Prototype soundness  | Bounded by plaintext MAC domain   |
 
 **Verdict**: Practical. The provider's computation doubles (two parallel
 FHE evaluations with the same circuit), but this is linear overhead —
@@ -170,7 +171,7 @@ The most practical verification system for CHIMERA combines:
    (via TEE, reputation, or stake) that it is running the committed circuit
 
 This provides:
-- **Computation integrity**: MAC verification (cryptographic, 2^(-54) soundness)
+- **Computation integrity**: MAC verification for supported linear operations (prototype-strength, bounded by plaintext MAC domain)
 - **Model integrity**: Attestation (trust-based, with cryptographic commitment
   to the model hash)
 
@@ -178,15 +179,13 @@ This provides:
 
 ### 3.1 For CHIMERA v1 (Current Implementation)
 
-**No verification**. Document the trust model explicitly:
+**Prototype MAC verification for linear operations only**.
 
-> The user trusts that the inference provider correctly evaluates the
-> agreed-upon model on the encrypted input. The provider's computation
-> is not verified. The FHE encryption guarantees only data privacy
-> (confidentiality of input and output), not computation integrity.
-
-This is acceptable for initial deployment where the provider is a
-known, reputable entity.
+> The user can verify linear operations (addition, plaintext multiplication,
+> dot products, matrix-vector products) using MAC tags in the plaintext MAC
+> domain. Nonlinear operations (ciphertext-ciphertext multiplication, softmax,
+> activations, layernorm) remain trusted. The FHE encryption guarantees data
+> privacy; integrity is partial and prototype-grade.
 
 ### 3.2 For CHIMERA v2 (Future Work)
 
@@ -226,9 +225,9 @@ but is feasible with existing ZK proof systems.
 |---------------------|------------|-------------|------------|------------|------------|
 | Full zkSNARK        | 2^(-128)   | 10-100 hours| ~10 ms     | ~300 B     | No         |
 | Commit-and-prove    | 2^(-128)   | 1-10 hours  | ~100 ms    | ~1.5 KB    | Marginal   |
-| MAC-based           | 2^(-54)    | 2x          | ~1 μs      | 0          | Yes        |
+| MAC-based           | Prototype-domain | 2x    | ~1 μs      | 0          | Yes        |
 | Probabilistic check | 1-(1-p)^m  | ~1x         | k inferences| 0         | Limited*   |
-| Hybrid MAC+attest   | 2^(-54)+trust| 2x        | ~1 μs      | 0          | Yes        |
+| Hybrid MAC+attest   | Prototype-domain + trust | 2x | ~1 μs | 0 | Yes |
 
 *Limited for batch size 1 (the target workload).
 
@@ -257,9 +256,9 @@ but is feasible with existing ZK proof systems.
 | Property                    | Status          | Notes                        |
 |-----------------------------|-----------------|------------------------------|
 | Data privacy (input/output) | Guaranteed      | RLWE IND-CPA security        |
-| Computation integrity       | Not verified    | Trust-based in v1            |
-| Model integrity             | Not verified    | Trust-based in v1            |
-| Recommended v2 approach     | MAC-based       | 2x overhead, 2^(-54) soundness|
+| Computation integrity       | Partially verified | Linear ops only, prototype MAC domain |
+| Model integrity             | Not verified    | Trust-based / out of scope   |
+| Recommended next step       | Stronger MAC domain | Larger plaintext domain or richer tagging |
 | Aspirational v3             | MAC + ZK model  | ~50 KB proof, ~5 sec verify  |
 | User-side verification cost | ~1 μs (MAC)     | Practical on any device      |
 | Provider-side overhead      | 2x (MAC)        | Acceptable for inference     |

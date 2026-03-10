@@ -6,24 +6,23 @@
 
 use std::collections::HashMap;
 
+use poulpy_core::ScratchTakeCore;
 use poulpy_core::{
-    GLWEAutomorphismKeyEncryptSk, GLWEEncryptSk, GLWETensorKeyEncryptSk, GLWETrace,
     layouts::{
-        Dsize, GLWE, GLWEAutomorphismKey, GLWEAutomorphismKeyLayout, GLWELayout, GLWEPlaintext,
-        GLWESecret, GLWESecretTensorFactory, GLWETensorKey, GLWETensorKeyLayout, LWEInfos,
         prepared::{
-            GLWEAutomorphismKeyPrepared, GLWEAutomorphismKeyPreparedFactory,
-            GLWESecretPrepared, GLWESecretPreparedFactory,
+            GLWEAutomorphismKeyPrepared, GLWEAutomorphismKeyPreparedFactory, GLWESecretPrepared, GLWESecretPreparedFactory,
             GLWETensorKeyPrepared, GLWETensorKeyPreparedFactory,
         },
+        Dsize, GLWEAutomorphismKey, GLWEAutomorphismKeyLayout, GLWELayout, GLWEPlaintext, GLWESecret, GLWESecretTensorFactory,
+        GLWETensorKey, GLWETensorKeyLayout, LWEInfos, GLWE,
     },
+    GLWEAutomorphismKeyEncryptSk, GLWEEncryptSk, GLWETensorKeyEncryptSk, GLWETrace,
 };
 use poulpy_hal::{
     api::{ModuleN, ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
     layouts::{Backend, Module, Scratch, ScratchOwned},
     source::Source,
 };
-use poulpy_core::ScratchTakeCore;
 
 use crate::params::ChimeraParams;
 
@@ -116,7 +115,6 @@ pub struct ChimeraEvalKey<BE: Backend> {
     pub res_offset: usize,
 
     // --- Level-2 tensor key (for chained tensor products) ---
-
     /// Prepared level-2 tensor key for operations on post-tensor-product ciphertexts.
     /// Accepts inputs at `out_base2k` and produces outputs at `out_base2k - 1`.
     /// `None` if chained tensor products are not needed.
@@ -203,13 +201,7 @@ where
 
         let encrypt_bytes = GLWETensorKey::encrypt_sk_tmp_bytes(module, &tsk_layout);
         let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(encrypt_bytes);
-        tsk.encrypt_sk(
-            module,
-            &key.secret,
-            &mut source_xa,
-            &mut source_xe,
-            scratch.borrow(),
-        );
+        tsk.encrypt_sk(module, &key.secret, &mut source_xa, &mut source_xe, scratch.borrow());
 
         let mut tsk_prep = GLWETensorKeyPrepared::<Vec<u8>, BE>::alloc_from_infos(module, &tsk_layout);
         let prep_bytes = tsk_prep.prepare_tmp_bytes(module, &tsk_layout);
@@ -252,13 +244,7 @@ where
         let mut tsk_l2 = GLWETensorKey::<Vec<u8>>::alloc_from_infos(&tsk_l2_layout);
         let l2_encrypt_bytes = GLWETensorKey::encrypt_sk_tmp_bytes(module, &tsk_l2_layout);
         let mut l2_scratch: ScratchOwned<BE> = ScratchOwned::alloc(l2_encrypt_bytes);
-        tsk_l2.encrypt_sk(
-            module,
-            &key.secret,
-            &mut source_xa,
-            &mut source_xe,
-            l2_scratch.borrow(),
-        );
+        tsk_l2.encrypt_sk(module, &key.secret, &mut source_xa, &mut source_xe, l2_scratch.borrow());
 
         let mut tsk_l2_prep = GLWETensorKeyPrepared::<Vec<u8>, BE>::alloc_from_infos(module, &tsk_l2_layout);
         let l2_prep_bytes = tsk_l2_prep.prepare_tmp_bytes(module, &tsk_l2_layout);
@@ -366,11 +352,9 @@ where
         let mut source_xa = Source::new(seed_a);
         let mut source_xe = Source::new(seed_e);
 
-        let auto_encrypt_bytes =
-            GLWEAutomorphismKey::encrypt_sk_tmp_bytes(module, &self.auto_key_layout);
+        let auto_encrypt_bytes = GLWEAutomorphismKey::encrypt_sk_tmp_bytes(module, &self.auto_key_layout);
         let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(auto_encrypt_bytes);
-        let mut tmp_key =
-            GLWEAutomorphismKey::<Vec<u8>>::alloc_from_infos(&self.auto_key_layout);
+        let mut tmp_key = GLWEAutomorphismKey::<Vec<u8>>::alloc_from_infos(&self.auto_key_layout);
 
         for &pos in rotation_positions {
             let gal_el = module.galois_element(pos);
@@ -380,19 +364,8 @@ where
                 continue;
             }
 
-            tmp_key.encrypt_sk(
-                module,
-                gal_el,
-                &key.secret,
-                &mut source_xa,
-                &mut source_xe,
-                scratch.borrow(),
-            );
-            let mut atk_prepared =
-                GLWEAutomorphismKeyPrepared::<Vec<u8>, BE>::alloc_from_infos(
-                    module,
-                    &tmp_key,
-                );
+            tmp_key.encrypt_sk(module, gal_el, &key.secret, &mut source_xa, &mut source_xe, scratch.borrow());
+            let mut atk_prepared = GLWEAutomorphismKeyPrepared::<Vec<u8>, BE>::alloc_from_infos(module, &tmp_key);
             atk_prepared.prepare(module, &tmp_key, scratch.borrow());
             self.auto_keys.insert(gal_el, atk_prepared);
         }
@@ -427,17 +400,9 @@ where
     let mut source_xa = Source::new(seed_a);
     let mut source_xe = Source::new(seed_e);
 
-    let mut scratch: ScratchOwned<BE> =
-        ScratchOwned::alloc(GLWE::encrypt_sk_tmp_bytes(module, &key.layout));
+    let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(GLWE::encrypt_sk_tmp_bytes(module, &key.layout));
 
-    ct.encrypt_sk(
-        module,
-        pt,
-        &key.prepared,
-        &mut source_xa,
-        &mut source_xe,
-        scratch.borrow(),
-    );
+    ct.encrypt_sk(module, pt, &key.prepared, &mut source_xa, &mut source_xe, scratch.borrow());
 
     ct
 }
@@ -486,8 +451,7 @@ where
         k: ct.k(),
         rank: key.layout.rank,
     };
-    let mut scratch: ScratchOwned<BE> =
-        ScratchOwned::alloc(GLWE::decrypt_tmp_bytes(module, &ct_layout));
+    let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(GLWE::decrypt_tmp_bytes(module, &ct_layout));
 
     ct.decrypt(module, &mut pt, &key.prepared, scratch.borrow());
 
@@ -524,10 +488,7 @@ mod tests {
         // Allow small error from encryption noise
         for (v, d) in values.iter().zip(decoded.iter()) {
             let diff = (*v as i16 - *d as i16).unsigned_abs();
-            assert!(
-                diff <= 1,
-                "encrypt/decrypt error too large: {v} vs {d}"
-            );
+            assert!(diff <= 1, "encrypt/decrypt error too large: {v} vs {d}");
         }
     }
 }

@@ -50,21 +50,12 @@ impl NonlinearLUT {
     /// * `lo`, `hi` - Input range.
     /// * `num_entries` - Number of table entries (should be power of 2).
     /// * `output_bits` - Precision bits for output encoding.
-    pub fn from_fn(
-        name: &str,
-        f: impl Fn(f64) -> f64,
-        lo: f64,
-        hi: f64,
-        num_entries: usize,
-        output_bits: u32,
-    ) -> Self {
+    pub fn from_fn(name: &str, f: impl Fn(f64) -> f64, lo: f64, hi: f64, num_entries: usize, output_bits: u32) -> Self {
         assert!(num_entries > 0);
         assert!(hi > lo);
 
         let step = (hi - lo) / num_entries as f64;
-        let entries: Vec<f64> = (0..num_entries)
-            .map(|i| f(lo + (i as f64 + 0.5) * step))
-            .collect();
+        let entries: Vec<f64> = (0..num_entries).map(|i| f(lo + (i as f64 + 0.5) * step)).collect();
 
         NonlinearLUT {
             name: name.to_string(),
@@ -94,14 +85,7 @@ impl NonlinearLUT {
 
     /// Creates a SiLU/Swish LUT for the range [-8, 8] with 256 entries.
     pub fn silu(output_bits: u32) -> Self {
-        Self::from_fn(
-            "silu",
-            |x| x / (1.0 + (-x).exp()),
-            -8.0,
-            8.0,
-            256,
-            output_bits,
-        )
+        Self::from_fn("silu", |x| x / (1.0 + (-x).exp()), -8.0, 8.0, 256, output_bits)
     }
 
     /// Creates an exp(x) LUT for the range [-8, 0] with 256 entries.
@@ -115,28 +99,14 @@ impl NonlinearLUT {
     ///
     /// Used for LayerNorm inverse square root.
     pub fn inv_sqrt(output_bits: u32) -> Self {
-        Self::from_fn(
-            "inv_sqrt",
-            |x| 1.0 / x.sqrt(),
-            0.01,
-            10.0,
-            256,
-            output_bits,
-        )
+        Self::from_fn("inv_sqrt", |x| 1.0 / x.sqrt(), 0.01, 10.0, 256, output_bits)
     }
 
     /// Creates a 1/x LUT for the range [0.01, 10] with 256 entries.
     ///
     /// Used for softmax normalisation.
     pub fn reciprocal(output_bits: u32) -> Self {
-        Self::from_fn(
-            "reciprocal",
-            |x| 1.0 / x,
-            0.01,
-            10.0,
-            256,
-            output_bits,
-        )
+        Self::from_fn("reciprocal", |x| 1.0 / x, 0.01, 10.0, 256, output_bits)
     }
 
     /// Evaluates the LUT at a given input by nearest-entry lookup.
@@ -236,36 +206,24 @@ mod tests {
         assert!((at_zero - 1.0).abs() < 0.1, "exp LUT(~0) = {at_zero}");
 
         let at_neg_one = lut.eval(-1.0);
-        assert!(
-            (at_neg_one - 0.3679).abs() < 0.05,
-            "exp LUT(-1) = {at_neg_one}"
-        );
+        assert!((at_neg_one - 0.3679).abs() < 0.05, "exp LUT(-1) = {at_neg_one}");
     }
 
     #[test]
     fn test_inv_sqrt_lut() {
         let lut = NonlinearLUT::inv_sqrt(8);
         let at_one = lut.eval(1.0);
-        assert!(
-            (at_one - 1.0).abs() < 0.1,
-            "inv_sqrt LUT(1) = {at_one}"
-        );
+        assert!((at_one - 1.0).abs() < 0.1, "inv_sqrt LUT(1) = {at_one}");
 
         let at_four = lut.eval(4.0);
-        assert!(
-            (at_four - 0.5).abs() < 0.1,
-            "inv_sqrt LUT(4) = {at_four}"
-        );
+        assert!((at_four - 0.5).abs() < 0.1, "inv_sqrt LUT(4) = {at_four}");
     }
 
     #[test]
     fn test_reciprocal_lut() {
         let lut = NonlinearLUT::reciprocal(8);
         let at_one = lut.eval(1.0);
-        assert!(
-            (at_one - 1.0).abs() < 0.1,
-            "reciprocal LUT(1) = {at_one}"
-        );
+        assert!((at_one - 1.0).abs() < 0.1, "reciprocal LUT(1) = {at_one}");
     }
 
     #[test]
@@ -281,10 +239,7 @@ mod tests {
 
     #[test]
     fn test_lut_cost_estimate() {
-        let params = crate::params::ChimeraParams::new(
-            crate::params::SecurityLevel::Bits80,
-            crate::params::Precision::Int8,
-        );
+        let params = crate::params::ChimeraParams::new(crate::params::SecurityLevel::Bits80, crate::params::Precision::Int8);
         let lut = NonlinearLUT::gelu(8);
         let cost = lut_eval_cost(&params, &lut);
         assert!(cost > 0);

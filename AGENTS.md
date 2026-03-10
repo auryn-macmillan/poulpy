@@ -282,7 +282,7 @@ tensor products, automorphisms).
 | Deliverable | Location | Status |
 |-------------|----------|--------|
 | Scheme specification | `docs/chimera_spec.md` | ✅ Complete |
-| Reference implementation | `poulpy-chimera/src/` | ✅ Complete (15 modules) |
+| Reference implementation | `poulpy-chimera/src/` | ✅ Complete (16 modules) |
 | Benchmark harness | `poulpy-chimera/benches/chimera_ops.rs` | ✅ Complete |
 | Comparison report vs CKKS | `docs/chimera_comparison.md` | ✅ Complete (updated with measured multi-security-level data) |
 | Security analysis | `docs/chimera_security.md` | ✅ Complete (updated with measured benchmarks at 80/100/128-bit) |
@@ -299,7 +299,7 @@ tensor products, automorphisms).
 | `activations.rs` | Polynomial GELU/SiLU/SquaredReLU/inv_sqrt approximations, ct×ct multiply | ✅ |
 | `lut.rs` | LUT-based nonlinearity evaluation via blind rotation | ✅ |
 | `layernorm.rs` | Approximate RMSNorm/LayerNorm under FHE (with optional gamma/beta) | ✅ |
-| `attention.rs` | QKV projection, attention scores, softmax approximation, context, output | ✅ (single-head) |
+| `attention.rs` | QKV projection, attention scores, softmax approximation, context, output | ✅ |
 | `transformer.rs` | Full transformer block, forward pass, FFN (standard + SwiGLU) | ✅ |
 | `moe.rs` | MoE routing: homomorphic router, sign extraction, top-k, expert dispatch | ✅ |
 | `noise.rs` | Noise tracking and budget estimation | ✅ |
@@ -321,7 +321,7 @@ tensor products, automorphisms).
 
 ### What Works End-to-End
 
-1. Encrypt INT8 input → homomorphic transformer block → decrypt output (d_model=1 and d_model=4)
+1. Encrypt INT8 input → homomorphic transformer block → decrypt output (legacy single-ct path for small toy dims; vec path for real model layout)
 2. Multi-layer forward pass (2 layers chained, output of block 1 feeds block 2)
 3. Standard FFN and SwiGLU FFN at d_model=1 and d_model=2
 4. Bootstrapping roundtrip: encrypt value → bootstrap through identity LUT → recover original
@@ -354,13 +354,13 @@ tensor products, automorphisms).
 
 ### P2 — Advanced Features
 
-6. ~~**Homomorphic MoE routing**~~ ✅ Done
+6. ~~**Homomorphic MoE routing**~~ ✅ Prototype done
    - Router logit computation via `chimera_matmul_single_ct`
    - Sign extraction comparison using bootstrap with sign LUT
    - Conditional swap via ct×ct multiply for oblivious sorting
    - Partial bubble sort network for encrypted top-k selection
-   - Uniform gating weights (1/n_active)
-   - Full `chimera_moe_forward` combining routing + expert FFN evaluation
+   - Uniform gating weights over selected active experts
+   - `chimera_moe_forward` combines routing + expert FFN evaluation, but remains a prototype (all experts may still be evaluated for privacy)
 
 7. ~~**Security parameter sweep**~~ ✅ Done
    - Ran identical workload at 80-bit (N=4096), 100-bit (N=8192), 128-bit (N=16384)
@@ -376,7 +376,7 @@ tensor products, automorphisms).
      homomorphic operations (add, mul_const, dot product, matmul)
    - User verifies `tag ≡ α·result (mod 2^scale_bits)` after decryption
    - 11 tests: 3 key management, 6 honest computation (all exact match), 2 tamper detection
-   - Honest computations produce zero MAC error; tampered outputs detected with high probability
+   - Honest computations produce zero MAC error; tampered outputs detected with high probability within the prototype plaintext MAC domain
    - `docs/chimera_verification.md` updated with prototype implementation section
 
 ### Path to Real Model Inference

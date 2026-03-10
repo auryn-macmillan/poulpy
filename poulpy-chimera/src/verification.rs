@@ -45,7 +45,7 @@
 //!
 //! With MAC verification of linear operations:
 //! - **Verified**: All matrix-vector products use the correct weights on the
-//!   correct encrypted input (cryptographic guarantee, soundness 1 - 1/q)
+//!   correct encrypted input, modulo the prototype MAC domain
 //! - **Trusted**: Nonlinear operations (activations, softmax, layernorm) are
 //!   applied correctly (trust assumption)
 //! - **Trusted**: The model architecture matches the agreed-upon specification
@@ -59,12 +59,9 @@
 //! - **Communication overhead**: 2x (send/receive tags alongside ciphertexts)
 //! - **User-side verification cost**: O(N) integer multiplications + comparison
 //!   (~microseconds on any modern device)
-//! - **Soundness**: 1 - 1/q where q ≈ 2^(base2k * k_ct) ≈ 2^(14 * 113) ≈ 2^1582
+//! - **Prototype soundness**: bounded by the plaintext MAC domain, not the RLWE modulus
 
-use poulpy_core::{
-    GLWEAdd, GLWEMulConst,
-    layouts::GLWE,
-};
+use poulpy_core::{layouts::GLWE, GLWEAdd, GLWEMulConst};
 use poulpy_hal::{
     api::{ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
     layouts::{Backend, Module, Scratch, ScratchOwned},
@@ -84,9 +81,9 @@ use crate::params::ChimeraParams;
 /// # Security
 ///
 /// The MAC key is a single scalar in the plaintext space. For INT8 precision,
-/// the effective soundness is 1 - 1/|plaintext_space|. Using a larger alpha
-/// (sampled from a wider range) increases soundness at the cost of scaling up
-/// ciphertext values, which consumes more noise budget.
+/// detection is limited by the small modular plaintext domain and by the alpha
+/// range used by the prototype. This is useful as a lightweight integrity check,
+/// but it is not equivalent to a large-field MAC.
 ///
 /// For the prototype, alpha is sampled as a small odd integer in [3, 13] to
 /// avoid trivial factors (0, 1, 2) while keeping noise amplification bounded.
@@ -163,11 +160,7 @@ pub struct TaggedCiphertext<D: poulpy_hal::layouts::Data> {
 /// # Returns
 ///
 /// A tagged ciphertext containing both the original ct and the MAC tag.
-pub fn chimera_mac_tag<BE: Backend>(
-    module: &Module<BE>,
-    mac_key: &MacKey,
-    ct: &GLWE<Vec<u8>>,
-) -> TaggedCiphertext<Vec<u8>>
+pub fn chimera_mac_tag<BE: Backend>(module: &Module<BE>, mac_key: &MacKey, ct: &GLWE<Vec<u8>>) -> TaggedCiphertext<Vec<u8>>
 where
     Module<BE>: GLWEMulConst<BE>,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
@@ -189,10 +182,7 @@ where
     // Compute tag = alpha * ct
     let tag = chimera_mul_const(module, ct, &[mac_key.alpha]);
 
-    TaggedCiphertext {
-        ct: ct_clone,
-        tag,
-    }
+    TaggedCiphertext { ct: ct_clone, tag }
 }
 
 /// Tags a vector of ciphertexts with the MAC key.
@@ -309,10 +299,7 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchAvailable,
 {
-    weight_rows
-        .iter()
-        .map(|row| tagged_mul_const(module, tagged, row))
-        .collect()
+    weight_rows.iter().map(|row| tagged_mul_const(module, tagged, row)).collect()
 }
 
 // ---- User-side verification ----
@@ -347,6 +334,7 @@ where
     Module<BE>: poulpy_hal::api::ModuleN,
 {
     let n = module.n() as usize;
+    assert!(count <= n, "decode_raw_coeffs: count ({count}) exceeds ring degree ({n})");
     let shift = params.in_base2k() - params.scale_bits as usize;
 
     let raw: &[u8] = pt.data.data.as_ref();
@@ -372,7 +360,11 @@ fn plaintext_modulus(params: &ChimeraParams) -> i64 {
 fn signed_mod(val: i64, modulus: i64) -> i64 {
     let half = modulus / 2;
     let r = ((val % modulus) + modulus) % modulus;
-    if r >= half { r - modulus } else { r }
+    if r >= half {
+        r - modulus
+    } else {
+        r
+    }
 }
 
 /// Verifies a tagged ciphertext after the provider returns results.
@@ -416,6 +408,12 @@ where
 {
     use crate::encrypt::chimera_decrypt;
 
+    let ring_degree = module.n() as usize;
+    assert!(
+        n_slots <= ring_degree,
+        "chimera_mac_verify: n_slots ({n_slots}) exceeds ring degree ({ring_degree})"
+    );
+
     let pt_ct = chimera_decrypt(module, key, &tagged.ct, params);
     let pt_tag = chimera_decrypt(module, key, &tagged.tag, params);
 
@@ -444,11 +442,7 @@ where
         sum_err += err as f64;
     }
 
-    let mean_err = if n_slots > 0 {
-        sum_err / n_slots as f64
-    } else {
-        0.0
-    };
+    let mean_err = if n_slots > 0 { sum_err / n_slots as f64 } else { 0.0 };
 
     VerificationResult {
         passed: matching == n_slots,
@@ -478,6 +472,12 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: poulpy_core::ScratchTakeCore<BE>,
 {
+    let ring_degree = module.n() as usize;
+    assert!(
+        n_slots <= ring_degree,
+        "chimera_mac_verify_vec: n_slots ({n_slots}) exceeds ring degree ({ring_degree})"
+    );
+
     let mut total_matching = 0usize;
     let mut total_slots = 0usize;
     let mut global_max_err: i64 = 0;
@@ -563,9 +563,10 @@ mod tests {
         // Verify with tight tolerance (mul_const error is at most 4)
         let result = chimera_mac_verify(&module, &key, &params, &mac, &tagged, 5, 25);
 
-        eprintln!("MAC verify identity: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
-            result.passed, result.matching_slots, result.total_slots,
-            result.max_error, result.mean_error);
+        eprintln!(
+            "MAC verify identity: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
+            result.passed, result.matching_slots, result.total_slots, result.max_error, result.mean_error
+        );
 
         assert!(result.passed, "MAC verification should pass for unmodified tagged ct");
     }
@@ -596,9 +597,10 @@ mod tests {
         // User verifies
         let result = chimera_mac_verify(&module, &key, &params, &mac, &tagged_sum, 3, 25);
 
-        eprintln!("MAC verify add: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
-            result.passed, result.matching_slots, result.total_slots,
-            result.max_error, result.mean_error);
+        eprintln!(
+            "MAC verify add: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
+            result.passed, result.matching_slots, result.total_slots, result.max_error, result.mean_error
+        );
 
         assert!(result.passed, "MAC verification should pass through addition");
     }
@@ -623,9 +625,10 @@ mod tests {
         // User verifies
         let result = chimera_mac_verify(&module, &key, &params, &mac, &tagged_result, 3, 50);
 
-        eprintln!("MAC verify mul_const: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
-            result.passed, result.matching_slots, result.total_slots,
-            result.max_error, result.mean_error);
+        eprintln!(
+            "MAC verify mul_const: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
+            result.passed, result.matching_slots, result.total_slots, result.max_error, result.mean_error
+        );
 
         assert!(result.passed, "MAC verification should pass through mul_const");
     }
@@ -651,18 +654,15 @@ mod tests {
         let tagged_b = chimera_mac_tag(&module, &mac, &ct_b);
 
         // Provider computes dot product: 3*2 + 4*1 = 10
-        let tagged_result = tagged_dot_product(
-            &module,
-            &[tagged_a, tagged_b],
-            &[vec![2i64], vec![1i64]],
-        );
+        let tagged_result = tagged_dot_product(&module, &[tagged_a, tagged_b], &[vec![2i64], vec![1i64]]);
 
         // User verifies
         let result = chimera_mac_verify(&module, &key, &params, &mac, &tagged_result, 1, 50);
 
-        eprintln!("MAC verify dot_product: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
-            result.passed, result.matching_slots, result.total_slots,
-            result.max_error, result.mean_error);
+        eprintln!(
+            "MAC verify dot_product: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
+            result.passed, result.matching_slots, result.total_slots, result.max_error, result.mean_error
+        );
 
         assert!(result.passed, "MAC verification should pass through dot_product");
     }
@@ -691,16 +691,17 @@ mod tests {
         let tampered_ct = chimera_encrypt(&module, &key, &tampered_pt, [5u8; 32], [6u8; 32]);
 
         let tampered_tagged = TaggedCiphertext {
-            ct: tampered_ct,        // Provider substituted a different ct
+            ct: tampered_ct,         // Provider substituted a different ct
             tag: tagged.tag.clone(), // Tag is from the honest computation
         };
 
         // User verifies — should FAIL because decrypt(tag) != alpha * decrypt(ct)
         let result = chimera_mac_verify(&module, &key, &params, &mac, &tampered_tagged, 3, 25);
 
-        eprintln!("MAC verify tampered: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
-            result.passed, result.matching_slots, result.total_slots,
-            result.max_error, result.mean_error);
+        eprintln!(
+            "MAC verify tampered: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
+            result.passed, result.matching_slots, result.total_slots, result.max_error, result.mean_error
+        );
 
         assert!(!result.passed, "MAC verification should FAIL for tampered ciphertext");
     }
@@ -734,11 +735,15 @@ mod tests {
         // User verifies — should FAIL
         let result = chimera_mac_verify(&module, &key, &params, &mac, &mismatched, 3, 25);
 
-        eprintln!("MAC verify wrong weights: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
-            result.passed, result.matching_slots, result.total_slots,
-            result.max_error, result.mean_error);
+        eprintln!(
+            "MAC verify wrong weights: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
+            result.passed, result.matching_slots, result.total_slots, result.max_error, result.mean_error
+        );
 
-        assert!(!result.passed, "MAC verification should FAIL when provider uses wrong weights");
+        assert!(
+            !result.passed,
+            "MAC verification should FAIL when provider uses wrong weights"
+        );
     }
 
     #[test]
@@ -770,11 +775,28 @@ mod tests {
         // Verify the chain
         let result = chimera_mac_verify(&module, &key, &params, &mac, &step3, 3, 80);
 
-        eprintln!("MAC verify chain: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
-            result.passed, result.matching_slots, result.total_slots,
-            result.max_error, result.mean_error);
+        eprintln!(
+            "MAC verify chain: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
+            result.passed, result.matching_slots, result.total_slots, result.max_error, result.mean_error
+        );
 
         assert!(result.passed, "MAC verification should pass through chained linear ops");
+    }
+
+    #[test]
+    #[should_panic(expected = "n_slots")]
+    fn test_mac_verify_rejects_too_many_slots() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+        let mac = MacKey::new(5);
+
+        let values: Vec<i8> = vec![1, 2, 3];
+        let pt = encode_int8(&module, &params, &values);
+        let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+        let tagged = chimera_mac_tag(&module, &mac, &ct);
+
+        chimera_mac_verify(&module, &key, &params, &mac, &tagged, module.n() as usize + 1, 25);
     }
 
     #[test]
@@ -798,13 +820,12 @@ mod tests {
         assert_eq!(tagged_results.len(), 2);
 
         // Verify each output
-        let result = chimera_mac_verify_vec(
-            &module, &key, &params, &mac, &tagged_results, 2, 50,
-        );
+        let result = chimera_mac_verify_vec(&module, &key, &params, &mac, &tagged_results, 2, 50);
 
-        eprintln!("MAC verify matmul: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
-            result.passed, result.matching_slots, result.total_slots,
-            result.max_error, result.mean_error);
+        eprintln!(
+            "MAC verify matmul: passed={}, matching={}/{}, max_err={}, mean_err={:.2}",
+            result.passed, result.matching_slots, result.total_slots, result.max_error, result.mean_error
+        );
 
         assert!(result.passed, "MAC verification should pass through matmul");
     }

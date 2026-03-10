@@ -67,10 +67,7 @@ mod integration {
         let decoded = decode_int8(&module, &params, &pt_dec, values.len());
 
         for (i, &d) in decoded.iter().enumerate() {
-            assert!(
-                d.abs() <= 1,
-                "zero encryption error at {i}: got {d}"
-            );
+            assert!(d.abs() <= 1, "zero encryption error at {i}: got {d}");
         }
     }
 
@@ -165,11 +162,7 @@ mod integration {
              - Bootstraps: {}\n\
              - CT-PT muls: {}\n\
              - CT-CT muls: {}",
-            plan.total_depth,
-            plan.needs_bootstrapping,
-            plan.num_bootstraps,
-            plan.total_ct_pt_muls,
-            plan.total_ct_ct_muls,
+            plan.total_depth, plan.needs_bootstrapping, plan.num_bootstraps, plan.total_ct_pt_muls, plan.total_ct_ct_muls,
         );
     }
 
@@ -246,16 +239,12 @@ mod integration {
         // and glwe_tensor_relinearize, following the exact pattern from
         // poulpy-core's tensor test. This validates our parameter setup.
         use poulpy_core::{
-            GLWESub, GLWETensoring,
             layouts::{
-                Base2K, Degree, Dsize, GLWE, GLWELayout, GLWEPlaintext,
-                GLWESecret, GLWETensor, GLWETensorKey,
-                GLWETensorKeyLayout, LWEInfos, Rank, TorusPrecision,
-                prepared::{
-                    GLWESecretPrepared,
-                    GLWETensorKeyPrepared,
-                },
+                prepared::{GLWESecretPrepared, GLWETensorKeyPrepared},
+                Base2K, Degree, Dsize, GLWELayout, GLWEPlaintext, GLWESecret, GLWETensor, GLWETensorKey, GLWETensorKeyLayout,
+                LWEInfos, Rank, TorusPrecision, GLWE,
             },
+            GLWESub, GLWETensoring,
         };
         use poulpy_hal::{
             api::{ScratchOwnedAlloc, ScratchOwnedBorrow, VecZnxNormalize},
@@ -404,7 +393,9 @@ mod integration {
         assert!(
             diff <= 2,
             "direct tensor product error at coeff 0: have={}, want={}, diff={}",
-            decoded_have[0], decoded_want[0], diff
+            decoded_have[0],
+            decoded_want[0],
+            diff
         );
 
         // Now test via chimera_ct_mul wrapper
@@ -451,7 +442,9 @@ mod integration {
         assert!(
             diff2 <= 2,
             "chimera_ct_mul error at coeff 0: have={}, want={}, diff={}",
-            decoded2[0], decoded_want[0], diff2
+            decoded2[0],
+            decoded_want[0],
+            diff2
         );
     }
 
@@ -462,28 +455,16 @@ mod integration {
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
 
-        let eval_key = ChimeraEvalKey::generate(
-            &module,
-            &key,
-            &params,
-            [50u8; 32],
-            [60u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [50u8; 32], [60u8; 32]);
 
         // Output base2k should be params.base2k - 2
-        assert_eq!(
-            eval_key.output_layout.base2k.0 as usize,
-            params.base2k.0 as usize - 2,
-        );
+        assert_eq!(eval_key.output_layout.base2k.0 as usize, params.base2k.0 as usize - 2,);
 
         // res_offset should be 2 * in_base2k where in_base2k = base2k - 1
         assert_eq!(eval_key.res_offset, 2 * (params.base2k.0 as usize - 1));
 
         // Automorphism keys should be generated for trace (log2(N) keys)
-        assert!(
-            !eval_key.auto_keys.is_empty(),
-            "auto_keys should not be empty"
-        );
+        assert!(!eval_key.auto_keys.is_empty(), "auto_keys should not be empty");
     }
 
     /// End-to-end GELU FHE test: encrypt → apply_poly_activation with GELU
@@ -498,9 +479,9 @@ mod integration {
     fn test_apply_poly_activation_gelu() {
         use crate::activations::{activation_decode_precision, apply_poly_activation, gelu_poly_approx};
         use poulpy_core::layouts::{
-            Base2K, Degree, Dsize, GLWE, GLWELayout, GLWEPlaintext,
-            GLWESecret, GLWETensorKey, GLWETensorKeyLayout, Rank, TorusPrecision,
             prepared::{GLWESecretPrepared, GLWETensorKeyPrepared},
+            Base2K, Degree, Dsize, GLWELayout, GLWEPlaintext, GLWESecret, GLWETensorKey, GLWETensorKeyLayout, Rank,
+            TorusPrecision, GLWE,
         };
         use poulpy_hal::{
             api::{ScratchOwnedAlloc, ScratchOwnedBorrow},
@@ -627,7 +608,8 @@ mod integration {
         assert!(
             diff <= 3,
             "GELU_approx(4) should be ~6, got decoded[0]={}, diff={}",
-            decoded[0], diff
+            decoded[0],
+            diff
         );
     }
 
@@ -649,13 +631,7 @@ mod integration {
         let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
 
         // Also generate eval key to test that doesn't interfere
-        let _eval_key = ChimeraEvalKey::generate(
-            &module,
-            &key,
-            &params,
-            [50u8; 32],
-            [60u8; 32],
-        );
+        let _eval_key = ChimeraEvalKey::generate(&module, &key, &params, [50u8; 32], [60u8; 32]);
 
         // Encode and encrypt two vectors
         let a_vals: Vec<i8> = vec![10, -20, 30, -40, 50, 0, 127, -128];
@@ -681,7 +657,8 @@ mod integration {
             assert!(
                 diff <= 1,
                 "pipeline add error at {i}: expected {expected}, got {}, diff={}",
-                decoded[i], diff
+                decoded[i],
+                diff
             );
         }
     }
@@ -695,9 +672,7 @@ mod integration {
     #[test]
     fn test_full_pipeline_eval_key_ct_mul() {
         use crate::activations::chimera_ct_mul;
-        use poulpy_core::layouts::{
-            GLWE, GLWEPlaintext, GLWEPlaintextLayout, TorusPrecision,
-        };
+        use poulpy_core::layouts::{GLWEPlaintext, GLWEPlaintextLayout, TorusPrecision, GLWE};
         use poulpy_hal::{
             api::{ScratchOwnedAlloc, ScratchOwnedBorrow},
             layouts::ScratchOwned,
@@ -709,13 +684,7 @@ mod integration {
 
         // Generate keys using high-level API
         let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module,
-            &key,
-            &params,
-            [50u8; 32],
-            [60u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [50u8; 32], [60u8; 32]);
 
         // Encode using encode_vec_i64 at the tensor product scale
         // (this is the encoding that's compatible with decode_vec_i64
@@ -764,7 +733,8 @@ mod integration {
         assert!(
             diff <= 2,
             "pipeline ct_mul(3,3) should give ~9, got decoded[0]={}, diff={}",
-            decoded[0], diff
+            decoded[0],
+            diff
         );
     }
 
@@ -776,9 +746,9 @@ mod integration {
         // Uses the same low-level parameter setup as test_chimera_ct_mul_basic.
         use crate::activations::{activation_decode_precision, apply_poly_activation, squared_relu_approx};
         use poulpy_core::layouts::{
-            Base2K, Degree, Dsize, GLWE, GLWELayout, GLWEPlaintext,
-            GLWESecret, GLWETensorKey, GLWETensorKeyLayout, Rank, TorusPrecision,
             prepared::{GLWESecretPrepared, GLWETensorKeyPrepared},
+            Base2K, Degree, Dsize, GLWELayout, GLWEPlaintext, GLWESecret, GLWETensorKey, GLWETensorKeyLayout, Rank,
+            TorusPrecision, GLWE,
         };
         use poulpy_hal::{
             api::{ScratchOwnedAlloc, ScratchOwnedBorrow},
@@ -903,7 +873,37 @@ mod integration {
         assert!(
             diff <= 2,
             "squared ReLU(3) should be ~9, got decoded[0]={}, diff={}",
-            decoded[0], diff
+            decoded[0],
+            diff
+        );
+    }
+
+    #[test]
+    fn test_apply_poly_activation_exp_constant_term() {
+        use crate::activations::{activation_decode_precision, apply_poly_activation, exp_poly_approx};
+        use poulpy_core::layouts::{GLWEPlaintext, TorusPrecision};
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [55u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [56u8; 32], [57u8; 32]);
+
+        let scale = params.encoding_scale();
+        let mut pt = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&key.layout);
+        let zero_data = vec![0i64; module.n() as usize];
+        pt.encode_vec_i64(&zero_data, TorusPrecision(scale as u32));
+
+        let ct = chimera_encrypt(&module, &key, &pt, [58u8; 32], [59u8; 32]);
+        let ct_result = apply_poly_activation(&module, &eval_key, &ct, &exp_poly_approx());
+        let pt_dec = chimera_decrypt(&module, &key, &ct_result, &params);
+
+        let mut decoded = vec![0i64; module.n() as usize];
+        pt_dec.decode_vec_i64(&mut decoded, TorusPrecision(activation_decode_precision(scale) as u32));
+
+        assert!(
+            (decoded[0] - 1).abs() <= 1,
+            "exp polynomial at zero should preserve c0=1, got {}",
+            decoded[0]
         );
     }
 
@@ -1069,7 +1069,8 @@ mod integration {
             assert!(
                 diff <= 2,
                 "rescale_after_add error at {i}: expected {}, got {}, diff={diff}",
-                expected[i], decoded[i]
+                expected[i],
+                decoded[i]
             );
         }
     }
@@ -1180,12 +1181,12 @@ mod integration {
     fn test_mul_const_on_tensor_output() {
         use crate::activations::chimera_ct_mul;
         use poulpy_core::{
-            GLWEMulConst,
             layouts::{
-                Base2K, Degree, Dsize, GLWE, GLWELayout, GLWEPlaintext,
-                GLWESecret, GLWETensorKey, GLWETensorKeyLayout, Rank, TorusPrecision,
                 prepared::{GLWESecretPrepared, GLWETensorKeyPrepared},
+                Base2K, Degree, Dsize, GLWELayout, GLWEPlaintext, GLWESecret, GLWETensorKey, GLWETensorKeyLayout, Rank,
+                TorusPrecision, GLWE,
             },
+            GLWEMulConst,
         };
         use poulpy_hal::{
             api::{ScratchOwnedAlloc, ScratchOwnedBorrow},
@@ -1380,9 +1381,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [43u8; 32], [44u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [43u8; 32], [44u8; 32]);
 
         // Tiny model: d_model=1, d_ffn=1, 1 head, 1 layer
         let dims = ModelDims {
@@ -1460,9 +1459,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [60u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [61u8; 32], [62u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [61u8; 32], [62u8; 32]);
 
         let dims = ModelDims {
             d_model: 1,
@@ -1549,9 +1546,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [100u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [101u8; 32], [102u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [101u8; 32], [102u8; 32]);
 
         // d_model=4, d_ffn=4, 1 head with d_head=4
         let dims = ModelDims {
@@ -1623,9 +1618,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [130u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [131u8; 32], [132u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [131u8; 32], [132u8; 32]);
 
         // d_model=4, n_heads=2, d_head=2 (d_model = n_heads * d_head)
         let dims = ModelDims {
@@ -1704,10 +1697,7 @@ mod integration {
         let ct = chimera_encrypt(&module, &key, &pt, [121u8; 32], [122u8; 32]);
 
         // Weight rows: [[1,0,0,0], [0,1,0,0]] — identity-like rows
-        let weight_rows = vec![
-            vec![1i64, 0, 0, 0],
-            vec![0i64, 1, 0, 0],
-        ];
+        let weight_rows = vec![vec![1i64, 0, 0, 0], vec![0i64, 1, 0, 0]];
 
         let result = chimera_matmul_single_ct(&module, &ct, &weight_rows);
         assert_eq!(result.len(), 2, "matmul should produce 2 output ciphertexts");
@@ -1719,7 +1709,8 @@ mod integration {
         // First coefficient should be close to 1 (with some noise)
         assert!(
             (decoded[0] as i16 - 1).unsigned_abs() <= 2,
-            "first output coeff should be ~1, got {}", decoded[0]
+            "first output coeff should be ~1, got {}",
+            decoded[0]
         );
     }
 
@@ -1730,9 +1721,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [130u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [131u8; 32], [132u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [131u8; 32], [132u8; 32]);
 
         // Encrypt [2, 3]
         let vals: Vec<i8> = vec![2, 3];
@@ -1746,13 +1735,7 @@ mod integration {
             w3: None,
         };
 
-        let result = chimera_ffn_standard(
-            &module,
-            &eval_key,
-            &ct,
-            &weights,
-            &ActivationChoice::SquaredReLU,
-        );
+        let result = chimera_ffn_standard(&module, &eval_key, &ct, &weights, &ActivationChoice::SquaredReLU);
         assert_eq!(result.len(), 2, "FFN d2 should produce 2 output ciphertexts");
     }
 
@@ -1762,9 +1745,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [140u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [141u8; 32], [142u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [141u8; 32], [142u8; 32]);
 
         // Encrypt [4, 5]
         let vals: Vec<i8> = vec![4, 5];
@@ -1772,8 +1753,8 @@ mod integration {
         let ct = chimera_encrypt(&module, &key, &pt, [143u8; 32], [144u8; 32]);
 
         let weights = FFNWeights {
-            w1: vec![vec![1, 0], vec![0, 1]],    // W_gate
-            w2: vec![vec![1, 0], vec![0, 1]],    // W_down
+            w1: vec![vec![1, 0], vec![0, 1]],       // W_gate
+            w2: vec![vec![1, 0], vec![0, 1]],       // W_down
             w3: Some(vec![vec![1, 0], vec![0, 1]]), // W_up
         };
 
@@ -1790,9 +1771,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [200u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [201u8; 32], [202u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [201u8; 32], [202u8; 32]);
 
         let dims = ModelDims {
             d_model: 1,
@@ -1849,14 +1828,10 @@ mod integration {
         let ct = chimera_encrypt(&module, &key, &pt, [210u8; 32], [211u8; 32]);
 
         // Run without gamma
-        let result_no_gamma = chimera_transformer_block(
-            &module, &eval_key, &ct, &config, &base_weights,
-        );
+        let result_no_gamma = chimera_transformer_block(&module, &eval_key, &ct, &config, &base_weights);
 
         // Run with gamma
-        let result_with_gamma = chimera_transformer_block(
-            &module, &eval_key, &ct, &config, &gamma_weights,
-        );
+        let result_with_gamma = chimera_transformer_block(&module, &eval_key, &ct, &config, &gamma_weights);
 
         // Both should produce valid ciphertexts
         use poulpy_core::layouts::LWEInfos;
@@ -1887,9 +1862,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [220u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [221u8; 32], [222u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [221u8; 32], [222u8; 32]);
 
         let dims = ModelDims {
             d_model: 1,
@@ -1961,21 +1934,22 @@ mod integration {
     /// between the two layers.
     #[test]
     fn test_forward_pass_with_bootstrap_enabled() {
-        use crate::bootstrapping::{
-            BootstrappingConfig, ChimeraBootstrapKey, ChimeraBootstrapKeyPrepared,
-        };
+        use crate::bootstrapping::{BootstrappingConfig, ChimeraBootstrapKey, ChimeraBootstrapKeyPrepared};
 
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [240u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [241u8; 32], [242u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [241u8; 32], [242u8; 32]);
 
         // Generate bootstrap keys
         let bsk = ChimeraBootstrapKey::generate(
-            &module, &params, &key.secret, &key.prepared,
-            [243u8; 32], [244u8; 32], [245u8; 32],
+            &module,
+            &params,
+            &key.secret,
+            &key.prepared,
+            [243u8; 32],
+            [244u8; 32],
+            [245u8; 32],
         );
         let bsk_prepared = ChimeraBootstrapKeyPrepared::prepare(&module, &bsk);
 
@@ -2046,8 +2020,8 @@ mod integration {
         // The noise tracker will report a low budget after just one block, so
         // this should trigger at least one bootstrap.
         let bootstrap_cfg = BootstrappingConfig::for_deep_model(
-            1000.0,  // absurdly high threshold — always triggers bootstrap
-            2,       // allow up to 2 bootstraps
+            1000.0, // absurdly high threshold — always triggers bootstrap
+            2,      // allow up to 2 bootstraps
         );
 
         let (result, tracker) = chimera_forward_pass_with_bootstrap(
@@ -2066,13 +2040,12 @@ mod integration {
         assert!(result.base2k() > 0, "output base2k should be > 0");
 
         // The tracker should show bootstrap_reset events in its history
-        let bootstrap_events = tracker.history.iter()
-            .filter(|e| e.op == "bootstrap_reset")
-            .count();
+        let bootstrap_events = tracker.history.iter().filter(|e| e.op == "bootstrap_reset").count();
         assert!(
             bootstrap_events > 0,
             "bootstrapping should have been triggered at least once; \
-             history: {:?}", tracker.history.iter().map(|e| &e.op).collect::<Vec<_>>()
+             history: {:?}",
+            tracker.history.iter().map(|e| &e.op).collect::<Vec<_>>()
         );
     }
 
@@ -2108,9 +2081,7 @@ mod integration {
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [250u8; 32]);
 
-        let test_vals: Vec<i8> = vec![
-            0, 1, -1, 10, -10, 42, -42, 100, -100, 127, -128,
-        ];
+        let test_vals: Vec<i8> = vec![0, 1, -1, 10, -10, 42, -42, 100, -100, 127, -128];
 
         let pt = encode_int8(&module, &params, &test_vals);
         let ct = chimera_encrypt(&module, &key, &pt, [251u8; 32], [252u8; 32]);
@@ -2154,7 +2125,9 @@ mod integration {
         let decoded = decode_int8(&module, &params, &pt_dec, a_vals.len());
 
         let fhe: Vec<f64> = decoded.iter().map(|&x| x as f64).collect();
-        let reference: Vec<f64> = a_vals.iter().zip(b_vals.iter())
+        let reference: Vec<f64> = a_vals
+            .iter()
+            .zip(b_vals.iter())
             .map(|(&a, &b)| (a as i16 + b as i16) as f64)
             .collect();
 
@@ -2215,10 +2188,7 @@ mod integration {
         let pt = encode_int8(&module, &params, &vals);
         let ct = chimera_encrypt(&module, &key, &pt, [221u8; 32], [222u8; 32]);
 
-        let weight_rows = vec![
-            vec![2i64, 0, 0, 0],
-            vec![1i64, 1, 0, 0],
-        ];
+        let weight_rows = vec![vec![2i64, 0, 0, 0], vec![1i64, 1, 0, 0]];
 
         let results = chimera_matmul_single_ct(&module, &ct, &weight_rows);
         assert_eq!(results.len(), 2);
@@ -2229,17 +2199,11 @@ mod integration {
         let dec1 = decode_int8(&module, &params, &pt1, 4);
 
         // Row 0: [5,0,0,0] * [2,0,0,0] = [10, 0, 0, 0]
-        let (linf0, l2_0) = accuracy_metrics(
-            &dec0.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-            &[10.0, 0.0, 0.0, 0.0],
-        );
+        let (linf0, l2_0) = accuracy_metrics(&dec0.iter().map(|&x| x as f64).collect::<Vec<_>>(), &[10.0, 0.0, 0.0, 0.0]);
         eprintln!("[accuracy_matmul row0] Linf={linf0:.4}, L2={l2_0:.4}, dec={dec0:?}");
 
         // Row 1: [5,0,0,0] * [1,1,0,0] = [5, 5, 0, 0]
-        let (linf1, l2_1) = accuracy_metrics(
-            &dec1.iter().map(|&x| x as f64).collect::<Vec<_>>(),
-            &[5.0, 5.0, 0.0, 0.0],
-        );
+        let (linf1, l2_1) = accuracy_metrics(&dec1.iter().map(|&x| x as f64).collect::<Vec<_>>(), &[5.0, 5.0, 0.0, 0.0]);
         eprintln!("[accuracy_matmul row1] Linf={linf1:.4}, L2={l2_1:.4}, dec={dec1:?}");
 
         assert!(linf0 <= 4.0, "matmul row0 Linf error: {linf0}");
@@ -2253,20 +2217,18 @@ mod integration {
     /// `PolyApprox::eval` for GELU on small integer inputs.
     #[test]
     fn test_accuracy_gelu_activation() {
-        use crate::activations::{
-            activation_decode_precision, apply_poly_activation, gelu_poly_approx,
-        };
+        use crate::activations::{activation_decode_precision, apply_poly_activation, gelu_poly_approx};
+        use poulpy_core::layouts::GLWE;
         use poulpy_core::layouts::{
-            Base2K, Degree, Dsize, GLWELayout, GLWEPlaintext,
-            GLWESecret, GLWETensorKey, GLWETensorKeyLayout, Rank, TorusPrecision,
             prepared::{GLWESecretPrepared, GLWETensorKeyPrepared},
+            Base2K, Degree, Dsize, GLWELayout, GLWEPlaintext, GLWESecret, GLWETensorKey, GLWETensorKeyLayout, Rank,
+            TorusPrecision,
         };
         use poulpy_hal::{
             api::{ScratchOwnedAlloc, ScratchOwnedBorrow},
             layouts::ScratchOwned,
             source::Source,
         };
-        use poulpy_core::layouts::GLWE;
 
         let base2k: usize = 14;
         let in_base2k: usize = base2k - 1;
@@ -2314,8 +2276,7 @@ mod integration {
         let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(enc_bytes);
         tsk.encrypt_sk(&module, &sk, &mut source_xa, &mut source_xe, scratch.borrow());
 
-        let mut tsk_prep =
-            GLWETensorKeyPrepared::<Vec<u8>, BE>::alloc_from_infos(&module, &tsk_layout);
+        let mut tsk_prep = GLWETensorKeyPrepared::<Vec<u8>, BE>::alloc_from_infos(&module, &tsk_layout);
         let prep_bytes = tsk_prep.prepare_tmp_bytes(&module, &tsk_layout);
         let mut prep_scratch: ScratchOwned<BE> = ScratchOwned::alloc(prep_bytes);
         tsk_prep.prepare(&module, &tsk, prep_scratch.borrow());
@@ -2358,10 +2319,7 @@ mod integration {
             let enc_ct_bytes = GLWE::encrypt_sk_tmp_bytes(&module, &glwe_in);
             let mut ct_scratch: ScratchOwned<BE> = ScratchOwned::alloc(enc_ct_bytes);
             let mut ct = GLWE::<Vec<u8>>::alloc_from_infos(&glwe_in);
-            ct.encrypt_sk(
-                &module, &pt, &sk_dft,
-                &mut source_xa, &mut source_xe, ct_scratch.borrow(),
-            );
+            ct.encrypt_sk(&module, &pt, &sk_dft, &mut source_xa, &mut source_xe, ct_scratch.borrow());
 
             let ct_result = apply_poly_activation(&module, &eval_key, &ct, &approx);
 
@@ -2396,15 +2354,17 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [230u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [231u8; 32], [232u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [231u8; 32], [232u8; 32]);
 
         let dims = ModelDims {
-            d_model: 1, d_head: 1, n_heads: 1,
+            d_model: 1,
+            d_head: 1,
+            n_heads: 1,
             n_kv_heads: 1,
-            d_ffn: 1, n_layers: 1,
-            n_experts: 1, n_active_experts: 1,
+            d_ffn: 1,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
         };
 
         let config = TransformerBlockConfig {
@@ -2442,9 +2402,7 @@ mod integration {
         for &input_val in &test_vals {
             let pt = encode_int8(&module, &params, &[input_val]);
             let ct = chimera_encrypt(&module, &key, &pt, [233u8; 32], [234u8; 32]);
-            let result = chimera_transformer_block(
-                &module, &eval_key, &ct, &config, &weights,
-            );
+            let result = chimera_transformer_block(&module, &eval_key, &ct, &config, &weights);
 
             let pt_dec = chimera_decrypt(&module, &key, &result, &params);
             let raw: &[u8] = pt_dec.data.data.as_ref();
@@ -2452,9 +2410,7 @@ mod integration {
             let coeffs: &[i64] = bytemuck::cast_slice(&raw[..n * 8]);
             let raw_coeff0 = coeffs[0];
 
-            eprintln!(
-                "[accuracy_block_d1] input={input_val}, raw_coeff0={raw_coeff0}",
-            );
+            eprintln!("[accuracy_block_d1] input={input_val}, raw_coeff0={raw_coeff0}",);
 
             if input_val > 0 {
                 assert!(
@@ -2471,15 +2427,17 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [240u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [241u8; 32], [242u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [241u8; 32], [242u8; 32]);
 
         let dims = ModelDims {
-            d_model: 1, d_head: 1, n_heads: 1,
+            d_model: 1,
+            d_head: 1,
+            n_heads: 1,
             n_kv_heads: 1,
-            d_ffn: 1, n_layers: 2,
-            n_experts: 1, n_active_experts: 1,
+            d_ffn: 1,
+            n_layers: 2,
+            n_experts: 1,
+            n_active_experts: 1,
         };
 
         let config = TransformerBlockConfig {
@@ -2520,9 +2478,7 @@ mod integration {
         let pt = encode_int8(&module, &params, &[input_val]);
         let ct = chimera_encrypt(&module, &key, &pt, [243u8; 32], [244u8; 32]);
 
-        let result = chimera_forward_pass(
-            &module, &eval_key, &ct, &config, &layer_weights,
-        );
+        let result = chimera_forward_pass(&module, &eval_key, &ct, &config, &layer_weights);
 
         use poulpy_core::layouts::LWEInfos;
         assert!(result.n() > 0);
@@ -2530,7 +2486,8 @@ mod integration {
 
         eprintln!(
             "[accuracy_error_growth] 2 layers completed, result n={} base2k={}",
-            result.n(), result.base2k()
+            result.n(),
+            result.base2k()
         );
 
         let pt_dec = chimera_decrypt(&module, &key, &result, &params);
@@ -2548,9 +2505,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [180u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [181u8; 32], [182u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [181u8; 32], [182u8; 32]);
 
         let vals: Vec<i8> = vec![1, 2, 3, 4];
         let pt = encode_int8(&module, &params, &vals);
@@ -2584,10 +2539,7 @@ mod integration {
 
         // Matmul
         {
-            let weight_rows = vec![
-                vec![1i64, 0, 0, 0],
-                vec![0i64, 1, 0, 0],
-            ];
+            let weight_rows = vec![vec![1i64, 0, 0, 0], vec![0i64, 1, 0, 0]];
             let results = chimera_matmul_single_ct(&module, &ct, &weight_rows);
 
             let pt0 = chimera_decrypt(&module, &key, &results[0], &params);
@@ -2611,10 +2563,14 @@ mod integration {
         // Full transformer block
         {
             let dims = ModelDims {
-                d_model: 4, d_head: 4, n_heads: 1,
+                d_model: 4,
+                d_head: 4,
+                n_heads: 1,
                 n_kv_heads: 1,
-                d_ffn: 4, n_layers: 1,
-                n_experts: 1, n_active_experts: 1,
+                d_ffn: 4,
+                n_layers: 1,
+                n_experts: 1,
+                n_active_experts: 1,
             };
             let block_config = TransformerBlockConfig {
                 attention: AttentionConfig {
@@ -2647,9 +2603,7 @@ mod integration {
                 pre_ffn_norm_gamma: None,
             };
 
-            let result = chimera_transformer_block(
-                &module, &eval_key, &ct, &block_config, &weights,
-            );
+            let result = chimera_transformer_block(&module, &eval_key, &ct, &block_config, &weights);
 
             let pt_dec = chimera_decrypt(&module, &key, &result, &params);
             let raw: &[u8] = pt_dec.data.data.as_ref();
@@ -2684,8 +2638,8 @@ mod integration {
     ///
     /// Returns a tuple of (encrypt_decrypt_linf, add_linf, mul_const_linf, ct_ct_mul_ok, matmul_linf).
     fn security_sweep_workload(security: SecurityLevel) -> (f64, f64, f64, bool, f64) {
-        use crate::arithmetic::{chimera_add, chimera_mul_const, chimera_matmul_single_ct};
         use crate::activations::chimera_ct_mul;
+        use crate::arithmetic::{chimera_add, chimera_matmul_single_ct, chimera_mul_const};
 
         let label = match security {
             SecurityLevel::Bits80 => "80-bit",
@@ -2696,8 +2650,13 @@ mod integration {
         let params = ChimeraParams::new(security, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
 
-        eprintln!("\n[security_sweep {label}] N={}, slots={}, max_depth={}, ciphertext_bytes={}",
-            params.n(), params.slots, params.max_depth, params.ciphertext_bytes());
+        eprintln!(
+            "\n[security_sweep {label}] N={}, slots={}, max_depth={}, ciphertext_bytes={}",
+            params.n(),
+            params.slots,
+            params.max_depth,
+            params.ciphertext_bytes()
+        );
 
         // Key generation (timed)
         let t0 = std::time::Instant::now();
@@ -2744,8 +2703,11 @@ mod integration {
         let pt_sum = chimera_decrypt(&module, &key, &ct_sum, &params);
         let dec_sum = decode_int8(&module, &params, &pt_sum, a_vals.len());
         let fhe_sum: Vec<f64> = dec_sum.iter().map(|&x| x as f64).collect();
-        let ref_sum: Vec<f64> = a_vals.iter().zip(b_vals.iter())
-            .map(|(&a, &b)| (a as i16 + b as i16) as f64).collect();
+        let ref_sum: Vec<f64> = a_vals
+            .iter()
+            .zip(b_vals.iter())
+            .map(|(&a, &b)| (a as i16 + b as i16) as f64)
+            .collect();
         let (add_linf, add_l2) = accuracy_metrics(&fhe_sum, &ref_sum);
         eprintln!("[security_sweep {label}] add: {add_us} us, Linf={add_linf:.4}, L2={add_l2:.4}");
 
@@ -2771,8 +2733,11 @@ mod integration {
         // scale, matching the pattern from test_full_pipeline_eval_key_ct_mul.
         // encode_int8 uses a different internal scaling that is not compatible
         // with decode_vec_i64 after tensor product.
-        use poulpy_core::layouts::{GLWE, GLWEPlaintext, GLWEPlaintextLayout, TorusPrecision};
-        use poulpy_hal::{api::{ScratchOwnedAlloc, ScratchOwnedBorrow}, layouts::ScratchOwned};
+        use poulpy_core::layouts::{GLWEPlaintext, GLWEPlaintextLayout, TorusPrecision, GLWE};
+        use poulpy_hal::{
+            api::{ScratchOwnedAlloc, ScratchOwnedBorrow},
+            layouts::ScratchOwned,
+        };
 
         let scale = eval_key.res_offset; // = 2 * in_base2k = 26
         let mut raw_data = vec![0i64; module.n()];
@@ -2810,8 +2775,10 @@ mod integration {
         pt_prod.decode_vec_i64(&mut decoded_prod, TorusPrecision(scale as u32));
 
         let ct_ct_ok = (decoded_prod[0] - 9).abs() <= 2;
-        eprintln!("[security_sweep {label}] ct*ct mul: {ctct_us} us, 3*3 → {}, ok={ct_ct_ok}",
-            decoded_prod[0]);
+        eprintln!(
+            "[security_sweep {label}] ct*ct mul: {ctct_us} us, 3*3 → {}, ok={ct_ct_ok}",
+            decoded_prod[0]
+        );
 
         // 5. Matmul (4 rows, single-coefficient weights)
         let vals_mm: Vec<i8> = vec![5, 0, 0, 0];
@@ -2852,8 +2819,7 @@ mod integration {
     /// Security sweep at 80-bit (N=4096) — runs as part of the normal test suite.
     #[test]
     fn test_security_sweep_80bit() {
-        let (enc_linf, add_linf, mulconst_linf, ct_ct_ok, matmul_linf) =
-            security_sweep_workload(SecurityLevel::Bits80);
+        let (enc_linf, add_linf, mulconst_linf, ct_ct_ok, matmul_linf) = security_sweep_workload(SecurityLevel::Bits80);
 
         assert!(enc_linf <= 1.0, "80-bit enc/dec Linf: {enc_linf}");
         assert!(add_linf <= 1.0, "80-bit add Linf: {add_linf}");
@@ -2867,8 +2833,7 @@ mod integration {
     #[test]
     #[ignore]
     fn test_security_sweep_100bit() {
-        let (enc_linf, add_linf, mulconst_linf, ct_ct_ok, matmul_linf) =
-            security_sweep_workload(SecurityLevel::Bits100);
+        let (enc_linf, add_linf, mulconst_linf, ct_ct_ok, matmul_linf) = security_sweep_workload(SecurityLevel::Bits100);
 
         assert!(enc_linf <= 1.0, "100-bit enc/dec Linf: {enc_linf}");
         assert!(add_linf <= 1.0, "100-bit add Linf: {add_linf}");
@@ -2882,8 +2847,7 @@ mod integration {
     #[test]
     #[ignore]
     fn test_security_sweep_128bit() {
-        let (enc_linf, add_linf, mulconst_linf, ct_ct_ok, matmul_linf) =
-            security_sweep_workload(SecurityLevel::Bits128);
+        let (enc_linf, add_linf, mulconst_linf, ct_ct_ok, matmul_linf) = security_sweep_workload(SecurityLevel::Bits128);
 
         assert!(enc_linf <= 1.0, "128-bit enc/dec Linf: {enc_linf}");
         assert!(add_linf <= 1.0, "128-bit add Linf: {add_linf}");
@@ -2965,8 +2929,7 @@ mod integration {
             w_o: vec![vec![1i64, 0], vec![0, 1]],
         };
 
-        let (q_cts, k_cts, v_cts) =
-            crate::attention::chimera_qkv_project_vec(&module, &x_cts, &weights, 2, 2);
+        let (q_cts, k_cts, v_cts) = crate::attention::chimera_qkv_project_vec(&module, &x_cts, &weights, 2, 2);
 
         // Should produce 2 output ciphertexts each
         assert_eq!(q_cts.len(), 2, "Q should have 2 output cts");
@@ -2977,11 +2940,13 @@ mod integration {
         let q_dec = decrypt_vec(&module, &key, &params, &q_cts);
         assert!(
             (q_dec[0] as i16 - 3).unsigned_abs() <= 4,
-            "Q[0] expected ~3, got {}", q_dec[0]
+            "Q[0] expected ~3, got {}",
+            q_dec[0]
         );
         assert!(
             (q_dec[1] as i16 - 5).unsigned_abs() <= 4,
-            "Q[1] expected ~5, got {}", q_dec[1]
+            "Q[1] expected ~5, got {}",
+            q_dec[1]
         );
     }
 
@@ -2995,9 +2960,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [71u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [72u8; 32], [73u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [72u8; 32], [73u8; 32]);
 
         // d_model=2 input: [2, 3]
         let x_cts = encrypt_vec(&module, &key, &params, &[2, 3]);
@@ -3009,13 +2972,7 @@ mod integration {
             w3: None,
         };
 
-        let result = chimera_ffn_standard_vec(
-            &module,
-            &eval_key,
-            &x_cts,
-            &weights,
-            &ActivationChoice::SquaredReLU,
-        );
+        let result = chimera_ffn_standard_vec(&module, &eval_key, &x_cts, &weights, &ActivationChoice::SquaredReLU);
 
         assert_eq!(result.len(), 2, "FFN vec should produce 2 output cts");
 
@@ -3036,18 +2993,16 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [74u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [75u8; 32], [76u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [75u8; 32], [76u8; 32]);
 
         // d_model=2 input: [4, 2]
         let x_cts = encrypt_vec(&module, &key, &params, &[4, 2]);
 
         // SwiGLU needs w1 (gate), w2 (down), w3 (up)
         let weights = FFNWeights {
-            w1: vec![vec![1i64, 0], vec![0, 1]],  // W_gate [d_ffn, d_model]
-            w2: vec![vec![1i64, 0], vec![0, 1]],  // W_down [d_model, d_ffn]
-            w3: Some(vec![vec![1i64, 0], vec![0, 1]]),  // W_up [d_ffn, d_model]
+            w1: vec![vec![1i64, 0], vec![0, 1]],       // W_gate [d_ffn, d_model]
+            w2: vec![vec![1i64, 0], vec![0, 1]],       // W_down [d_model, d_ffn]
+            w3: Some(vec![vec![1i64, 0], vec![0, 1]]), // W_up [d_ffn, d_model]
         };
 
         let result = chimera_ffn_swiglu_vec(&module, &eval_key, &x_cts, &weights);
@@ -3069,9 +3024,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [80u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [81u8; 32], [82u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [81u8; 32], [82u8; 32]);
 
         let dims = ModelDims {
             d_model: 2,
@@ -3118,9 +3071,7 @@ mod integration {
         // Encrypt d_model=2 input: [5, 3]
         let x_cts = encrypt_vec(&module, &key, &params, &[5, 3]);
 
-        let result = chimera_transformer_block_vec(
-            &module, &eval_key, &x_cts, &config, &weights,
-        );
+        let result = chimera_transformer_block_vec(&module, &eval_key, &x_cts, &config, &weights);
 
         assert_eq!(result.len(), 2, "Block vec should produce d_model=2 output");
 
@@ -3142,9 +3093,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [85u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [86u8; 32], [87u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [86u8; 32], [87u8; 32]);
 
         let dims = ModelDims {
             d_model: 2,
@@ -3207,9 +3156,7 @@ mod integration {
 
         let x_cts = encrypt_vec(&module, &key, &params, &[4, 6]);
 
-        let result = chimera_forward_pass_vec(
-            &module, &eval_key, &x_cts, &config, &layer_weights,
-        );
+        let result = chimera_forward_pass_vec(&module, &eval_key, &x_cts, &config, &layer_weights);
 
         assert_eq!(result.len(), 2, "Forward pass vec should produce d_model=2 output");
 
@@ -3225,9 +3172,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [88u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [89u8; 32], [90u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [89u8; 32], [90u8; 32]);
 
         let x_cts = encrypt_vec(&module, &key, &params, &[3, 7]);
 
@@ -3240,9 +3185,7 @@ mod integration {
         let config_std = FFNConfig::Standard {
             activation: ActivationChoice::SquaredReLU,
         };
-        let result_std = chimera_ffn_vec(
-            &module, &eval_key, &x_cts, &std_weights, &config_std,
-        );
+        let result_std = chimera_ffn_vec(&module, &eval_key, &x_cts, &std_weights, &config_std);
         assert_eq!(result_std.len(), 2, "Standard FFN vec dispatch should produce 2 cts");
 
         // SwiGLU FFN via dispatch
@@ -3252,9 +3195,7 @@ mod integration {
             w3: Some(vec![vec![1i64, 0], vec![0, 1]]),
         };
         let config_swiglu = FFNConfig::SwiGLU;
-        let result_swiglu = chimera_ffn_vec(
-            &module, &eval_key, &x_cts, &swiglu_weights, &config_swiglu,
-        );
+        let result_swiglu = chimera_ffn_vec(&module, &eval_key, &x_cts, &swiglu_weights, &config_swiglu);
         assert_eq!(result_swiglu.len(), 2, "SwiGLU FFN vec dispatch should produce 2 cts");
     }
 
@@ -3267,17 +3208,13 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [91u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [92u8; 32], [93u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [92u8; 32], [93u8; 32]);
 
         // d_model=2 input: [4, 3]
         let x_cts = encrypt_vec(&module, &key, &params, &[4, 3]);
 
         let config = LayerNormConfig::rms_norm(2);
-        let result = crate::layernorm::chimera_rms_norm_vec(
-            &module, &eval_key, &x_cts, &config,
-        );
+        let result = crate::layernorm::chimera_rms_norm_vec(&module, &eval_key, &x_cts, &config);
 
         assert_eq!(result.len(), 2, "RMSNorm vec should produce 2 output cts");
 
@@ -3297,9 +3234,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [94u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [95u8; 32], [96u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [95u8; 32], [96u8; 32]);
 
         let dims = ModelDims {
             d_model: 4,
@@ -3321,37 +3256,15 @@ mod integration {
 
         // 4x4 identity weights for all projections
         let weights = AttentionWeights {
-            w_q: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-                vec![0, 0, 1, 0],
-                vec![0, 0, 0, 1],
-            ],
-            w_k: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-                vec![0, 0, 1, 0],
-                vec![0, 0, 0, 1],
-            ],
-            w_v: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-                vec![0, 0, 1, 0],
-                vec![0, 0, 0, 1],
-            ],
-            w_o: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-                vec![0, 0, 1, 0],
-                vec![0, 0, 0, 1],
-            ],
+            w_q: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
+            w_k: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
+            w_v: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
+            w_o: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
         };
 
         let x_cts = encrypt_vec(&module, &key, &params, &[2, 4, 6, 8]);
 
-        let result = crate::attention::chimera_multi_head_attention_vec(
-            &module, &eval_key, &x_cts, &weights, &attn_config,
-        );
+        let result = crate::attention::chimera_multi_head_attention_vec(&module, &eval_key, &x_cts, &weights, &attn_config);
 
         assert_eq!(result.len(), 4, "Multi-head attn vec should produce d_model=4 output");
 
@@ -3369,9 +3282,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [97u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [98u8; 32], [99u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [98u8; 32], [99u8; 32]);
 
         let dims = ModelDims {
             d_model: 2,
@@ -3405,9 +3316,9 @@ mod integration {
                 w_o: vec![vec![1i64, 0], vec![0, 1]],
             },
             ffn: FFNWeights {
-                w1: vec![vec![1i64, 0], vec![0, 1]],   // W_gate
-                w2: vec![vec![1i64, 0], vec![0, 1]],   // W_down
-                w3: Some(vec![vec![1i64, 0], vec![0, 1]]),  // W_up
+                w1: vec![vec![1i64, 0], vec![0, 1]],       // W_gate
+                w2: vec![vec![1i64, 0], vec![0, 1]],       // W_down
+                w3: Some(vec![vec![1i64, 0], vec![0, 1]]), // W_up
             },
             pre_attn_norm_gamma: None,
             pre_ffn_norm_gamma: None,
@@ -3415,9 +3326,7 @@ mod integration {
 
         let x_cts = encrypt_vec(&module, &key, &params, &[5, 3]);
 
-        let result = chimera_transformer_block_vec(
-            &module, &eval_key, &x_cts, &config, &weights,
-        );
+        let result = chimera_transformer_block_vec(&module, &eval_key, &x_cts, &config, &weights);
 
         assert_eq!(result.len(), 2, "SwiGLU block vec should produce d_model=2 output");
 
@@ -3468,32 +3377,14 @@ mod integration {
 
         // W_Q: [4][4] (d_model rows), W_K: [2][4] (d_kv rows), W_V: [2][4]
         let weights = AttentionWeights {
-            w_q: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-                vec![0, 0, 1, 0],
-                vec![0, 0, 0, 1],
-            ],
-            w_k: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-            ],
-            w_v: vec![
-                vec![0, 0, 1, 0],
-                vec![0, 0, 0, 1],
-            ],
-            w_o: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-                vec![0, 0, 1, 0],
-                vec![0, 0, 0, 1],
-            ],
+            w_q: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
+            w_k: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0]],
+            w_v: vec![vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
+            w_o: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
         };
 
         let d_kv = dims.d_kv();
-        let (q_cts, k_cts, v_cts) = crate::attention::chimera_qkv_project_vec(
-            &module, &x_cts, &weights, dims.d_model, d_kv,
-        );
+        let (q_cts, k_cts, v_cts) = crate::attention::chimera_qkv_project_vec(&module, &x_cts, &weights, dims.d_model, d_kv);
 
         // Q should have d_model=4 outputs, K/V should have d_kv=2 outputs
         assert_eq!(q_cts.len(), 4, "Q should have d_model=4 output cts");
@@ -3506,7 +3397,8 @@ mod integration {
             let expected = (i + 1) as i16;
             assert!(
                 (q_dec[i] as i16 - expected).unsigned_abs() <= 4,
-                "Q[{i}] expected ~{expected}, got {}", q_dec[i]
+                "Q[{i}] expected ~{expected}, got {}",
+                q_dec[i]
             );
         }
 
@@ -3514,22 +3406,26 @@ mod integration {
         let k_dec = decrypt_vec(&module, &key, &params, &k_cts);
         assert!(
             (k_dec[0] as i16 - 1).unsigned_abs() <= 4,
-            "K[0] expected ~1, got {}", k_dec[0]
+            "K[0] expected ~1, got {}",
+            k_dec[0]
         );
         assert!(
             (k_dec[1] as i16 - 2).unsigned_abs() <= 4,
-            "K[1] expected ~2, got {}", k_dec[1]
+            "K[1] expected ~2, got {}",
+            k_dec[1]
         );
 
         // V should be dims 2-3 of x (V_0 ≈ x[2]=3, V_1 ≈ x[3]=4)
         let v_dec = decrypt_vec(&module, &key, &params, &v_cts);
         assert!(
             (v_dec[0] as i16 - 3).unsigned_abs() <= 4,
-            "V[0] expected ~3, got {}", v_dec[0]
+            "V[0] expected ~3, got {}",
+            v_dec[0]
         );
         assert!(
             (v_dec[1] as i16 - 4).unsigned_abs() <= 4,
-            "V[1] expected ~4, got {}", v_dec[1]
+            "V[1] expected ~4, got {}",
+            v_dec[1]
         );
     }
 
@@ -3546,9 +3442,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [111u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [112u8; 32], [113u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [112u8; 32], [113u8; 32]);
 
         let dims = ModelDims {
             d_model: 4,
@@ -3571,33 +3465,15 @@ mod integration {
         // Q: 4x4 identity, K: 2x4 (first 2 rows of identity), V: 2x4 (first 2 rows)
         // O: 4x4 identity
         let weights = AttentionWeights {
-            w_q: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-                vec![0, 0, 1, 0],
-                vec![0, 0, 0, 1],
-            ],
-            w_k: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-            ],
-            w_v: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-            ],
-            w_o: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-                vec![0, 0, 1, 0],
-                vec![0, 0, 0, 1],
-            ],
+            w_q: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
+            w_k: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0]],
+            w_v: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0]],
+            w_o: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
         };
 
         let x_cts = encrypt_vec(&module, &key, &params, &[2, 4, 6, 8]);
 
-        let result = crate::attention::chimera_multi_head_attention_vec(
-            &module, &eval_key, &x_cts, &weights, &attn_config,
-        );
+        let result = crate::attention::chimera_multi_head_attention_vec(&module, &eval_key, &x_cts, &weights, &attn_config);
 
         // Should produce d_model=4 outputs
         assert_eq!(result.len(), 4, "GQA MHA vec should produce d_model=4 output cts");
@@ -3620,9 +3496,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [114u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [115u8; 32], [116u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [115u8; 32], [116u8; 32]);
 
         let dims = ModelDims {
             d_model: 4,
@@ -3644,26 +3518,10 @@ mod integration {
 
         // Same weight setup: Q 4x4, K 2x4, V 2x4, O 4x4
         let weights = AttentionWeights {
-            w_q: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-                vec![0, 0, 1, 0],
-                vec![0, 0, 0, 1],
-            ],
-            w_k: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-            ],
-            w_v: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-            ],
-            w_o: vec![
-                vec![1, 0, 0, 0],
-                vec![0, 1, 0, 0],
-                vec![0, 0, 1, 0],
-                vec![0, 0, 0, 1],
-            ],
+            w_q: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
+            w_k: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0]],
+            w_v: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0]],
+            w_o: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
         };
 
         // Encrypt as packed single ciphertext
@@ -3671,9 +3529,7 @@ mod integration {
         let pt = encode_int8(&module, &params, &values);
         let ct_x = chimera_encrypt(&module, &key, &pt, [117u8; 32], [118u8; 32]);
 
-        let result = crate::attention::chimera_multi_head_attention(
-            &module, &eval_key, &ct_x, &weights, &attn_config,
-        );
+        let result = crate::attention::chimera_multi_head_attention(&module, &eval_key, &ct_x, &weights, &attn_config);
 
         // Should produce d_model=4 ciphertexts
         assert_eq!(result.len(), 4, "GQA packed MHA should produce d_model=4 output cts");
@@ -3694,9 +3550,7 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [120u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [121u8; 32], [122u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [121u8; 32], [122u8; 32]);
 
         let dims = ModelDims {
             d_model: 4,
@@ -3727,40 +3581,14 @@ mod integration {
         // Q: 4x4 identity, K: 2x4 identity-subset, V: 2x4, O: 4x4
         let weights = TransformerBlockWeights {
             attention: AttentionWeights {
-                w_q: vec![
-                    vec![1, 0, 0, 0],
-                    vec![0, 1, 0, 0],
-                    vec![0, 0, 1, 0],
-                    vec![0, 0, 0, 1],
-                ],
-                w_k: vec![
-                    vec![1, 0, 0, 0],
-                    vec![0, 1, 0, 0],
-                ],
-                w_v: vec![
-                    vec![1, 0, 0, 0],
-                    vec![0, 1, 0, 0],
-                ],
-                w_o: vec![
-                    vec![1, 0, 0, 0],
-                    vec![0, 1, 0, 0],
-                    vec![0, 0, 1, 0],
-                    vec![0, 0, 0, 1],
-                ],
+                w_q: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
+                w_k: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0]],
+                w_v: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0]],
+                w_o: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
             },
             ffn: FFNWeights {
-                w1: vec![
-                    vec![1, 0, 0, 0],
-                    vec![0, 1, 0, 0],
-                    vec![0, 0, 1, 0],
-                    vec![0, 0, 0, 1],
-                ],
-                w2: vec![
-                    vec![1, 0, 0, 0],
-                    vec![0, 1, 0, 0],
-                    vec![0, 0, 1, 0],
-                    vec![0, 0, 0, 1],
-                ],
+                w1: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
+                w2: vec![vec![1, 0, 0, 0], vec![0, 1, 0, 0], vec![0, 0, 1, 0], vec![0, 0, 0, 1]],
                 w3: None,
             },
             pre_attn_norm_gamma: None,
@@ -3769,9 +3597,7 @@ mod integration {
 
         let x_cts = encrypt_vec(&module, &key, &params, &[3, 5, 7, 9]);
 
-        let result = chimera_transformer_block_vec(
-            &module, &eval_key, &x_cts, &config, &weights,
-        );
+        let result = chimera_transformer_block_vec(&module, &eval_key, &x_cts, &config, &weights);
 
         assert_eq!(result.len(), 4, "GQA block vec should produce d_model=4 output");
 
@@ -3924,31 +3750,13 @@ mod integration {
         serialize(&tensors, &None).unwrap()
     }
 
-    /// Transposes a 2D weight matrix (Vec<Vec<i64>>) from [R][C] to [C][R].
-    fn transpose_weights(w: &[Vec<i64>]) -> Vec<Vec<i64>> {
-        if w.is_empty() {
-            return vec![];
-        }
-        let rows = w.len();
-        let cols = w[0].len();
-        let mut out = vec![vec![0i64; rows]; cols];
-        for r in 0..rows {
-            for c in 0..cols {
-                out[c][r] = w[r][c];
-            }
-        }
-        out
-    }
-
     /// End-to-end integration test: load synthetic LLaMA weights from
     /// safetensors, encrypt an embedding, run through one transformer
     /// layer using the vector FHE pipeline, decrypt, and compare against
     /// a cleartext reference computation.
     #[test]
     fn test_e2e_synthetic_llama_forward_pass() {
-        use crate::model_loader::{
-            LoaderConfig, load_embedding_table, load_final_norm, load_layer, load_lm_head,
-        };
+        use crate::model_loader::{load_embedding_table, load_final_norm, load_layer, load_lm_head, LoaderConfig};
         use safetensors::SafeTensors;
 
         // ---- 1. Create and parse synthetic safetensors ----
@@ -3973,21 +3781,17 @@ mod integration {
         let loader_config = LoaderConfig::llama(dims.clone());
 
         // ---- 2. Load all model components ----
-        let embedding_table = load_embedding_table(
-            &tensors, "model.embed_tokens.weight", d_model,
-        ).expect("Failed to load embedding table");
+        let embedding_table =
+            load_embedding_table(&tensors, "model.embed_tokens.weight", d_model).expect("Failed to load embedding table");
         assert_eq!(embedding_table.vocab_size, vocab_size);
         assert_eq!(embedding_table.d_model, d_model);
 
-        let layer_result = load_layer(&tensors, 0, &loader_config)
-            .expect("Failed to load layer 0");
+        let layer_result = load_layer(&tensors, 0, &loader_config).expect("Failed to load layer 0");
 
-        let (_final_norm_weights, _final_norm_qi) = load_final_norm(
-            &tensors, "model.norm.weight", d_model,
-        ).expect("Failed to load final norm");
+        let (_final_norm_weights, _final_norm_qi) =
+            load_final_norm(&tensors, "model.norm.weight", d_model).expect("Failed to load final norm");
 
-        let lm_head = load_lm_head(&tensors, "lm_head.weight", d_model)
-            .expect("Failed to load LM head");
+        let lm_head = load_lm_head(&tensors, "lm_head.weight", d_model).expect("Failed to load LM head");
         assert_eq!(lm_head.vocab_size, vocab_size);
 
         eprintln!("[e2e_llama] All model components loaded successfully");
@@ -4014,48 +3818,25 @@ mod integration {
 
         eprintln!("[e2e_llama] Weight shapes verified");
 
-        // ---- 4. Transpose FFN weights for vec pipeline ----
-        //
-        // The model_loader produces:
-        //   w1 (gate) = [d_model][d_ffn]
-        //   w2 (down) = [d_ffn][d_model]
-        //   w3 (up)   = [d_model][d_ffn]
-        //
-        // The vec pipeline (chimera_ffn_swiglu_vec) expects:
-        //   w1 (gate) = [d_ffn][d_model]  (iterates j in 0..d_ffn, accesses w1[j][..d_in])
-        //   w2 (down) = [d_model][d_ffn]  (iterates over rows, dot with d_ffn hidden cts)
-        //   w3 (up)   = [d_ffn][d_model]  (iterates j in 0..d_ffn)
-        //
-        // So we need to transpose all three FFN matrices.
-        let vec_weights = TransformerBlockWeights {
-            attention: loaded_w.attention.clone(),
-            ffn: FFNWeights {
-                w1: transpose_weights(&loaded_w.ffn.w1),       // [d_model][d_ffn] → [d_ffn][d_model]
-                w2: transpose_weights(&loaded_w.ffn.w2),       // [d_ffn][d_model] → [d_model][d_ffn]
-                w3: Some(transpose_weights(w3_loaded)),         // [d_model][d_ffn] → [d_ffn][d_model]
-            },
-            pre_attn_norm_gamma: loaded_w.pre_attn_norm_gamma.clone(),
-            pre_ffn_norm_gamma: loaded_w.pre_ffn_norm_gamma.clone(),
-        };
+        // ---- 4. Convert FFN weights for vec pipeline ----
+        let vec_weights = layer_result.clone().into_vec_pipeline_weights();
 
         // Verify transposed shapes match vec pipeline expectations
-        assert_eq!(vec_weights.ffn.w1.len(), d_ffn);       // [d_ffn][d_model]
+        assert_eq!(vec_weights.ffn.w1.len(), d_ffn); // [d_ffn][d_model]
         assert_eq!(vec_weights.ffn.w1[0].len(), d_model);
-        assert_eq!(vec_weights.ffn.w2.len(), d_model);      // [d_model][d_ffn]
+        assert_eq!(vec_weights.ffn.w2.len(), d_model); // [d_model][d_ffn]
         assert_eq!(vec_weights.ffn.w2[0].len(), d_ffn);
         let w3_vec = vec_weights.ffn.w3.as_ref().unwrap();
-        assert_eq!(w3_vec.len(), d_ffn);                     // [d_ffn][d_model]
+        assert_eq!(w3_vec.len(), d_ffn); // [d_ffn][d_model]
         assert_eq!(w3_vec[0].len(), d_model);
 
-        eprintln!("[e2e_llama] FFN weights transposed for vec pipeline");
+        eprintln!("[e2e_llama] FFN weights converted for vec pipeline");
 
         // ---- 5. Set up FHE parameters and keys ----
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [200u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [201u8; 32], [202u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [201u8; 32], [202u8; 32]);
 
         // ---- 6. Look up token embedding and encrypt ----
         let token_id: usize = 3;
@@ -4094,9 +3875,7 @@ mod integration {
             residual: true,
         };
 
-        let result_cts = chimera_transformer_block_vec(
-            &module, &eval_key, &ct_x, &block_config, &vec_weights,
-        );
+        let result_cts = chimera_transformer_block_vec(&module, &eval_key, &ct_x, &block_config, &vec_weights);
 
         assert_eq!(result_cts.len(), d_model, "Output should have d_model={d_model} ciphertexts");
         eprintln!("[e2e_llama] Transformer block completed, {} output cts", result_cts.len());
@@ -4150,10 +3929,7 @@ mod integration {
     /// Truncates a 2D weight matrix from [R][C] to [new_rows][new_cols],
     /// keeping the top-left submatrix.
     fn truncate_weights(w: &[Vec<i64>], new_rows: usize, new_cols: usize) -> Vec<Vec<i64>> {
-        w.iter()
-            .take(new_rows)
-            .map(|row| row[..new_cols].to_vec())
-            .collect()
+        w.iter().take(new_rows).map(|row| row[..new_cols].to_vec()).collect()
     }
 
     /// Computes a cleartext matmul: y[i] = sum_j w[i][j] * x[j]
@@ -4168,8 +3944,7 @@ mod integration {
     #[ignore] // Requires TinyLlama-1.1B model file (~2GB)
     fn test_e2e_real_tinyllama_load_all_layers() {
         use crate::model_loader::{
-            LoaderConfig, load_layer_from_file, load_embedding_from_file,
-            load_lm_head_from_file, load_final_norm,
+            load_embedding_from_file, load_final_norm, load_layer_from_file, load_lm_head_from_file, LoaderConfig,
         };
         use safetensors::SafeTensors;
 
@@ -4260,12 +4035,14 @@ mod integration {
         eprintln!("[real_tinyllama] All {n_layers} layers loaded successfully!");
 
         // ---- Load embedding table ----
-        let embedding = load_embedding_from_file(
-            model_path, "model.embed_tokens.weight", d_model,
-        ).expect("Failed to load embedding table");
+        let embedding =
+            load_embedding_from_file(model_path, "model.embed_tokens.weight", d_model).expect("Failed to load embedding table");
         assert_eq!(embedding.vocab_size, vocab_size);
         assert_eq!(embedding.d_model, d_model);
-        eprintln!("[real_tinyllama] Embedding table loaded: vocab={}, d_model={}", embedding.vocab_size, embedding.d_model);
+        eprintln!(
+            "[real_tinyllama] Embedding table loaded: vocab={}, d_model={}",
+            embedding.vocab_size, embedding.d_model
+        );
 
         // Verify a sample embedding is non-zero (token 0 is <unk>/padding, use token 1 = BOS)
         let emb_1 = embedding.lookup(1);
@@ -4274,9 +4051,7 @@ mod integration {
         eprintln!("[real_tinyllama] Token 1 embedding max abs = {emb_max}");
 
         // ---- Load LM head ----
-        let lm_head = load_lm_head_from_file(
-            model_path, "lm_head.weight", d_model,
-        ).expect("Failed to load LM head");
+        let lm_head = load_lm_head_from_file(model_path, "lm_head.weight", d_model).expect("Failed to load LM head");
         assert_eq!(lm_head.vocab_size, vocab_size);
         assert_eq!(lm_head.d_model, d_model);
         eprintln!("[real_tinyllama] LM head loaded: vocab={}", lm_head.vocab_size);
@@ -4285,8 +4060,7 @@ mod integration {
         let file = std::fs::File::open(model_path).unwrap();
         let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
         let tensors = SafeTensors::deserialize(&mmap).unwrap();
-        let (final_norm, _qi) = load_final_norm(&tensors, "model.norm.weight", d_model)
-            .expect("Failed to load final norm");
+        let (final_norm, _qi) = load_final_norm(&tensors, "model.norm.weight", d_model).expect("Failed to load final norm");
         assert_eq!(final_norm.len(), d_model);
         eprintln!("[real_tinyllama] Final norm loaded: len={}", final_norm.len());
 
@@ -4300,9 +4074,7 @@ mod integration {
     #[test]
     #[ignore] // Requires TinyLlama-1.1B model file (~2GB) and takes ~30s for FHE ops
     fn test_e2e_real_tinyllama_fhe_inference_d64() {
-        use crate::model_loader::{
-            LoaderConfig, load_layer_from_file, load_embedding_from_file,
-        };
+        use crate::model_loader::{load_embedding_from_file, load_layer_from_file, LoaderConfig};
 
         let model_path = "/home/dev/models/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/\
             snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6/model.safetensors";
@@ -4341,8 +4113,7 @@ mod integration {
 
         // ---- 1. Load layer 0 at full dimensions ----
         let loader_config = LoaderConfig::llama(full_dims.clone());
-        let layer_result = load_layer_from_file(model_path, 0, &loader_config)
-            .expect("Failed to load layer 0");
+        let layer_result = load_layer_from_file(model_path, 0, &loader_config).expect("Failed to load layer 0");
         let full_w = &layer_result.weights;
 
         eprintln!("[fhe_d64] Layer 0 loaded. Truncating to d_model={trunc_d_model}, d_ffn={trunc_d_ffn}...");
@@ -4361,34 +4132,25 @@ mod integration {
             w_o: truncate_weights(&full_w.attention.w_o, trunc_d_model, trunc_d_model),
         };
 
-        // FFN weights from loader: w1=[2048][5632], w2=[5632][2048], w3=[2048][5632]
-        // Vec pipeline expects:    w1=[d_ffn][d_model], w2=[d_model][d_ffn], w3=[d_ffn][d_model]
-        // So first truncate, then transpose w1 and w3; w2 transpose goes from [d_ffn][d_model]->[d_model][d_ffn]
-        //
-        // Loader: w1=[2048][5632], truncate to [64][128] then transpose to [128][64]
-        let w1_trunc = truncate_weights(&full_w.ffn.w1, trunc_d_model, trunc_d_ffn);
-        let w1_vec = transpose_weights(&w1_trunc); // [128][64]
-        // Loader: w2=[5632][2048], truncate to [128][64] then transpose to [64][128]
-        let w2_trunc = truncate_weights(&full_w.ffn.w2, trunc_d_ffn, trunc_d_model);
-        let w2_vec = transpose_weights(&w2_trunc); // [64][128]
-        // Loader: w3=[2048][5632], truncate to [64][128] then transpose to [128][64]
-        let w3_full = full_w.ffn.w3.as_ref().expect("SwiGLU w3");
-        let w3_trunc = truncate_weights(w3_full, trunc_d_model, trunc_d_ffn);
-        let w3_vec = transpose_weights(&w3_trunc); // [128][64]
+        // FFN weights from loader are first truncated in loader orientation,
+        // then converted with the same helper used by the vec pipeline.
+        let trunc_ffn_loader = FFNWeights {
+            w1: truncate_weights(&full_w.ffn.w1, trunc_d_model, trunc_d_ffn),
+            w2: truncate_weights(&full_w.ffn.w2, trunc_d_ffn, trunc_d_model),
+            w3: full_w
+                .ffn
+                .w3
+                .as_ref()
+                .map(|w3| truncate_weights(w3, trunc_d_model, trunc_d_ffn)),
+        };
 
         // Norm gammas: truncate to first 64 elements
-        let trunc_attn_gamma = full_w.pre_attn_norm_gamma.as_ref()
-            .map(|g| g[..trunc_d_model].to_vec());
-        let trunc_ffn_gamma = full_w.pre_ffn_norm_gamma.as_ref()
-            .map(|g| g[..trunc_d_model].to_vec());
+        let trunc_attn_gamma = full_w.pre_attn_norm_gamma.as_ref().map(|g| g[..trunc_d_model].to_vec());
+        let trunc_ffn_gamma = full_w.pre_ffn_norm_gamma.as_ref().map(|g| g[..trunc_d_model].to_vec());
 
         let trunc_weights = TransformerBlockWeights {
             attention: trunc_attn,
-            ffn: FFNWeights {
-                w1: w1_vec,
-                w2: w2_vec,
-                w3: Some(w3_vec),
-            },
+            ffn: trunc_ffn_loader.into_vec_pipeline_weights(),
             pre_attn_norm_gamma: trunc_attn_gamma,
             pre_ffn_norm_gamma: trunc_ffn_gamma,
         };
@@ -4401,16 +4163,15 @@ mod integration {
         assert_eq!(trunc_weights.attention.w_q[0].len(), trunc_d_model);
         assert_eq!(trunc_weights.attention.w_k.len(), trunc_d_model);
         assert_eq!(trunc_weights.attention.w_k[0].len(), trunc_d_model);
-        assert_eq!(trunc_weights.ffn.w1.len(), trunc_d_ffn);        // [128][64]
+        assert_eq!(trunc_weights.ffn.w1.len(), trunc_d_ffn); // [128][64]
         assert_eq!(trunc_weights.ffn.w1[0].len(), trunc_d_model);
-        assert_eq!(trunc_weights.ffn.w2.len(), trunc_d_model);       // [64][128]
+        assert_eq!(trunc_weights.ffn.w2.len(), trunc_d_model); // [64][128]
         assert_eq!(trunc_weights.ffn.w2[0].len(), trunc_d_ffn);
-        eprintln!("[fhe_d64] Weights truncated and transposed for vec pipeline");
+        eprintln!("[fhe_d64] Weights truncated and converted for vec pipeline");
 
         // ---- 3. Load embedding and get input token ----
-        let embedding = load_embedding_from_file(
-            model_path, "model.embed_tokens.weight", full_dims.d_model,
-        ).expect("Failed to load embedding");
+        let embedding = load_embedding_from_file(model_path, "model.embed_tokens.weight", full_dims.d_model)
+            .expect("Failed to load embedding");
 
         // Use token_id=1 (BOS token in LLaMA)
         let token_id = 1usize;
@@ -4424,16 +4185,12 @@ mod integration {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         let module: Module<BE> = Module::new(params.n());
         let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
-        let eval_key = ChimeraEvalKey::generate(
-            &module, &key, &params, [43u8; 32], [44u8; 32],
-        );
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [43u8; 32], [44u8; 32]);
         eprintln!("[fhe_d64] FHE keys generated (80-bit security, N={})", params.n());
 
         // ---- 5. Encrypt input embedding ----
         // Clamp to i8 range for encryption
-        let input_i8: Vec<i8> = trunc_emb.iter()
-            .map(|&v| v.clamp(-127, 127) as i8)
-            .collect();
+        let input_i8: Vec<i8> = trunc_emb.iter().map(|&v| v.clamp(-127, 127) as i8).collect();
         let ct_x = encrypt_vec(&module, &key, &params, &input_i8);
         assert_eq!(ct_x.len(), trunc_d_model);
         eprintln!("[fhe_d64] Input encrypted: {} ciphertexts", ct_x.len());
@@ -4454,13 +4211,15 @@ mod integration {
 
         eprintln!("[fhe_d64] Running FHE transformer block (d_model={trunc_d_model}, d_ffn={trunc_d_ffn}, 1 head)...");
         let start = std::time::Instant::now();
-        let result_cts = chimera_transformer_block_vec(
-            &module, &eval_key, &ct_x, &block_config, &trunc_weights,
-        );
+        let result_cts = chimera_transformer_block_vec(&module, &eval_key, &ct_x, &block_config, &trunc_weights);
         let elapsed = start.elapsed();
         eprintln!("[fhe_d64] Transformer block completed in {:.2?}", elapsed);
 
-        assert_eq!(result_cts.len(), trunc_d_model, "Output should have {trunc_d_model} ciphertexts");
+        assert_eq!(
+            result_cts.len(),
+            trunc_d_model,
+            "Output should have {trunc_d_model} ciphertexts"
+        );
 
         // ---- 7. Decrypt output ----
         let decrypted = decrypt_vec(&module, &key, &params, &result_cts);
@@ -4491,20 +4250,31 @@ mod integration {
         eprintln!("[fhe_d64] Running partial cleartext check (QKV projection)...");
 
         // Compute cleartext Q, K, V projections
-        let cleartext_q: Vec<f64> = trunc_weights.attention.w_q.iter()
+        let cleartext_q: Vec<f64> = trunc_weights
+            .attention
+            .w_q
+            .iter()
             .map(|row| row.iter().zip(input_i8.iter()).map(|(&w, &x)| w * x as i64).sum::<i64>() as f64)
             .collect();
-        let cleartext_k: Vec<f64> = trunc_weights.attention.w_k.iter()
+        let cleartext_k: Vec<f64> = trunc_weights
+            .attention
+            .w_k
+            .iter()
             .map(|row| row.iter().zip(input_i8.iter()).map(|(&w, &x)| w * x as i64).sum::<i64>() as f64)
             .collect();
 
-        eprintln!("[fhe_d64] Cleartext Q[..8]: {:?}", &cleartext_q[..8].iter().map(|v| *v as i64).collect::<Vec<_>>());
-        eprintln!("[fhe_d64] Cleartext K[..8]: {:?}", &cleartext_k[..8].iter().map(|v| *v as i64).collect::<Vec<_>>());
+        eprintln!(
+            "[fhe_d64] Cleartext Q[..8]: {:?}",
+            &cleartext_q[..8].iter().map(|v| *v as i64).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "[fhe_d64] Cleartext K[..8]: {:?}",
+            &cleartext_k[..8].iter().map(|v| *v as i64).collect::<Vec<_>>()
+        );
 
         // Also run a standalone FHE QKV projection to validate against cleartext
-        let (fhe_q, fhe_k, _fhe_v) = crate::attention::chimera_qkv_project_vec(
-            &module, &ct_x, &trunc_weights.attention, trunc_d_model, trunc_d_model,
-        );
+        let (fhe_q, fhe_k, _fhe_v) =
+            crate::attention::chimera_qkv_project_vec(&module, &ct_x, &trunc_weights.attention, trunc_d_model, trunc_d_model);
 
         // Decrypt FHE Q and K
         let fhe_q_dec = decrypt_vec(&module, &key, &params, &fhe_q);
@@ -4514,7 +4284,8 @@ mod integration {
         eprintln!("[fhe_d64] FHE    K[..8]: {:?}", &fhe_k_dec[..8]);
 
         // Compare QKV projection: cleartext vs FHE
-        let q_errors: Vec<i16> = fhe_q_dec.iter()
+        let q_errors: Vec<i16> = fhe_q_dec
+            .iter()
             .zip(cleartext_q.iter())
             .map(|(&fhe, &ct)| (fhe as i16) - (ct.round().clamp(-128.0, 127.0) as i8 as i16))
             .collect();
@@ -4563,10 +4334,17 @@ mod integration {
         let neg_count = decrypted.iter().filter(|&&v| v < 0).count();
 
         eprintln!("[fhe_d64] Output statistics:");
-        eprintln!("[fhe_d64]   Non-zero: {nonzero_count}/{} ({:.1}%)", trunc_d_model, nonzero_frac * 100.0);
+        eprintln!(
+            "[fhe_d64]   Non-zero: {nonzero_count}/{} ({:.1}%)",
+            trunc_d_model,
+            nonzero_frac * 100.0
+        );
         eprintln!("[fhe_d64]   Mean: {mean:.2}, Std: {std_dev:.2}");
         eprintln!("[fhe_d64]   Min: {min_val}, Max: {max_val}, Dynamic range: {dynamic_range}");
-        eprintln!("[fhe_d64]   Positive: {pos_count}, Negative: {neg_count}, Zero: {}", trunc_d_model - pos_count - neg_count);
+        eprintln!(
+            "[fhe_d64]   Positive: {pos_count}, Negative: {neg_count}, Zero: {}",
+            trunc_d_model - pos_count - neg_count
+        );
 
         // Print side-by-side for first 16 dims
         eprintln!("[fhe_d64] FHE output (first 16 dims):");
@@ -4610,7 +4388,10 @@ mod integration {
         eprintln!("[fhe_d64] E2E REAL TINYLLAMA FHE INFERENCE TEST PASSED");
         eprintln!("[fhe_d64] Pipeline: real BF16 safetensors -> INT8 quantize -> truncate d=64 -> encrypt -> transformer_block_vec -> decrypt");
         eprintln!("[fhe_d64] QKV validation: Q MAE={q_mae:.2}, Q max_err={q_max_err}");
-        eprintln!("[fhe_d64] Output validation: non-zero={:.1}%, std={std_dev:.2}, range=[{min_val},{max_val}]", nonzero_frac * 100.0);
+        eprintln!(
+            "[fhe_d64] Output validation: non-zero={:.1}%, std={std_dev:.2}, range=[{min_val},{max_val}]",
+            nonzero_frac * 100.0
+        );
         eprintln!("[fhe_d64] Total wall time for FHE block: {:.2?}", elapsed);
     }
 }

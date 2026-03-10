@@ -22,11 +22,7 @@ use crate::params::ChimeraParams;
 /// # Panics
 ///
 /// Panics if `values.len() > params.slots`.
-pub fn encode_int8<BE: Backend>(
-    module: &Module<BE>,
-    params: &ChimeraParams,
-    values: &[i8],
-) -> GLWEPlaintext<Vec<u8>>
+pub fn encode_int8<BE: Backend>(module: &Module<BE>, params: &ChimeraParams, values: &[i8]) -> GLWEPlaintext<Vec<u8>>
 where
     Module<BE>: ModuleN,
 {
@@ -72,11 +68,7 @@ where
 /// # Panics
 ///
 /// Panics if `values.len() > params.slots`.
-pub fn encode_fp16<BE: Backend>(
-    module: &Module<BE>,
-    params: &ChimeraParams,
-    values: &[f32],
-) -> GLWEPlaintext<Vec<u8>>
+pub fn encode_fp16<BE: Backend>(module: &Module<BE>, params: &ChimeraParams, values: &[f32]) -> GLWEPlaintext<Vec<u8>>
 where
     Module<BE>: ModuleN,
 {
@@ -122,12 +114,7 @@ where
 /// # Panics
 ///
 /// Panics if `count > params.slots`.
-pub fn decode_int8<BE: Backend>(
-    module: &Module<BE>,
-    params: &ChimeraParams,
-    pt: &GLWEPlaintext<Vec<u8>>,
-    count: usize,
-) -> Vec<i8>
+pub fn decode_int8<BE: Backend>(module: &Module<BE>, params: &ChimeraParams, pt: &GLWEPlaintext<Vec<u8>>, count: usize) -> Vec<i8>
 where
     Module<BE>: ModuleN,
 {
@@ -254,10 +241,7 @@ mod tests {
         for (v, d) in values.iter().zip(decoded.iter()) {
             let err = (v - d).abs();
             // Allow quantisation error up to 2^(-scale_bits)
-            assert!(
-                err < 0.01,
-                "fp16 roundtrip error too large: {v} -> {d}, err={err}"
-            );
+            assert!(err < 0.01, "fp16 roundtrip error too large: {v} -> {d}, err={err}");
         }
     }
 
@@ -265,14 +249,8 @@ mod tests {
     fn test_packing_mode() {
         let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
         assert_eq!(PackingMode::Custom(64).active_slots(&params), 64);
-        assert_eq!(
-            PackingMode::HeadAligned { d_head: 128 }.active_slots(&params),
-            128,
-        );
-        assert_eq!(
-            PackingMode::EmbeddingAligned { d_model: 4096 }.active_slots(&params),
-            4096,
-        );
+        assert_eq!(PackingMode::HeadAligned { d_head: 128 }.active_slots(&params), 128,);
+        assert_eq!(PackingMode::EmbeddingAligned { d_model: 4096 }.active_slots(&params), 4096,);
         // ExpertAligned clamped to slots when dimension exceeds N
         assert_eq!(
             PackingMode::ExpertAligned { d_expert: 99999 }.active_slots(&params),

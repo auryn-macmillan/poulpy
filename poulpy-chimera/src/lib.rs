@@ -48,22 +48,22 @@
 //!
 //! ## Scratch-Space Allocation
 //!
-//! All operations accept a mutable `Scratch<BE>` arena. No heap allocation
-//! occurs on the hot path.
+//! Core backend operations use scratch-space arenas, but higher-level research
+//! helpers and tests may still allocate owned buffers.
 
-pub mod params;
+pub mod activations;
+pub mod arithmetic;
+pub mod attention;
+pub mod bootstrapping;
 pub mod encoding;
 pub mod encrypt;
-pub mod arithmetic;
-pub mod activations;
-pub mod lut;
 pub mod layernorm;
-pub mod attention;
-pub mod transformer;
+pub mod lut;
+pub mod model_loader;
 pub mod moe;
 pub mod noise;
-pub mod bootstrapping;
-pub mod model_loader;
+pub mod params;
+pub mod transformer;
 pub mod verification;
 
 #[cfg(test)]

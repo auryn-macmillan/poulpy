@@ -4,15 +4,15 @@
 //! slot rotation — the four building blocks needed for all transformer
 //! operations under FHE.
 
+use poulpy_core::ScratchTakeCore;
 use poulpy_core::{
+    layouts::{GLWEInfos, GLWELayout, LWEInfos, TorusPrecision, GLWE},
     GLWEAdd, GLWEAutomorphism, GLWEMulConst, GLWESub, GLWETrace,
-    layouts::{GLWE, GLWEInfos, GLWELayout, LWEInfos, TorusPrecision},
 };
 use poulpy_hal::{
     api::{ModuleN, ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
     layouts::{Backend, Module, Scratch, ScratchOwned},
 };
-use poulpy_core::ScratchTakeCore;
 
 use crate::encrypt::ChimeraEvalKey;
 use crate::params::ChimeraParams;
@@ -25,11 +25,7 @@ use crate::params::ChimeraParams;
 /// # Panics
 ///
 /// Panics if the ciphertexts have incompatible parameters.
-pub fn chimera_add<BE: Backend>(
-    module: &Module<BE>,
-    a: &GLWE<Vec<u8>>,
-    b: &GLWE<Vec<u8>>,
-) -> GLWE<Vec<u8>>
+pub fn chimera_add<BE: Backend>(module: &Module<BE>, a: &GLWE<Vec<u8>>, b: &GLWE<Vec<u8>>) -> GLWE<Vec<u8>>
 where
     Module<BE>: GLWEAdd,
 {
@@ -50,11 +46,7 @@ where
 /// # Panics
 ///
 /// Panics if the ciphertexts have incompatible parameters.
-pub fn chimera_sub<BE: Backend>(
-    module: &Module<BE>,
-    a: &GLWE<Vec<u8>>,
-    b: &GLWE<Vec<u8>>,
-) -> GLWE<Vec<u8>>
+pub fn chimera_sub<BE: Backend>(module: &Module<BE>, a: &GLWE<Vec<u8>>, b: &GLWE<Vec<u8>>) -> GLWE<Vec<u8>>
 where
     Module<BE>: GLWESub,
 {
@@ -81,11 +73,7 @@ where
 /// # Panics
 ///
 /// Panics if scratch space is insufficient.
-pub fn chimera_mul_const<BE: Backend>(
-    module: &Module<BE>,
-    ct: &GLWE<Vec<u8>>,
-    constants: &[i64],
-) -> GLWE<Vec<u8>>
+pub fn chimera_mul_const<BE: Backend>(module: &Module<BE>, ct: &GLWE<Vec<u8>>, constants: &[i64]) -> GLWE<Vec<u8>>
 where
     Module<BE>: GLWEMulConst<BE>,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
@@ -121,11 +109,7 @@ where
 /// # Returns
 ///
 /// A new ciphertext at the target layout.
-pub fn chimera_project_layout<BE: Backend>(
-    module: &Module<BE>,
-    ct: &GLWE<Vec<u8>>,
-    target: &GLWELayout,
-) -> GLWE<Vec<u8>>
+pub fn chimera_project_layout<BE: Backend>(module: &Module<BE>, ct: &GLWE<Vec<u8>>, target: &GLWELayout) -> GLWE<Vec<u8>>
 where
     Module<BE>: GLWEMulConst<BE>,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
@@ -150,11 +134,7 @@ where
 ///
 /// This is implemented by creating a new ciphertext with reduced torus
 /// precision k' = k - base2k and copying the upper limbs.
-pub fn chimera_rescale<BE: Backend>(
-    _module: &Module<BE>,
-    ct: &GLWE<Vec<u8>>,
-    params: &ChimeraParams,
-) -> GLWE<Vec<u8>>
+pub fn chimera_rescale<BE: Backend>(_module: &Module<BE>, ct: &GLWE<Vec<u8>>, params: &ChimeraParams) -> GLWE<Vec<u8>>
 where
     Module<BE>: ModuleN,
 {
@@ -206,11 +186,8 @@ where
             for col in 0..cols {
                 let src_offset = (j * cols + col) * limb_bytes;
                 let dst_offset = (j * cols + col) * limb_bytes;
-                if src_offset + limb_bytes <= src.len()
-                    && dst_offset + limb_bytes <= dst.len()
-                {
-                    dst[dst_offset..dst_offset + limb_bytes]
-                        .copy_from_slice(&src[src_offset..src_offset + limb_bytes]);
+                if src_offset + limb_bytes <= src.len() && dst_offset + limb_bytes <= dst.len() {
+                    dst[dst_offset..dst_offset + limb_bytes].copy_from_slice(&src[src_offset..src_offset + limb_bytes]);
                 }
             }
         }
@@ -235,11 +212,7 @@ where
 /// # Panics
 ///
 /// Panics if `cts` and `weights` have different lengths or are empty.
-pub fn chimera_dot_product<BE: Backend>(
-    module: &Module<BE>,
-    cts: &[GLWE<Vec<u8>>],
-    weights: &[Vec<i64>],
-) -> GLWE<Vec<u8>>
+pub fn chimera_dot_product<BE: Backend>(module: &Module<BE>, cts: &[GLWE<Vec<u8>>], weights: &[Vec<i64>]) -> GLWE<Vec<u8>>
 where
     Module<BE>: GLWEMulConst<BE> + GLWEAdd,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
@@ -370,16 +343,13 @@ where
 
     let gal_el = module.galois_element(k);
 
-    let auto_key = eval_key
-        .auto_keys
-        .get(&gal_el)
-        .unwrap_or_else(|| {
-            panic!(
-                "chimera_rotate_slots: no automorphism key for rotation k={k} \
+    let auto_key = eval_key.auto_keys.get(&gal_el).unwrap_or_else(|| {
+        panic!(
+            "chimera_rotate_slots: no automorphism key for rotation k={k} \
                  (Galois element {gal_el}). Call ChimeraEvalKey::add_rotation_keys \
                  with this position first."
-            )
-        });
+        )
+    });
 
     // Automorphism: output has the same layout as input for in-place variant,
     // but for the out-of-place variant, we allocate separately.
@@ -395,12 +365,7 @@ where
     }
 
     // Compute scratch
-    let auto_bytes = GLWE::<Vec<u8>>::automorphism_tmp_bytes(
-        module,
-        &res,
-        &res,
-        &eval_key.auto_key_layout,
-    );
+    let auto_bytes = GLWE::<Vec<u8>>::automorphism_tmp_bytes(module, &res, &res, &eval_key.auto_key_layout);
     let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(auto_bytes);
 
     res.automorphism_inplace(module, auto_key, scratch.borrow());
@@ -608,11 +573,13 @@ mod tests {
         // row0: [2, 3] * 2 = [4, 6]
         assert!(
             (decoded0[0] as i16 - 4).unsigned_abs() <= 1,
-            "matmul row0[0]: expected 4, got {}", decoded0[0]
+            "matmul row0[0]: expected 4, got {}",
+            decoded0[0]
         );
         assert!(
             (decoded0[1] as i16 - 6).unsigned_abs() <= 1,
-            "matmul row0[1]: expected 6, got {}", decoded0[1]
+            "matmul row0[1]: expected 6, got {}",
+            decoded0[1]
         );
 
         let pt1 = chimera_decrypt(&module, &key, &results[1], &params);
@@ -620,11 +587,13 @@ mod tests {
         // row1: [2, 3] * 3 = [6, 9]
         assert!(
             (decoded1[0] as i16 - 6).unsigned_abs() <= 1,
-            "matmul row1[0]: expected 6, got {}", decoded1[0]
+            "matmul row1[0]: expected 6, got {}",
+            decoded1[0]
         );
         assert!(
             (decoded1[1] as i16 - 9).unsigned_abs() <= 1,
-            "matmul row1[1]: expected 9, got {}", decoded1[1]
+            "matmul row1[1]: expected 9, got {}",
+            decoded1[1]
         );
     }
 
@@ -661,10 +630,7 @@ mod tests {
 
         // Expected: 3*2 + 4*1 = 10
         let diff = (decoded[0] as i16 - 10).unsigned_abs();
-        assert!(
-            diff <= 2,
-            "matmul ct_pt: expected 10, got {}, diff={}", decoded[0], diff
-        );
+        assert!(diff <= 2, "matmul ct_pt: expected 10, got {}, diff={}", decoded[0], diff);
     }
 
     #[test]
@@ -679,9 +645,7 @@ mod tests {
         let ct = chimera_encrypt(&module, &key, &pt, [2u8; 32], [3u8; 32]);
 
         // Generate eval key (only trace keys, rotation by 0 doesn't need extra)
-        let eval_key = crate::encrypt::ChimeraEvalKey::generate(
-            &module, &key, &params, [4u8; 32], [5u8; 32],
-        );
+        let eval_key = crate::encrypt::ChimeraEvalKey::generate(&module, &key, &params, [4u8; 32], [5u8; 32]);
 
         let ct_rot = chimera_rotate_slots(&module, &eval_key, &ct, 0);
         let pt_dec = chimera_decrypt(&module, &key, &ct_rot, &params);
@@ -692,7 +656,8 @@ mod tests {
             assert!(
                 diff <= 1,
                 "rotate_slots(0) error at {i}: expected {}, got {}",
-                values[i], decoded[i]
+                values[i],
+                decoded[i]
             );
         }
     }
@@ -722,9 +687,7 @@ mod tests {
         let ct = chimera_encrypt(&module, &key, &pt, [2u8; 32], [3u8; 32]);
 
         // Generate eval key with rotation key for position 1
-        let mut eval_key = crate::encrypt::ChimeraEvalKey::generate(
-            &module, &key, &params, [4u8; 32], [5u8; 32],
-        );
+        let mut eval_key = crate::encrypt::ChimeraEvalKey::generate(&module, &key, &params, [4u8; 32], [5u8; 32]);
         eval_key.add_rotation_keys(&module, &key, &[1], [6u8; 32], [7u8; 32]);
 
         let ct_rot = chimera_rotate_slots(&module, &eval_key, &ct, 1);
@@ -741,10 +704,7 @@ mod tests {
 
         // Coefficient 0 should be preserved (automorphism fixes the constant term)
         let diff0 = (decoded[0] as i16 - 10).unsigned_abs();
-        assert!(
-            diff0 <= 1,
-            "rotate_slots(1) coeff[0]: expected 10, got {}", decoded[0]
-        );
+        assert!(diff0 <= 1, "rotate_slots(1) coeff[0]: expected 10, got {}", decoded[0]);
 
         // The non-zero values should sum to approximately the same as the input.
         // (Automorphism is a permutation, not a scaling, so total "energy" is preserved.)

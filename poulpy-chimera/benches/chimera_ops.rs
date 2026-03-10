@@ -244,6 +244,97 @@ fn bench_ffn_standard_fhe(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Realistic-dimension benchmarks (d_model=128)
+// ---------------------------------------------------------------------------
+
+/// Benchmarks matmul at d_model=128 (128 output rows, each with 128 coefficients).
+fn bench_matmul_d128(c: &mut Criterion) {
+    let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+    let module: Module<BE> = Module::new(params.n());
+    let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+
+    let vals: Vec<i8> = (0..128).map(|i| ((i % 7) as i8) - 3).collect();
+    let pt = encode_int8(&module, &params, &vals);
+    let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+    // 128 output rows, each with 128 polynomial coefficients
+    let weight_rows: Vec<Vec<i64>> = (0..128)
+        .map(|r| (0..128).map(|c| ((r * 128 + c) % 5) as i64 - 2).collect())
+        .collect();
+
+    c.bench_function("chimera/matmul_d128", |b| {
+        b.iter(|| chimera_matmul_single_ct(&module, black_box(&ct), black_box(&weight_rows)))
+    });
+}
+
+/// Benchmarks mul_const with a 128-coefficient polynomial weight.
+fn bench_mul_const_d128(c: &mut Criterion) {
+    let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+    let module: Module<BE> = Module::new(params.n());
+    let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+
+    let vals: Vec<i8> = (0..128).map(|i| ((i % 5) as i8) - 2).collect();
+    let pt = encode_int8(&module, &params, &vals);
+    let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+    let weight: Vec<i64> = (0..128).map(|i| (i % 5) as i64 - 2).collect();
+
+    c.bench_function("chimera/mul_const_128coeff", |b| {
+        b.iter(|| chimera_mul_const(&module, black_box(&ct), black_box(&weight)))
+    });
+}
+
+/// Benchmarks ct*ct multiplication at realistic dimension.
+fn bench_ct_ct_mul_d128(c: &mut Criterion) {
+    let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+    let module: Module<BE> = Module::new(params.n());
+    let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+    let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [50u8; 32], [60u8; 32]);
+
+    let vals: Vec<i8> = (0..128).map(|i| ((i % 7) as i8) - 3).collect();
+    let pt = encode_int8(&module, &params, &vals);
+    let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+    c.bench_function("chimera/ct_ct_mul_d128", |b| {
+        b.iter(|| chimera_ct_mul(&module, &eval_key, black_box(&ct), black_box(&ct)))
+    });
+}
+
+/// Benchmarks a standard FFN pipeline at modest dimension (d_model=4, d_ffn=8).
+/// Full d_model=128 FFN would take minutes per iteration; we measure a smaller
+/// but representative configuration to derive per-op scaling factors.
+fn bench_ffn_d4h8(c: &mut Criterion) {
+    let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+    let module: Module<BE> = Module::new(params.n());
+    let key = ChimeraKey::generate(&module, &params, [42u8; 32]);
+    let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [50u8; 32], [60u8; 32]);
+
+    let vals: Vec<i8> = vec![1, 2, 3, 4];
+    let pt = encode_int8(&module, &params, &vals);
+    let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
+
+    // d_model=4, d_ffn=8: w1 has 8 rows (up-project), w2 has 4 rows (down-project)
+    let w1: Vec<Vec<i64>> = (0..8).map(|_| vec![1i64]).collect();
+    let w2: Vec<Vec<i64>> = (0..4)
+        .map(|_| vec![1i64; 8])
+        .collect();
+
+    let weights = FFNWeights { w1, w2, w3: None };
+
+    c.bench_function("chimera/ffn_standard_d4h8", |b| {
+        b.iter(|| {
+            chimera_ffn_standard(
+                &module,
+                &eval_key,
+                black_box(&ct),
+                black_box(&weights),
+                &ActivationChoice::SquaredReLU,
+            )
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_encoding,
@@ -258,5 +349,9 @@ criterion_group!(
     bench_poly_activation_fhe,
     bench_matmul_fhe,
     bench_ffn_standard_fhe,
+    bench_matmul_d128,
+    bench_mul_const_d128,
+    bench_ct_ct_mul_d128,
+    bench_ffn_d4h8,
 );
 criterion_main!(benches);

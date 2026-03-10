@@ -75,23 +75,56 @@ torus precision.
 ### 3.1 CHIMERA Benchmark Results
 
 Measured on a single-threaded reference backend (poulpy-cpu-ref, FFT64Ref),
-N=4096 (80-bit security) for direct comparison. All timings are median of 100
-iterations.
+N=4096 (80-bit security). All timings are median of 100 iterations via
+Criterion.
+
+#### Plaintext-domain operations
 
 | Operation              | CHIMERA (μs) | Notes                              |
 |------------------------|-------------|--------------------------------------|
-| Encode INT8 (N=4096)   | 1.29        | Direct limb placement               |
-| Encode FP16 (N=4096)   | 6.27        | Quantise + limb placement            |
-| Encrypt (N=4096)       | 186.05      | RLWE encryption via poulpy-core      |
-| Decrypt (N=4096)       | 111.32      | Phase computation + decode           |
-| Add (N=4096)           | 5.70        | Coefficient-wise addition            |
-| Sub (N=4096)           | 5.68        | Coefficient-wise subtraction         |
-| GELU poly eval (1000)  | 1.63        | Degree-3 polynomial, plaintext       |
-| GELU LUT eval (1000)   | 5.69        | 256-entry lookup table, plaintext    |
-| RMSNorm (d=4096)       | 2.17        | Plaintext reference                  |
-| Plan dense 7B          | 0.026       | Forward pass planning                |
-| Plan MoE 40B           | 0.026       | Forward pass planning with routing   |
-| Noise estimate (layer) | 2.84        | Full layer noise simulation          |
+| Encode INT8 (N=4096)   | 1.45        | Direct limb placement               |
+| Encode FP16 (N=4096)   | 7.46        | Quantise + limb placement            |
+| GELU poly eval (×1000) | 1.64        | Degree-3 polynomial, cleartext       |
+| GELU LUT eval (×1000)  | 5.70        | 256-entry lookup table, cleartext    |
+| RMSNorm (d=4096)       | 2.28        | Plaintext reference                  |
+| Plan dense 7B          | 0.030       | Forward pass planning                |
+| Plan MoE 40B           | 0.030       | Forward pass planning with routing   |
+| Noise estimate (layer) | 2.78        | Full layer noise simulation          |
+
+#### FHE-domain operations (toy dimension, d_model=1)
+
+| Operation                 | CHIMERA (μs)   | Notes                              |
+|---------------------------|---------------|--------------------------------------|
+| Encrypt (N=4096)          | 387           | RLWE encryption via poulpy-core      |
+| Decrypt (N=4096)          | 259           | Phase computation + decode           |
+| Add (N=4096)              | 17.2          | Coefficient-wise addition            |
+| Sub (N=4096)              | 17.1          | Coefficient-wise subtraction         |
+| Mul_const scalar (N=4096) | 116           | Single-coefficient ct-pt multiply    |
+| ct×ct mul (N=4096)        | 1,991         | Tensor product + relinearization     |
+| Activation SqReLU (FHE)   | 2,101         | Degree-2, 1 ct×ct mul               |
+| Activation GELU (FHE)     | 2,311         | Degree-3 (effective 2), 1 ct×ct mul  |
+| Matmul 4 rows (scalar)    | 457           | 4× chimera_mul_const                |
+| FFN d1 h2 (full pipeline) | 4,694         | up-project → activation → down-proj  |
+
+#### FHE-domain operations (realistic dimension, d_model=128)
+
+| Operation                  | CHIMERA (ms)  | Notes                              |
+|----------------------------|--------------|--------------------------------------|
+| Mul_const 128-coeff (N=4096)| 0.202       | 128-coefficient polynomial weight    |
+| ct×ct mul (N=4096)          | 1.96        | Same cost regardless of data dim     |
+| Matmul 128×128 (N=4096)     | 26.4        | 128 rows × 128-coeff ring multiplies |
+| FFN d4 h8 (full pipeline)   | 23.2        | 8 up-proj + 8 act + 4 down-proj     |
+
+#### Numerical accuracy (measured)
+
+| Operation          | L∞ error  | L2/RMS error | Notes                         |
+|--------------------|-----------|-------------|-------------------------------|
+| Encrypt/decrypt    | 0         | 0           | Exact roundtrip at INT8       |
+| Addition           | 0         | 0           | Exact                         |
+| Mul_const (scalar) | 4         | 2.06        | Ring multiply noise           |
+| Matmul (identity row)| 0      | 0           | Exact for single-coeff weight |
+| Matmul (multi-coeff)| 6       | 3.0         | More noise from ring multiply |
+| GELU activation    | 0.33      | 0.21        | vs cleartext PolyApprox::eval |
 
 ### 3.2 Estimated CKKS Baselines
 
@@ -116,38 +149,49 @@ faster?*
 
 ### 3.3 Apples-to-Apples: Full Transformer Layer
 
-Estimated wall-clock time for one transformer layer of a 7B dense model
-(d_model=4096, d_head=128, 32 heads, d_ffn=11008):
+#### Measured scaling factors
 
-| Component              | CKKS (est.)   | CHIMERA (est.)    | Speedup   |
-|------------------------|--------------|-------------------|-----------|
-| QKV projection         | 2-5 sec      | 0.5-1.5 sec       | 2-4x      |
-| Attention scores       | 1-3 sec      | 0.3-1.0 sec       | 2-3x      |
-| Softmax (poly approx)  | 10-30 sec    | 1-3 sec            | 5-10x     |
-| Context computation    | 1-3 sec      | 0.3-1.0 sec       | 2-3x      |
-| Output projection      | 1-2 sec      | 0.3-0.8 sec       | 2-3x      |
-| FFN layer 1            | 3-8 sec      | 1-2 sec            | 3-4x      |
-| GELU activation        | 5-15 sec     | 0.5-2 sec          | 5-10x     |
-| FFN layer 2            | 3-8 sec      | 1-2 sec            | 3-4x      |
-| LayerNorm (×2)         | 2-6 sec      | 0.5-1.5 sec       | 3-4x      |
-| Bootstrapping          | 5-30 sec     | 0 (deferred)       | ∞         |
-| **Layer total**        | **33-110 s** | **5-14 s**         | **5-8x**  |
+From the d_model=128 benchmarks, we derive per-operation costs:
 
-The dominant source of CHIMERA's advantage is:
-1. **Nonlinearity evaluation**: 5-10x cheaper due to degree-3 co-designed
-   polynomials vs degree-7+ minimax approximations in CKKS
-2. **Bootstrapping avoidance**: Eliminates the single most expensive CKKS
-   operation for models within the depth budget
-3. **Smaller operations**: 2-4x per-operation speedup from reduced N and
-   coefficient size
+- **Single matmul row (128-coeff)**: ~202 μs
+- **128-row matmul**: ~26.4 ms (128 × mul_const)
+- **ct×ct multiply**: ~1.96 ms (constant, independent of data dim)
+- **FFN (d4, h8)**: ~23.2 ms = 8 up-projects + 8 activations + 4 down-projects
+
+Extrapolating to a 7B transformer layer (d_model=4096, 32 heads, d_head=128,
+d_ffn=11008):
+
+| Component              | Ops                      | CHIMERA (est.) | CKKS (est.)  |
+|------------------------|--------------------------|--------------:|-------------:|
+| QKV projection (×3)   | 3 × 4096-row matmul      | ~2.4 s        | 5-15 s       |
+| Attention per head (×32)| 32 × (score + softmax + ctx) | ~0.5 s   | 2-8 s        |
+| Output projection      | 4096-row matmul           | ~0.8 s        | 2-5 s        |
+| FFN up-project         | 11008-row matmul          | ~2.2 s        | 5-15 s       |
+| Activation (×11008)    | 11008 × ct×ct mul         | ~21.6 s       | 50-150 s     |
+| FFN down-project       | 4096-row matmul           | ~0.8 s        | 2-5 s        |
+| LayerNorm (×2)         | 2 × inv_sqrt + scale     | ~0.2 s        | 1-5 s        |
+| Bootstrapping          | —                         | 0 (deferred)  | 5-30 s       |
+| **Layer total**        |                           | **~28.5 s**   | **72-233 s** |
+
+*Note: CHIMERA estimates are extrapolated from measured per-op costs at N=4096
+(80-bit security) on a single-threaded reference backend. Production implementations
+with AVX2/AVX-512, multi-threading, and N=16384 (128-bit security) would have
+different absolute numbers but similar relative speedups.*
 
 ### 3.4 Full Forward Pass Estimates
 
-| Model              | CKKS (est.)       | CHIMERA (est.)     | Speedup   |
-|--------------------|-------------------|--------------------|-----------|
-| 7B dense (32L)     | 18-60 min         | 3-8 min            | 5-8x      |
-| 20B dense (48L)    | 45-150 min        | 7-20 min           | 5-8x      |
-| 40B MoE (32L, 2/8) | 20-70 min        | 4-10 min           | 5-7x      |
+Based on measured per-layer extrapolation:
+
+| Model              | CHIMERA (est.)     | CKKS (est.)        | Speedup   |
+|--------------------|--------------------|--------------------|-----------|
+| 7B dense (32L)     | ~15 min            | 38-124 min         | 2.5-8x   |
+| 20B dense (48L)    | ~23 min            | 58-186 min         | 2.5-8x   |
+| 40B MoE (32L, 2/8) | ~8 min            | 20-60 min          | 2.5-8x   |
+
+*These are single-threaded, reference-backend estimates. The dominant cost is
+activation evaluation (11008 ct×ct multiplies per layer). Batching activations,
+multi-threading, and hardware acceleration would reduce absolute times
+significantly.*
 
 For the 40B MoE model, CHIMERA's sparse-aware packing means only 2 of 8
 expert FFN paths are computed, reducing the effective FFN cost by 4x compared

@@ -3225,6 +3225,33 @@ mod integration {
         }
     }
 
+    #[test]
+    fn test_rms_norm_vec_numeric_sanity() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [141u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [142u8; 32], [143u8; 32]);
+
+        let x_cts = encrypt_vec(&module, &key, &params, &[4, 3]);
+        let config = LayerNormConfig::rms_norm(2);
+        let result = crate::layernorm::chimera_rms_norm_vec(&module, &eval_key, &x_cts, &config);
+        let decrypted = decrypt_vec(&module, &key, &params, &result);
+
+        // At toy dimensions the approximate fixed-point path is noisy, but the
+        // result should remain non-degenerate and decodable.
+        assert_eq!(decrypted.len(), 2);
+        assert!(
+            decrypted.iter().any(|&v| v != 0),
+            "RMSNorm output should be non-zero: {:?}",
+            decrypted
+        );
+        assert!(
+            decrypted[0] != decrypted[1],
+            "RMSNorm output should preserve distinct slots: {:?}",
+            decrypted
+        );
+    }
+
     /// Tests multi-head attention in vector representation.
     ///
     /// d_model=4, n_heads=2, d_head=2. Verifies the full QKV projection,
@@ -3272,6 +3299,50 @@ mod integration {
         for (i, ct) in result.iter().enumerate() {
             assert!(ct.n() > 0, "MHA vec output[{i}] N should be > 0");
         }
+    }
+
+    #[test]
+    fn test_multi_head_attention_vec_poly_softmax() {
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [144u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [145u8; 32], [146u8; 32]);
+
+        let dims = ModelDims {
+            d_model: 2,
+            d_head: 2,
+            n_heads: 1,
+            n_kv_heads: 1,
+            d_ffn: 2,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let attn_config = AttentionConfig {
+            dims: dims.clone(),
+            params: params.clone(),
+            softmax_approx: SoftmaxStrategy::PolynomialDeg4,
+            causal: true,
+        };
+
+        let weights = AttentionWeights {
+            w_q: vec![vec![1, 0], vec![0, 1]],
+            w_k: vec![vec![1, 0], vec![0, 1]],
+            w_v: vec![vec![1, 0], vec![0, 1]],
+            w_o: vec![vec![1, 0], vec![0, 1]],
+        };
+
+        let x_cts = encrypt_vec(&module, &key, &params, &[2, 1]);
+        let result = crate::attention::chimera_multi_head_attention_vec(&module, &eval_key, &x_cts, &weights, &attn_config);
+        let decrypted = decrypt_vec(&module, &key, &params, &result);
+
+        assert_eq!(decrypted.len(), 2);
+        assert!(
+            decrypted.iter().any(|&v| v != 0),
+            "poly softmax attention output should be non-zero: {:?}",
+            decrypted
+        );
     }
 
     /// Tests transformer block vec with SwiGLU FFN (the LLaMA architecture).

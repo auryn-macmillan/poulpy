@@ -321,7 +321,7 @@ tensor products, automorphisms).
 
 ### What Works End-to-End
 
-1. Encrypt INT8 input → homomorphic transformer block → decrypt output (legacy single-ct path for small toy dims; vec path for real model layout)
+1. Encrypt INT8 input → homomorphic transformer block → decrypt output (legacy single-ct path for small toy dims only; vec path is the model-faithful path for real layouts)
 2. Multi-layer forward pass (2 layers chained, output of block 1 feeds block 2)
 3. Standard FFN and SwiGLU FFN at d_model=1 and d_model=2
 4. Bootstrapping roundtrip: encrypt value → bootstrap through identity LUT → recover original

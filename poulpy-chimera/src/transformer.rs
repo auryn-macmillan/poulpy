@@ -562,7 +562,7 @@ impl TransformerBlockWeights {
 // Homomorphic transformer block evaluation
 // ---------------------------------------------------------------------------
 
-/// Evaluates a complete transformer decoder block on an encrypted input.
+/// Evaluates a legacy single-ciphertext transformer decoder block on an encrypted input.
 ///
 /// Implements the pre-norm architecture:
 ///
@@ -614,7 +614,12 @@ impl TransformerBlockWeights {
 ///
 /// # Returns
 ///
-/// Encrypted output vector (single ciphertext representing the first output dimension).
+/// A single ciphertext result.
+///
+/// This legacy path truncates multi-output attention/FFN computations to the
+/// first produced ciphertext and is therefore suitable only for toy experiments
+/// and backward-compatibility tests. Use [`chimera_transformer_block_vec`] for
+/// model-faithful transformer evaluation.
 ///
 /// # Panics
 ///
@@ -816,7 +821,7 @@ where
     }
 }
 
-/// Evaluates a sequence of transformer blocks (full forward pass) on an encrypted input.
+/// Evaluates a sequence of legacy single-ciphertext transformer blocks.
 ///
 /// Chains `num_layers` transformer blocks sequentially, feeding the output of
 /// each block as the input to the next. All blocks share the same configuration
@@ -833,6 +838,10 @@ where
 /// # Returns
 ///
 /// Encrypted output after all transformer blocks.
+///
+/// This function inherits the legacy truncation semantics of
+/// [`chimera_transformer_block`]. Use [`chimera_forward_pass_vec`] for the
+/// vector representation used by real-model inference.
 ///
 /// # Panics
 ///

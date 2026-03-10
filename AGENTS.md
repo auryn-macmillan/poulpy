@@ -271,7 +271,7 @@ Agents should treat the following as active research questions and document find
 
 > Last updated: 2026-03-10
 
-### Crate: `poulpy-chimera` (15 source files, 130 tests passing)
+### Crate: `poulpy-chimera` (15 source files, 139 tests passing)
 
 The CHIMERA scheme is implemented as a new crate in the Poulpy workspace, reusing
 `poulpy-hal` (backend traits, FFT) and `poulpy-core` (RLWE encryption, keyswitching,
@@ -284,8 +284,8 @@ tensor products, automorphisms).
 | Scheme specification | `docs/chimera_spec.md` | ✅ Complete |
 | Reference implementation | `poulpy-chimera/src/` | ✅ Complete (15 modules) |
 | Benchmark harness | `poulpy-chimera/benches/chimera_ops.rs` | ✅ Complete |
-| Comparison report vs CKKS | `docs/chimera_comparison.md` | ✅ Complete (needs update with measured numbers) |
-| Security analysis | `docs/chimera_security.md` | ✅ Complete |
+| Comparison report vs CKKS | `docs/chimera_comparison.md` | ✅ Complete (updated with measured multi-security-level data) |
+| Security analysis | `docs/chimera_security.md` | ✅ Complete (updated with measured benchmarks at 80/100/128-bit) |
 | Verification analysis | `docs/chimera_verification.md` | ✅ Complete |
 
 ### Module Map
@@ -301,12 +301,12 @@ tensor products, automorphisms).
 | `layernorm.rs` | Approximate RMSNorm/LayerNorm under FHE (with optional gamma/beta) | ✅ |
 | `attention.rs` | QKV projection, attention scores, softmax approximation, context, output | ✅ (single-head) |
 | `transformer.rs` | Full transformer block, forward pass, FFN (standard + SwiGLU) | ✅ |
-| `moe.rs` | MoE routing cost estimation | ✅ (cost only, no homomorphic routing) |
+| `moe.rs` | MoE routing: homomorphic router, sign extraction, top-k, expert dispatch | ✅ |
 | `noise.rs` | Noise tracking and budget estimation | ✅ |
 | `bootstrapping.rs` | Full bootstrap pipeline: sample extract → LWE keyswitch → blind rotation | ✅ |
 | `model_loader.rs` | Safetensors loading, INT8/FP16/BF16/FP32 quantization, transpose, sharded models | ✅ |
-| `tests.rs` | 130 integration tests (including 8 accuracy characterization tests) | ✅ |
-| `benches/chimera_ops.rs` | Criterion benchmarks for all operations (toy + d_model=128) | ✅ |
+| `tests.rs` | 139 integration tests (including 8 accuracy + 3 security sweep tests) | ✅ |
+| `benches/chimera_ops.rs` | Criterion benchmarks for all operations (toy + d_model=128 + security sweep) | ✅ |
 
 ### Key Design Decisions Implemented
 
@@ -353,17 +353,21 @@ tensor products, automorphisms).
 
 ### P2 — Advanced Features
 
-6. **Homomorphic MoE routing**
-   - `moe.rs` has cost estimation but no homomorphic gating implementation
-   - Implement encrypted top-k expert selection (argmax under FHE)
-   - Route tokens to active experts without revealing which experts are selected
-   - Evaluate whether inactive expert paths can be skipped (FHE-specific
-     optimization opportunity from Open Question #6)
+6. ~~**Homomorphic MoE routing**~~ ✅ Done
+   - Router logit computation via `chimera_matmul_single_ct`
+   - Sign extraction comparison using bootstrap with sign LUT
+   - Conditional swap via ct×ct multiply for oblivious sorting
+   - Partial bubble sort network for encrypted top-k selection
+   - Uniform gating weights (1/n_active)
+   - Full `chimera_moe_forward` combining routing + expert FFN evaluation
 
-7. **Security parameter sweep**
-   - Run identical workload at 80-bit (N=4096), 100-bit (N=8192), 128-bit (N=16384)
-   - Measure latency, noise budget consumption, and error for each
-   - Document recommended security level for inference with justification
+7. ~~**Security parameter sweep**~~ ✅ Done
+   - Ran identical workload at 80-bit (N=4096), 100-bit (N=8192), 128-bit (N=16384)
+   - Measured latency, accuracy, and noise budget at all three levels
+   - 5 Criterion benchmarks parameterized across security levels
+   - Key finding: ~2x latency per security step; accuracy identical across levels
+   - `docs/chimera_security.md` and `docs/chimera_comparison.md` updated with
+     measured (not estimated) multi-security-level data
 
 8. **User-side verification prototype**
    - Design a lightweight proof of correct inference (not publicly verifiable)

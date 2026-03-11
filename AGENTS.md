@@ -271,7 +271,7 @@ Agents should treat the following as active research questions and document find
 
 > Last updated: 2026-03-11
 
-### Crate: `poulpy-chimera` (17 source files, 191 tests passing)
+### Crate: `poulpy-chimera` (18 source files, 208 tests passing)
 
 The CHIMERA scheme is implemented as a new crate in the Poulpy workspace, reusing
 `poulpy-hal` (backend traits, FFT) and `poulpy-core` (RLWE encryption, keyswitching,
@@ -282,7 +282,7 @@ tensor products, automorphisms).
 | Deliverable | Location | Status |
 |-------------|----------|--------|
 | Scheme specification | `docs/chimera_spec.md` | ✅ Complete |
-| Reference implementation | `poulpy-chimera/src/` | ✅ Complete (17 modules) |
+| Reference implementation | `poulpy-chimera/src/` | ✅ Complete (18 modules) |
 | Benchmark harness | `poulpy-chimera/benches/chimera_ops.rs` | ✅ Complete |
 | Comparison report vs CKKS | `docs/chimera_comparison.md` | ✅ Complete (updated with measured multi-security-level data) |
 | Security analysis | `docs/chimera_security.md` | ✅ Complete (updated with measured benchmarks at 80/100/128-bit) |
@@ -308,6 +308,7 @@ tensor products, automorphisms).
 | `verification.rs` | MAC-based user-side computation verification (linear ops) | ✅ |
 | `inference.rs` | End-to-end inference pipeline: tokenize → embed → encrypt → FHE forward → decrypt → LM head → decode | ✅ |
 | `tests.rs` | 183 integration tests (including 8 accuracy + 3 security sweep + 11 MAC verification + 4 RoPE/full-pipeline tests) + 3 E2E inference pipeline tests (ignored, require model files) | ✅ |
+| `plaintext_forward.rs` | Cleartext reference inference for FHE-vs-plaintext comparison (25 tests) | ✅ |
 | `benches/chimera_ops.rs` | Criterion benchmarks for all operations (toy + d_model=128 + security sweep) | ✅ |
 
 ### Key Design Decisions Implemented
@@ -332,7 +333,9 @@ tensor products, automorphisms).
 7. RoPE wired into multi-head attention vec path (tested at d_model=4 with n_heads=2)
 8. Full forward pass with final RMSNorm (`chimera_forward_pass_vec_full`) — production entry point
 9. Full forward pass with bootstrapping support (per-layer noise check, all-ct bootstrap)
-10. **Full text-in → text-out inference pipeline** (`inference.rs`): tokenize → embed → encrypt → FHE transformer → decrypt → LM head → decode. Tested with TinyLlama 1.1B (truncated d_model=64, 1 layer, 80-bit security). Single token generation: ~190s. Multi-token generation (3 tokens): ~570s.
+10. **Full text-in → text-out inference pipeline** (`inference.rs`): tokenize → embed → encrypt → FHE transformer → decrypt → LM head → decode. Tested with TinyLlama 1.1B (truncated d_model=64, 1 layer, 80-bit security). Single token generation: ~2.74s (release, parallelized). Multi-token generation (3 tokens): ~8.2s.
+11. **Rayon parallelization** of all hot paths (QKV projection, output projection, SwiGLU FFN, RMSNorm) — 3.2x speedup over sequential on 4 cores
+12. **Cleartext reference inference** (`plaintext_forward.rs`) for FHE-vs-plaintext comparison with 25 tests
 
 ---
 
@@ -394,10 +397,31 @@ To run CHIMERA on a real model (e.g., a quantized LLaMA-7B):
 3. ~~Load real safetensors weights via `model_loader.rs`~~ ✅ Done (implemented)
 4. ~~Build end-to-end inference pipeline (tokenize → embed → encrypt → FHE → decrypt → LM head → decode)~~ ✅ Done (`inference.rs`)
 5. Run a single-token forward pass and compare output logits to cleartext inference
-6. Profile bottlenecks and optimize hot paths
+6. ~~Profile bottlenecks and optimize hot paths~~ ✅ Done (Rayon parallelization, 3.2x speedup)
 
 The model loader already supports LLaMA naming conventions and handles INT8 quantized
 weights. All P0 and P1 items are complete. The inference pipeline (`inference.rs`) has
 been tested end-to-end with TinyLlama 1.1B at truncated dimensions (d_model=64, 1 layer,
-80-bit security), generating tokens at ~190s per token. The next concrete step is scaling
-to larger dimensions (d_model >= 128) and profiling the hot paths for optimization.
+80-bit security), generating tokens at ~2.74s per token (release, parallelized with Rayon
+on 4 cores). At d_model=128 (2 heads), a single layer takes ~9.64s.
+
+### P3 — Performance Optimization
+
+9. ~~**Rayon parallelization**~~ ✅ Done
+   - Parallelized all hot paths: QKV projection, output projection, SwiGLU FFN
+     (gate+up and down phases), standard FFN, RMSNorm (squaring and scaling)
+   - Results at d_model=64, 80-bit security, 4 cores:
+     - Single token FHE forward pass: 8.77s → 2.74s (3.2x speedup)
+     - QKV projection: 3.5x, output projection: 3.7x
+     - SwiGLU gate+up: 3.7x, down projection: 3.3x
+     - RMSNorm: 2.5-3.0x
+   - d_model=128 (2 heads, d_ffn=256): 9.64s per layer (parallelized)
+   - Profiling instrumentation added to transformer block, attention, and SwiGLU FFN
+
+### Remaining Optimization Opportunities
+
+- Parallelize per-head attention loop (score+softmax+context) — matters at >1 head
+- Fused multiply-accumulate in `chimera_dot_product` to reduce intermediate allocations
+- FHE-vs-cleartext comparison with real TinyLlama weights at d_model=64
+- Multi-layer testing (2-4 layers) — noise accumulation measurement
+- Scale to d_model=256 and profile (~40s/layer estimated)

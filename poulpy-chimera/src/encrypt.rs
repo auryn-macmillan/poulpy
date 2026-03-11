@@ -229,7 +229,7 @@ where
         // --- Level-2 tensor key generation ---
         // For chained tensor products (e.g. SwiGLU: SiLU activation then ct*ct mul).
         // Level-2 accepts inputs at out_base2k and produces outputs at out_base2k - 1.
-        let l2_in_base2k = out_base2k;
+        let _l2_in_base2k = out_base2k;
         let l2_out_base2k = if out_base2k > 1 { out_base2k - 1 } else { out_base2k };
         let l2_tsk_base2k = out_base2k + 1; // = in_base2k
         let l2_k = k; // same torus precision
@@ -267,7 +267,12 @@ where
             rank,
         };
 
-        let res_offset_l2 = 2 * l2_in_base2k;
+        // Level-2 res_offset must match level-1 (= encoding_scale = 2 * in_base2k)
+        // so that chained tensor products preserve the torus position at TP(encoding_scale).
+        // Previously this was 2 * l2_in_base2k = 2 * out_base2k, which shifted the output
+        // to TP(encoding_scale + 2) instead of TP(encoding_scale), causing a factor-of-4
+        // error in all chained nonlinear operations (RMSNorm, SwiGLU gate*up).
+        let res_offset_l2 = 2 * in_base2k; // encoding_scale
 
         // --- Automorphism key generation ---
         // The automorphism key uses key_base2k = base2k - 1 (following the trace test pattern).

@@ -12,10 +12,15 @@ use poulpy_hal::{
 
 use crate::params::ChimeraParams;
 
-/// Encodes a vector of `i8` values into a GLWE plaintext.
+/// Encodes a vector of `i8` values into a GLWE plaintext at the full
+/// encoding scale (`TorusPrecision(encoding_scale)` = `2 * in_base2k`).
 ///
-/// Each value is scaled to the upper bits of the torus by left-shifting
-/// by `(k_pt - 8)` bits (i.e. multiplied by Δ = 2^(k_pt * base2k - 8)).
+/// This encoding is compatible with both linear operations (`glwe_mul_const`)
+/// and nonlinear operations (`glwe_tensor_apply` with `res_offset = encoding_scale`).
+/// The tensor product preserves the torus position when both inputs are encoded
+/// at `TorusPrecision(encoding_scale)`, making ct×ct multiplication exact at
+/// INT8 precision (zero noise from the encoding).
+///
 /// The first `values.len()` polynomial coefficients are set; remaining
 /// coefficients are zero.
 ///
@@ -41,20 +46,27 @@ where
 
     let mut pt = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&layout);
 
-    // Write scaled values into the first limb of each coefficient.
-    // In Poulpy's bivariate representation, each limb stores coefficients
-    // in the range [-2^(base2k-1), 2^(base2k-1)). For INT8 values (8-bit),
-    // we shift by (in_base2k - scale_bits) to place them in the upper bits
-    // of the limb's digit range.
+    // Encode at TorusPrecision(encoding_scale) where encoding_scale = 2 * in_base2k.
+    // This places values across two limbs of the base2k representation, spanning
+    // the full encoding precision. This is critical for compatibility with the
+    // tensor product (ct×ct multiplication): with res_offset = encoding_scale,
+    // the product of two values at TorusPrecision(encoding_scale) lands at the
+    // same torus position, preserving the encoding through nonlinear operations.
+    //
+    // Previously, values were placed only in limb 0 (at in_base2k position),
+    // which caused the tensor product to produce zero output — the product of
+    // two values at position 2^{-13} is at 2^{-26}, and res_offset=26 shifts
+    // it to torus position 0 (complete signal loss).
     let n = module.n() as usize;
-    let shift = params.in_base2k() - params.scale_bits as usize;
+    let scale = params.encoding_scale(); // 2 * in_base2k = 26
 
-    let raw: &mut [u8] = pt.data.data.as_mut();
-    let coeffs: &mut [i64] = bytemuck::cast_slice_mut(&mut raw[..n * 8]);
-
+    // Build the i64 data array (N elements, most zeroed)
+    let mut data = vec![0i64; n];
     for (i, &v) in values.iter().enumerate() {
-        coeffs[i] = (v as i64) << shift;
+        data[i] = v as i64;
     }
+
+    pt.encode_vec_i64(&data, poulpy_core::layouts::TorusPrecision(scale as u32));
 
     pt
 }
@@ -109,7 +121,8 @@ where
 /// Decodes a GLWE plaintext back to `i8` values.
 ///
 /// Extracts `count` coefficient values, reversing the encoding applied by
-/// [`encode_int8`].
+/// [`encode_int8`]. Decodes at `TorusPrecision(encoding_scale)` to match
+/// the encoding position, then truncates to `i8`.
 ///
 /// # Panics
 ///
@@ -121,18 +134,12 @@ where
     assert!(count <= params.slots);
 
     let n = module.n() as usize;
-    let shift = params.in_base2k() - params.scale_bits as usize;
+    let scale = params.encoding_scale(); // 2 * in_base2k = 26
 
-    let raw: &[u8] = pt.data.data.as_ref();
-    let coeffs: &[i64] = bytemuck::cast_slice(&raw[..n * 8]);
+    let mut decoded = vec![0i64; n];
+    pt.decode_vec_i64(&mut decoded, poulpy_core::layouts::TorusPrecision(scale as u32));
 
-    let mut result = Vec::with_capacity(count);
-    for i in 0..count {
-        // Arithmetic right-shift to recover the signed value.
-        let v = coeffs[i] >> shift;
-        result.push(v as i8);
-    }
-    result
+    decoded[..count].iter().map(|&v| v as i8).collect()
 }
 
 /// Decodes a GLWE plaintext back to `f32` values.

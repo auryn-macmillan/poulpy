@@ -449,7 +449,7 @@ where
     let d_ffn = gate.len();
     let mut h = Vec::with_capacity(d_ffn);
     for j in 0..d_ffn {
-        // SiLU(gate_j)
+        // SiLU(gate_j) — apply_poly_activation normalizes the output internally.
         let gate_activated = apply_poly_activation(module, eval_key, &gate[j], &silu_approx);
 
         // Project up_j to match gate_activated's layout (potentially lower base2k)
@@ -1089,7 +1089,7 @@ where
             .par_iter()
             .map(|w2_row| {
                 let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
-                crate::arithmetic::chimera_dot_product(module, &h_act, &w2_vecs)
+                crate::arithmetic::chimera_dot_product_scaled(module, &h_act, &w2_vecs, crate::activations::COEFF_SCALE_BITS)
             })
             .collect()
     };
@@ -1134,7 +1134,7 @@ where
                 let wu_vecs: Vec<Vec<i64>> = w_up[j][..d_in].iter().map(|&w| vec![w]).collect();
                 let up_j = crate::arithmetic::chimera_dot_product(module, x_cts, &wu_vecs);
 
-                // SiLU(gate_j)
+                // SiLU(gate_j) — apply_poly_activation normalizes the *256 factor internally.
                 let gate_activated = apply_poly_activation(module, eval_key, &gate_j, &silu_approx);
 
                 // Project up_j to match gate_activated's layout

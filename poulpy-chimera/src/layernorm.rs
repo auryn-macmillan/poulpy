@@ -24,7 +24,9 @@ use poulpy_hal::{
     layouts::{Backend, Module, Scratch, ScratchOwned},
 };
 
-use crate::activations::{apply_poly_activation, chimera_ct_mul, PolyApprox};
+use crate::activations::{
+    activation_decode_precision, apply_poly_activation, chimera_ct_mul, chimera_ct_mul_with_res_offset, PolyApprox,
+};
 use crate::arithmetic::{chimera_add, chimera_align_layout, chimera_mul_const, chimera_slot_sum};
 use crate::encrypt::ChimeraEvalKey;
 
@@ -309,7 +311,13 @@ where
                 } else {
                     chimera_align_layout(module, xi, &inv_rms_layout)
                 };
-                chimera_ct_mul(module, eval_key, &xi_proj, &inv_rms)
+                chimera_ct_mul_with_res_offset(
+                    module,
+                    eval_key,
+                    &xi_proj,
+                    &inv_rms,
+                    activation_decode_precision(eval_key.res_offset),
+                )
             })
             .collect()
     };
@@ -426,7 +434,13 @@ where
         chimera_align_layout(module, ct, &inv_rms_layout)
     };
 
-    let normalised = chimera_ct_mul(module, eval_key, &ct_projected, &inv_rms);
+    let normalised = chimera_ct_mul_with_res_offset(
+        module,
+        eval_key,
+        &ct_projected,
+        &inv_rms,
+        activation_decode_precision(eval_key.res_offset),
+    );
 
     // Optional: apply learnable scale (gamma) via plaintext multiplication.
     // Gamma is stored as fixed-point i64 values (one per slot).

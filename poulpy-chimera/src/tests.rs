@@ -590,10 +590,9 @@ mod integration {
         let mut pt_dec = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&glwe_out);
         ct_result.decrypt(&module, &mut pt_dec, &sk_dft, dec_scratch.borrow());
 
-        // The output of apply_poly_activation uses coefficients scaled by 2^COEFF_SCALE_BITS.
-        // Since glwe_mul_const at res_offset=base2k gives identity scaling (a*b on torus),
-        // the output has an extra factor of 2^COEFF_SCALE_BITS. To recover the true value,
-        // decode at scale - COEFF_SCALE_BITS = 26 - 8 = 18.
+        // The output of apply_poly_activation has an extra factor of 2^COEFF_SCALE_BITS
+        // from the fixed-point coefficient scaling. Decode at scale - COEFF_SCALE_BITS
+        // to recover the true polynomial evaluation.
         let decode_scale = activation_decode_precision(scale);
         let mut decoded = vec![0i64; n_usize];
         pt_dec.decode_vec_i64(&mut decoded, TorusPrecision(decode_scale as u32));
@@ -857,18 +856,12 @@ mod integration {
         ct_result.decrypt(&module, &mut pt_dec, &sk_dft, dec_scratch.borrow());
 
         // Decode at scale - COEFF_SCALE_BITS to compensate for coefficient scaling.
-        // The tensor product gives ct_sq encrypting 3²=9 on the torus at 2^{-26}.
-        // mul_const(ct_sq, 256, res_offset=12) gives 9*256 on the torus at 2^{-26}.
-        // Decode at TorusPrecision(18) = 9*256*2^{-26}*2^{18} = 9*256/256 = 9.
         let decode_scale = activation_decode_precision(scale);
         let mut decoded = vec![0i64; n_usize];
         pt_dec.decode_vec_i64(&mut decoded, TorusPrecision(decode_scale as u32));
 
         // For SqReLU with coeffs [0.0, 0.0, 1.0]:
-        // c₂ = 1.0 → c2_scaled = 256 (= 1.0 * 2^8).
-        // The tensor product computes ct*ct = encrypt(3*3) = encrypt(9).
-        // mul_const(ct_sq, 256, res_offset=12) gives 9*256 on the torus at 2^{-26}.
-        // decode at TorusPrecision(18) = 9*256/2^8 = 9.
+        // squared_relu(3) = 9.
         let diff = (decoded[0] - 9).abs();
         assert!(
             diff <= 2,
@@ -2413,16 +2406,14 @@ mod integration {
             let result = chimera_transformer_block(&module, &eval_key, &ct, &config, &weights);
 
             let pt_dec = chimera_decrypt(&module, &key, &result, &params);
-            let raw: &[u8] = pt_dec.data.data.as_ref();
-            let n = module.n();
-            let coeffs: &[i64] = bytemuck::cast_slice(&raw[..n * 8]);
-            let raw_coeff0 = coeffs[0];
+            let decoded = decode_int8(&module, &params, &pt_dec, 1);
+            let output_val = decoded[0];
 
-            eprintln!("[accuracy_block_d1] input={input_val}, raw_coeff0={raw_coeff0}",);
+            eprintln!("[accuracy_block_d1] input={input_val}, output={output_val}",);
 
             if input_val > 0 {
                 assert!(
-                    raw_coeff0 != 0,
+                    output_val != 0,
                     "block should produce non-zero output for positive input {input_val}"
                 );
             }
@@ -5558,6 +5549,40 @@ mod integration {
         assert!(poly_exact_linf.is_finite(), "poly_vs_exact L-inf should be finite");
     }
 
+    #[test]
+    fn test_align_layout_preserves_scalar_value() {
+        use poulpy_core::layouts::{GLWEInfos, GLWELayout, LWEInfos};
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [220u8; 32]);
+
+        let pt = encode_int8(&module, &params, &[5]);
+        let ct = chimera_encrypt(&module, &key, &pt, [221u8; 32], [222u8; 32]);
+
+        let target = GLWELayout {
+            n: ct.n(),
+            base2k: poulpy_core::layouts::Base2K(12),
+            k: ct.k(),
+            rank: ct.rank(),
+        };
+        let aligned = crate::arithmetic::chimera_align_layout(&module, &ct, &target);
+
+        let pt_dec = chimera_decrypt(&module, &key, &aligned, &params);
+        let decoded = decode_int8(&module, &params, &pt_dec, 1);
+        eprintln!(
+            "[align_layout] decoded={decoded:?} base2k {} -> {}",
+            ct.base2k().0,
+            aligned.base2k().0
+        );
+
+        assert!(
+            (decoded[0] - 5).abs() <= 2,
+            "align_layout should preserve scalar value, got {}",
+            decoded[0]
+        );
+    }
+
     // ---- Plaintext step (mini integration) ----
 
     #[test]
@@ -6477,6 +6502,678 @@ mod integration {
                 "d256/128-bit layers={}: L2 must be finite",
                 n_layers
             );
+        }
+    }
+
+    // ================================================================
+    // Noise diagnostic tests — understanding and reducing FHE noise
+    // ================================================================
+
+    /// Measure per-operation noise: single mul_const with scalar weight.
+    /// This isolates the noise introduced by one ct-pt multiply.
+    #[test]
+    fn test_noise_diag_single_mul_const() {
+        use crate::arithmetic::chimera_mul_const;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [170u8; 32]);
+
+        // Test with various input values and scalar multipliers
+        let test_cases: Vec<(i8, i64)> = vec![
+            (1, 1),   // identity multiply
+            (10, 2),  // small values
+            (50, 3),  // medium
+            (100, 1), // large input, identity mult
+            (-50, 2), // negative
+            (1, 10),  // small input, larger weight
+            (1, 50),  // small input, large weight
+            (1, 100), // small input, very large weight
+        ];
+
+        eprintln!("\n=== Single mul_const noise diagnostic ===");
+        eprintln!(
+            "{:>8} {:>8} {:>10} {:>10} {:>10}",
+            "input", "weight", "expected", "got", "error"
+        );
+
+        for (val, weight) in &test_cases {
+            let vals: Vec<i8> = vec![*val];
+            let pt = encode_int8(&module, &params, &vals);
+            let ct = chimera_encrypt(&module, &key, &pt, [171u8; 32], [172u8; 32]);
+
+            let ct_mul = chimera_mul_const(&module, &ct, &[*weight]);
+
+            let pt_dec = chimera_decrypt(&module, &key, &ct_mul, &params);
+            let decoded = decode_int8(&module, &params, &pt_dec, 1);
+
+            let expected = (*val as i64) * weight;
+            let error = decoded[0] as i64 - expected;
+            eprintln!("{:>8} {:>8} {:>10} {:>10} {:>10}", val, weight, expected, decoded[0], error);
+        }
+    }
+
+    /// Measure noise from dot products of varying dimensions.
+    /// This is the key question: how does noise scale with d_model?
+    #[test]
+    fn test_noise_diag_dot_product_scaling() {
+        use crate::arithmetic::chimera_dot_product;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [180u8; 32]);
+
+        eprintln!("\n=== Dot product noise scaling diagnostic ===");
+        eprintln!(
+            "{:>5} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "d", "expected", "got", "error", "Linf_all", "MAE_all"
+        );
+
+        for d in [1, 2, 4, 8, 16, 32, 64] {
+            // Encrypt d ciphertexts each with value 1 in coeff 0
+            let vals: Vec<i8> = vec![1];
+            let cts: Vec<_> = (0..d)
+                .map(|i| {
+                    let pt = encode_int8(&module, &params, &vals);
+                    let mut seed_a = [0u8; 32];
+                    let mut seed_e = [0u8; 32];
+                    seed_a[0] = (i * 2) as u8;
+                    seed_a[1] = 181;
+                    seed_e[0] = (i * 2 + 1) as u8;
+                    seed_e[1] = 182;
+                    chimera_encrypt(&module, &key, &pt, seed_a, seed_e)
+                })
+                .collect();
+
+            // All weights = 1 → dot product = d * 1 = d
+            let weights: Vec<Vec<i64>> = vec![vec![1i64]; d];
+
+            let ct_dot = chimera_dot_product(&module, &cts, &weights);
+            let pt_dec = chimera_decrypt(&module, &key, &ct_dot, &params);
+            let decoded = decode_int8(&module, &params, &pt_dec, 1);
+
+            let expected = d as i64;
+            let error = decoded[0] as i64 - expected;
+
+            // Also measure all N coefficients to get noise floor
+            let all_decoded = decode_int8(&module, &params, &pt_dec, params.slots.min(128));
+            let mut max_noise = 0i64;
+            let mut sum_noise = 0i64;
+            // coeff 0 should be d, rest should be 0
+            for (i, &v) in all_decoded.iter().enumerate() {
+                let exp = if i == 0 { expected } else { 0 };
+                let e = (v as i64 - exp).abs();
+                max_noise = max_noise.max(e);
+                sum_noise += e;
+            }
+            let mae = sum_noise as f64 / all_decoded.len() as f64;
+
+            eprintln!(
+                "{:>5} {:>10} {:>10} {:>10} {:>10} {:>10.2}",
+                d, expected, decoded[0] as i64, error, max_noise, mae
+            );
+        }
+    }
+
+    /// Measure noise from a realistic matmul: d-dim input × weight matrix.
+    /// This simulates what happens in a QKV projection.
+    #[test]
+    fn test_noise_diag_matmul_realistic() {
+        use crate::arithmetic::chimera_dot_product;
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [190u8; 32]);
+
+        eprintln!("\n=== Realistic matmul noise diagnostic ===");
+        eprintln!("Using random INT8 inputs and small random weights");
+        eprintln!("{:>5} {:>10} {:>10} {:>10}", "d", "expected", "got", "error");
+
+        for d in [4, 8, 16, 32, 64] {
+            // Random-ish input values and weights
+            let input_vals: Vec<i8> = (0..d).map(|i| ((i * 7 + 3) % 11 - 5) as i8).collect();
+            let weight_vals: Vec<i64> = (0..d).map(|i| ((i * 13 + 5) % 7 - 3) as i64).collect();
+
+            // Encrypt each input dimension separately
+            let cts: Vec<_> = input_vals
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let vals: Vec<i8> = vec![v];
+                    let pt = encode_int8(&module, &params, &vals);
+                    let mut seed_a = [0u8; 32];
+                    let mut seed_e = [0u8; 32];
+                    seed_a[0] = (i * 2) as u8;
+                    seed_a[1] = 191;
+                    seed_e[0] = (i * 2 + 1) as u8;
+                    seed_e[1] = 192;
+                    chimera_encrypt(&module, &key, &pt, seed_a, seed_e)
+                })
+                .collect();
+
+            // Each weight is a single-coeff polynomial [w_i]
+            let weights: Vec<Vec<i64>> = weight_vals.iter().map(|&w| vec![w]).collect();
+
+            let ct_dot = chimera_dot_product(&module, &cts, &weights);
+            let pt_dec = chimera_decrypt(&module, &key, &ct_dot, &params);
+            let decoded = decode_int8(&module, &params, &pt_dec, 1);
+
+            // Compute expected dot product
+            let expected: i64 = input_vals.iter().zip(weight_vals.iter()).map(|(&x, &w)| x as i64 * w).sum();
+
+            let error = decoded[0] as i64 - expected;
+
+            eprintln!("{:>5} {:>10} {:>10} {:>10}", d, expected, decoded[0] as i64, error);
+        }
+    }
+
+    /// Test the effect of res_offset on noise in chimera_mul_const.
+    /// Currently CHIMERA uses res_offset = ct.base2k() = in_base2k = 13.
+    /// The poulpy-core test uses res_offset = scale + i where scale = 2 * in_base2k.
+    /// Higher res_offset = more precision but fewer useful bits for the message.
+    #[test]
+    fn test_noise_diag_res_offset_comparison() {
+        use poulpy_core::{
+            layouts::{GLWEInfos, GLWELayout, LWEInfos, GLWE},
+            GLWEMulConst,
+        };
+        use poulpy_hal::api::{ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow};
+        use poulpy_hal::layouts::{Scratch, ScratchOwned};
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [200u8; 32]);
+
+        let val: i8 = 42;
+        let weight: i64 = 3;
+        let expected = val as i64 * weight;
+
+        let vals: Vec<i8> = vec![val];
+        let pt = encode_int8(&module, &params, &vals);
+        let ct = chimera_encrypt(&module, &key, &pt, [201u8; 32], [202u8; 32]);
+
+        eprintln!("\n=== res_offset comparison ===");
+        eprintln!("Input={val}, Weight={weight}, Expected={expected}");
+        eprintln!("in_base2k={}, encoding_scale={}", params.in_base2k(), params.encoding_scale());
+        eprintln!("{:>12} {:>10} {:>10} {:>20}", "res_offset", "decoded", "error", "note");
+
+        // Current CHIMERA choice: res_offset = in_base2k = 13
+        let res_offset_current = params.in_base2k();
+        {
+            let mut res = GLWE::<Vec<u8>>::alloc_from_infos(&ct);
+            let tmp_bytes = module.glwe_mul_const_tmp_bytes(&res, res_offset_current, &ct, 1);
+            let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp_bytes);
+            module.glwe_mul_const(&mut res, res_offset_current, &ct, &[weight], scratch.borrow());
+
+            let pt_dec = chimera_decrypt(&module, &key, &res, &params);
+            let decoded = decode_int8(&module, &params, &pt_dec, 1);
+            eprintln!(
+                "{:>12} {:>10} {:>10} {:>20}",
+                res_offset_current,
+                decoded[0] as i64,
+                decoded[0] as i64 - expected,
+                "current CHIMERA"
+            );
+        }
+
+        // Test higher res_offset values
+        for offset_add in [0, 1, 2, 3, 5, 8, 13] {
+            let res_offset = params.encoding_scale() + offset_add;
+            let mut res = GLWE::<Vec<u8>>::alloc_from_infos(&ct);
+            let tmp_bytes = module.glwe_mul_const_tmp_bytes(&res, res_offset, &ct, 1);
+            let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp_bytes);
+            module.glwe_mul_const(&mut res, res_offset, &ct, &[weight], scratch.borrow());
+
+            let pt_dec = chimera_decrypt(&module, &key, &res, &params);
+            let decoded = decode_int8(&module, &params, &pt_dec, 1);
+            eprintln!(
+                "{:>12} {:>10} {:>10} {:>20}",
+                res_offset,
+                decoded[0] as i64,
+                decoded[0] as i64 - expected,
+                format!("scale+{offset_add}")
+            );
+        }
+    }
+
+    /// Comprehensive tensor product noise diagnostic.
+    ///
+    /// Tests two encoding paths:
+    /// (A) encode_vec_i64 at TorusPrecision(scale=26) — the "tensor-native" encoding
+    ///     used by test_full_pipeline_eval_key_ct_mul. This is the correct path.
+    /// (B) encode_int8 at in_base2k=13 — the encoding used by the inference pipeline.
+    ///     This places values at a DIFFERENT torus position than (A).
+    ///
+    /// Understanding the difference is critical for noise reduction.
+    #[test]
+    fn test_noise_diag_ct_ct_multiply() {
+        use crate::activations::chimera_ct_mul;
+        use poulpy_core::layouts::{GLWEPlaintext, GLWEPlaintextLayout, TorusPrecision, GLWE};
+        use poulpy_hal::{
+            api::{ScratchOwnedAlloc, ScratchOwnedBorrow},
+            layouts::ScratchOwned,
+        };
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let n_usize = module.n() as usize;
+        let key = ChimeraKey::generate(&module, &params, [210u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [211u8; 32], [212u8; 32]);
+
+        let scale = eval_key.res_offset; // 2 * in_base2k = 26
+
+        let test_cases: Vec<(i64, i64)> = vec![(1, 1), (2, 3), (5, 5), (10, 10), (-5, 7), (50, 2), (11, 11), (8, 15)];
+
+        // ---- PATH A: encode_vec_i64 at TorusPrecision(26) ----
+        eprintln!("\n=== PATH A: encode_vec_i64 at TorusPrecision({scale}) ===");
+        eprintln!("{:>8} {:>8} {:>10} {:>10} {:>10}", "a", "b", "expected", "got", "error");
+
+        let pt_layout = GLWEPlaintextLayout {
+            n: key.layout.n,
+            base2k: key.layout.base2k,
+            k: key.layout.k,
+        };
+
+        let mut max_error_a = 0i64;
+        for &(a, b) in &test_cases {
+            let mut data_a = vec![0i64; n_usize];
+            data_a[0] = a;
+            let mut pt_a = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&pt_layout);
+            pt_a.encode_vec_i64(&data_a, TorusPrecision(scale as u32));
+            let ct_a = chimera_encrypt(&module, &key, &pt_a, [213u8; 32], [214u8; 32]);
+
+            let mut data_b = vec![0i64; n_usize];
+            data_b[0] = b;
+            let mut pt_b = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&pt_layout);
+            pt_b.encode_vec_i64(&data_b, TorusPrecision(scale as u32));
+            let ct_b = chimera_encrypt(&module, &key, &pt_b, [215u8; 32], [216u8; 32]);
+
+            let ct_mul = chimera_ct_mul(&module, &eval_key, &ct_a, &ct_b);
+
+            // Decrypt using the OUTPUT layout (out_base2k)
+            let out_pt_layout = GLWEPlaintextLayout {
+                n: eval_key.output_layout.n,
+                base2k: eval_key.output_layout.base2k,
+                k: eval_key.output_layout.k,
+            };
+            let decrypt_ct_layout = poulpy_core::layouts::GLWELayout {
+                n: eval_key.output_layout.n,
+                base2k: eval_key.output_layout.base2k,
+                k: eval_key.output_layout.k,
+                rank: key.layout.rank,
+            };
+            let mut pt_dec = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&out_pt_layout);
+            let decrypt_bytes = GLWE::<Vec<u8>>::decrypt_tmp_bytes(&module, &decrypt_ct_layout);
+            let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(decrypt_bytes);
+            ct_mul.decrypt(&module, &mut pt_dec, &key.prepared, scratch.borrow());
+
+            // Decode at TorusPrecision(scale) — same as input
+            let mut decoded = vec![0i64; n_usize];
+            pt_dec.decode_vec_i64(&mut decoded, TorusPrecision(scale as u32));
+
+            let expected = a * b;
+            let error = decoded[0] - expected;
+            max_error_a = max_error_a.max(error.abs());
+
+            eprintln!("{:>8} {:>8} {:>10} {:>10} {:>10}", a, b, expected, decoded[0], error);
+        }
+        eprintln!("PATH A max |error|: {max_error_a}");
+
+        // ---- PATH B: encode_int8 at in_base2k=13 ----
+        eprintln!(
+            "\n=== PATH B: encode_int8 (torus position in_base2k={}) ===",
+            params.in_base2k()
+        );
+        eprintln!(
+            "{:>8} {:>8} {:>10} {:>14} {:>14} {:>14}",
+            "a", "b", "expected", "decode@scale", "decode@13", "decode@18"
+        );
+
+        for &(a, b) in &test_cases {
+            if a < -128 || a > 127 || b < -128 || b > 127 {
+                continue;
+            }
+            let vals_a: Vec<i8> = vec![a as i8];
+            let vals_b: Vec<i8> = vec![b as i8];
+            let pt_a = encode_int8(&module, &params, &vals_a);
+            let pt_b = encode_int8(&module, &params, &vals_b);
+            let ct_a = chimera_encrypt(&module, &key, &pt_a, [213u8; 32], [214u8; 32]);
+            let ct_b = chimera_encrypt(&module, &key, &pt_b, [215u8; 32], [216u8; 32]);
+
+            let ct_mul = chimera_ct_mul(&module, &eval_key, &ct_a, &ct_b);
+
+            // Decrypt using the OUTPUT layout
+            let out_pt_layout = GLWEPlaintextLayout {
+                n: eval_key.output_layout.n,
+                base2k: eval_key.output_layout.base2k,
+                k: eval_key.output_layout.k,
+            };
+            let decrypt_ct_layout = poulpy_core::layouts::GLWELayout {
+                n: eval_key.output_layout.n,
+                base2k: eval_key.output_layout.base2k,
+                k: eval_key.output_layout.k,
+                rank: key.layout.rank,
+            };
+            let mut pt_dec = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&out_pt_layout);
+            let decrypt_bytes = GLWE::<Vec<u8>>::decrypt_tmp_bytes(&module, &decrypt_ct_layout);
+            let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(decrypt_bytes);
+            ct_mul.decrypt(&module, &mut pt_dec, &key.prepared, scratch.borrow());
+
+            // Try multiple decode precisions
+            let mut decoded_scale = vec![0i64; n_usize];
+            pt_dec.decode_vec_i64(&mut decoded_scale, TorusPrecision(scale as u32));
+
+            let mut decoded_13 = vec![0i64; n_usize];
+            pt_dec.decode_vec_i64(&mut decoded_13, TorusPrecision(params.in_base2k() as u32));
+
+            let mut decoded_18 = vec![0i64; n_usize];
+            pt_dec.decode_vec_i64(&mut decoded_18, TorusPrecision(18));
+
+            let expected = a * b;
+            eprintln!(
+                "{:>8} {:>8} {:>10} {:>14} {:>14} {:>14}",
+                a, b, expected, decoded_scale[0], decoded_13[0], decoded_18[0]
+            );
+        }
+
+        // PATH A should have low noise (this is the correct encoding for tensor product)
+        assert!(
+            max_error_a <= 2,
+            "PATH A tensor product noise should be <= 2, got {max_error_a}"
+        );
+    }
+
+    /// Measure noise through the actual inference chain: encode_int8 → mul_const →
+    /// ct×ct → mul_const. This is the actual transformer pattern.
+    ///
+    /// Also tests whether encoding at TorusPrecision(26) instead of encode_int8
+    /// for the INITIAL embedding would improve noise through the full pipeline.
+    #[test]
+    fn test_noise_diag_chain_linear_nonlinear() {
+        use crate::activations::chimera_ct_mul;
+        use crate::arithmetic::chimera_mul_const;
+        use poulpy_core::layouts::{GLWEPlaintext, GLWEPlaintextLayout, TorusPrecision, GLWE};
+        use poulpy_hal::{
+            api::{ScratchOwnedAlloc, ScratchOwnedBorrow},
+            layouts::ScratchOwned,
+        };
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let n_usize = module.n() as usize;
+        let key = ChimeraKey::generate(&module, &params, [220u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [221u8; 32], [222u8; 32]);
+        let scale = eval_key.res_offset; // 26
+
+        eprintln!("\n=== Chain diagnostic: encode → mul_const → ct×ct → decode ===");
+
+        let pt_layout = GLWEPlaintextLayout {
+            n: key.layout.n,
+            base2k: key.layout.base2k,
+            k: key.layout.k,
+        };
+
+        // ---- Test 1: Full chain with encode_vec_i64 at scale=26 ----
+        eprintln!("\n--- Test 1: encode_vec_i64 at TorusPrecision({scale}) ---");
+        {
+            let val = 5i64;
+            let weight = 3i64;
+
+            let mut data = vec![0i64; n_usize];
+            data[0] = val;
+            let mut pt = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&pt_layout);
+            pt.encode_vec_i64(&data, TorusPrecision(scale as u32));
+            let ct = chimera_encrypt(&module, &key, &pt, [223u8; 32], [224u8; 32]);
+
+            // Step 1: mul_const
+            let ct_mul = chimera_mul_const(&module, &ct, &[weight]);
+            // Decrypt and decode at scale
+            let pt_dec1 = chimera_decrypt(&module, &key, &ct_mul, &params);
+            let mut dec1 = vec![0i64; n_usize];
+            pt_dec1.decode_vec_i64(&mut dec1, TorusPrecision(scale as u32));
+            let expected1 = val * weight;
+            eprintln!(
+                "mul_const({val}, {weight}): expected={expected1}, got={}, error={}",
+                dec1[0],
+                dec1[0] - expected1
+            );
+
+            // Step 2: ct×ct self-multiply on the result
+            let ct_sq = chimera_ct_mul(&module, &eval_key, &ct_mul, &ct_mul);
+            // Decrypt output layout
+            let out_pt_layout = GLWEPlaintextLayout {
+                n: eval_key.output_layout.n,
+                base2k: eval_key.output_layout.base2k,
+                k: eval_key.output_layout.k,
+            };
+            let decrypt_ct_layout = poulpy_core::layouts::GLWELayout {
+                n: eval_key.output_layout.n,
+                base2k: eval_key.output_layout.base2k,
+                k: eval_key.output_layout.k,
+                rank: key.layout.rank,
+            };
+            let mut pt_dec2 = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&out_pt_layout);
+            let decrypt_bytes = GLWE::<Vec<u8>>::decrypt_tmp_bytes(&module, &decrypt_ct_layout);
+            let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(decrypt_bytes);
+            ct_sq.decrypt(&module, &mut pt_dec2, &key.prepared, scratch.borrow());
+            let mut dec2 = vec![0i64; n_usize];
+            pt_dec2.decode_vec_i64(&mut dec2, TorusPrecision(scale as u32));
+            let expected2 = expected1 * expected1; // (5*3)^2 = 225
+            eprintln!(
+                "ct×ct({expected1}²): expected={expected2}, got={}, error={}",
+                dec2[0],
+                dec2[0] - expected2
+            );
+        }
+
+        // ---- Test 2: Full chain with encode_int8 ----
+        eprintln!("\n--- Test 2: encode_int8 (in_base2k={}) ---", params.in_base2k());
+        {
+            let val: i8 = 5;
+            let weight = 3i64;
+
+            let pt = encode_int8(&module, &params, &[val]);
+            let ct = chimera_encrypt(&module, &key, &pt, [225u8; 32], [226u8; 32]);
+
+            // Step 1: mul_const
+            let ct_mul = chimera_mul_const(&module, &ct, &[weight]);
+            let pt_dec1 = chimera_decrypt(&module, &key, &ct_mul, &params);
+            let dec1 = decode_int8(&module, &params, &pt_dec1, 1);
+            let expected1 = val as i64 * weight;
+            eprintln!(
+                "mul_const({val}, {weight}): expected={expected1}, got={}, error={}",
+                dec1[0] as i64,
+                dec1[0] as i64 - expected1
+            );
+
+            // Step 2: ct×ct on encode_int8 result — what happens?
+            let ct_sq = chimera_ct_mul(&module, &eval_key, &ct_mul, &ct_mul);
+            // Try decoding at various precisions
+            let out_pt_layout = GLWEPlaintextLayout {
+                n: eval_key.output_layout.n,
+                base2k: eval_key.output_layout.base2k,
+                k: eval_key.output_layout.k,
+            };
+            let decrypt_ct_layout = poulpy_core::layouts::GLWELayout {
+                n: eval_key.output_layout.n,
+                base2k: eval_key.output_layout.base2k,
+                k: eval_key.output_layout.k,
+                rank: key.layout.rank,
+            };
+            let mut pt_dec2 = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&out_pt_layout);
+            let decrypt_bytes = GLWE::<Vec<u8>>::decrypt_tmp_bytes(&module, &decrypt_ct_layout);
+            let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(decrypt_bytes);
+            ct_sq.decrypt(&module, &mut pt_dec2, &key.prepared, scratch.borrow());
+
+            let expected2 = expected1 * expected1; // 225
+            for decode_prec in [8u32, 13, 18, 26] {
+                let mut dec = vec![0i64; n_usize];
+                pt_dec2.decode_vec_i64(&mut dec, TorusPrecision(decode_prec));
+                eprintln!(
+                    "  ct×ct({expected1}²): decode@{decode_prec}: got={}, error={}",
+                    dec[0],
+                    dec[0] - expected2
+                );
+            }
+        }
+
+        // ---- Test 3: Diagnose d4 transformer block step by step ----
+        eprintln!("\n--- Test 3: Step-by-step transformer block diagnostic ---");
+        {
+            let dims = ModelDims {
+                d_model: 4,
+                d_head: 2,
+                n_heads: 2,
+                n_kv_heads: 2,
+                d_ffn: 4,
+                n_layers: 1,
+                n_experts: 1,
+                n_active_experts: 1,
+            };
+
+            let config = TransformerBlockConfig {
+                attention: AttentionConfig {
+                    dims: dims.clone(),
+                    params: params.clone(),
+                    softmax_approx: SoftmaxStrategy::ReluSquared,
+                    causal: true,
+                    rope: None,
+                },
+                pre_attn_norm: LayerNormConfig::rms_norm(4),
+                pre_ffn_norm: LayerNormConfig::rms_norm(4),
+                ffn: FFNConfig::Standard {
+                    activation: ActivationChoice::SquaredReLU,
+                },
+                residual: true,
+            };
+
+            let id_row = |i: usize| -> Vec<i64> {
+                let mut r = vec![0i64; 4];
+                r[i] = 1;
+                r
+            };
+            let weights = TransformerBlockWeights {
+                attention: AttentionWeights {
+                    w_q: (0..4).map(id_row).collect(),
+                    w_k: (0..4).map(id_row).collect(),
+                    w_v: (0..4).map(id_row).collect(),
+                    w_o: (0..4).map(id_row).collect(),
+                },
+                ffn: FFNWeights {
+                    w1: (0..4).map(id_row).collect(),
+                    w2: (0..4).map(id_row).collect(),
+                    w3: None,
+                },
+                pre_attn_norm_gamma: None,
+                pre_ffn_norm_gamma: None,
+            };
+
+            let input_i8: Vec<i8> = vec![5, 3, 7, 2];
+            let ct_x = encrypt_vec(&module, &key, &params, &input_i8);
+
+            // Step 1: RMSNorm
+            let normed = chimera_rms_norm_vec(&module, &eval_key, &ct_x, &config.pre_attn_norm);
+            eprintln!("[diag] After pre-attn RMSNorm:");
+            for (i, ct) in normed.iter().enumerate() {
+                let pt_out = chimera_decrypt(&module, &key, ct, &params);
+                // Try multiple decode precisions
+                for &prec in &[26u32, 18, 10, 13, 12, 8] {
+                    let mut vals = vec![0i64; n_usize];
+                    pt_out.decode_vec_i64(&mut vals, TorusPrecision(prec));
+                    if i == 0 {
+                        eprintln!("  [dim={i}] decode@{prec}: coeff0={}", vals[0]);
+                    }
+                }
+                // Standard decode
+                let vals = decode_int8(&module, &params, &pt_out, 1);
+                eprintln!("  [dim={i}] decode_int8: {}", vals[0]);
+            }
+
+            // Plaintext RMSNorm for comparison
+            let x_f64: Vec<f64> = input_i8.iter().map(|&v| v as f64).collect();
+            let rms = (x_f64.iter().map(|v| v * v).sum::<f64>() / 4.0).sqrt();
+            let pt_normed: Vec<f64> = x_f64.iter().map(|v| v / rms).collect();
+            eprintln!("[diag] Plaintext RMSNorm: {:?}", pt_normed);
+            eprintln!("[diag] (RMS = {rms})");
+
+            // Step 2: Full transformer block — decrypt at multiple precisions
+            let fhe_result = chimera_transformer_block_vec(&module, &eval_key, &ct_x, &config, &weights);
+            eprintln!("[diag] After full transformer block:");
+            for (i, ct) in fhe_result.iter().enumerate() {
+                use poulpy_core::layouts::LWEInfos;
+                eprintln!("  [dim={i}] base2k={}, k={}", ct.base2k().0, ct.k().0);
+                let pt_out = chimera_decrypt(&module, &key, ct, &params);
+                for &prec in &[26u32, 18, 10, 13, 12, 8, 4, 2] {
+                    let mut vals = vec![0i64; n_usize];
+                    pt_out.decode_vec_i64(&mut vals, TorusPrecision(prec));
+                    if i == 0 || i == 2 {
+                        eprintln!("    decode@{prec}: coeff0={}", vals[0]);
+                    }
+                }
+            }
+        }
+
+        // ---- (old) Test 3: What if we convert encode_int8 to scale=26 before tensor product? ----
+        eprintln!("\n--- Test 3b: encode_int8 + manual upscale before ct×ct ---");
+        {
+            // The idea: encode_int8 puts val at position 2^{-13} (limb 0).
+            // If we mul_const by 1 with a higher res_offset, we can shift it down.
+            // Or: just re-encode at scale=26 from the start.
+            //
+            // This test measures the noise gap between the two approaches.
+            let val: i8 = 7;
+
+            // Approach A: encode at scale=26 → ct×ct → decode@26
+            let mut data = vec![0i64; n_usize];
+            data[0] = val as i64;
+            let mut pt_a = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&pt_layout);
+            pt_a.encode_vec_i64(&data, TorusPrecision(scale as u32));
+            let ct_a = chimera_encrypt(&module, &key, &pt_a, [230u8; 32], [231u8; 32]);
+            let ct_sq_a = chimera_ct_mul(&module, &eval_key, &ct_a, &ct_a);
+
+            let out_pt_layout = GLWEPlaintextLayout {
+                n: eval_key.output_layout.n,
+                base2k: eval_key.output_layout.base2k,
+                k: eval_key.output_layout.k,
+            };
+            let decrypt_ct_layout = poulpy_core::layouts::GLWELayout {
+                n: eval_key.output_layout.n,
+                base2k: eval_key.output_layout.base2k,
+                k: eval_key.output_layout.k,
+                rank: key.layout.rank,
+            };
+            let mut pt_dec_a = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&out_pt_layout);
+            let decrypt_bytes = GLWE::<Vec<u8>>::decrypt_tmp_bytes(&module, &decrypt_ct_layout);
+            let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(decrypt_bytes);
+            ct_sq_a.decrypt(&module, &mut pt_dec_a, &key.prepared, scratch.borrow());
+            let mut dec_a = vec![0i64; n_usize];
+            pt_dec_a.decode_vec_i64(&mut dec_a, TorusPrecision(scale as u32));
+
+            let expected = (val as i64) * (val as i64);
+            eprintln!(
+                "Approach A (scale=26): {val}²: expected={expected}, got={}, error={}",
+                dec_a[0],
+                dec_a[0] - expected
+            );
+
+            // Approach B: encode_int8 → ct×ct → try all decode precisions
+            let pt_b = encode_int8(&module, &params, &[val]);
+            let ct_b = chimera_encrypt(&module, &key, &pt_b, [232u8; 32], [233u8; 32]);
+            let ct_sq_b = chimera_ct_mul(&module, &eval_key, &ct_b, &ct_b);
+
+            let mut pt_dec_b = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&out_pt_layout);
+            let mut scratch2: ScratchOwned<BE> = ScratchOwned::alloc(decrypt_bytes);
+            ct_sq_b.decrypt(&module, &mut pt_dec_b, &key.prepared, scratch2.borrow());
+
+            for decode_prec in [1u32, 2, 4, 8, 13, 18, 26] {
+                let mut dec_b = vec![0i64; n_usize];
+                pt_dec_b.decode_vec_i64(&mut dec_b, TorusPrecision(decode_prec));
+                eprintln!(
+                    "Approach B (int8): {val}²: decode@{decode_prec}: got={}, error={}",
+                    dec_b[0],
+                    dec_b[0] - expected
+                );
+            }
         }
     }
 }

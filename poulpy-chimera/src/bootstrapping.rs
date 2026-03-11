@@ -884,8 +884,8 @@ mod tests {
     // End-to-end test: encrypt → bootstrap → decrypt
     #[test]
     fn test_chimera_bootstrap_roundtrip() {
-        use crate::encoding::encode_int8;
-        use crate::encrypt::{chimera_decrypt, chimera_encrypt, ChimeraKey};
+        use crate::encrypt::{chimera_encrypt, ChimeraKey};
+        use poulpy_core::layouts::{GLWEPlaintext, LWEInfos};
         use poulpy_hal::api::ModuleNew;
 
         #[cfg(not(all(feature = "enable-avx", target_arch = "x86_64")))]
@@ -914,18 +914,52 @@ mod tests {
         let bsk_prepared = ChimeraBootstrapKeyPrepared::prepare(&module, &bsk);
         let bp = &bsk_prepared.bootstrap_params;
 
-        // Encrypt a simple value
-        let values: Vec<i8> = vec![5];
-        let pt = encode_int8(&module, &params, &values);
+        // Encode value at the bootstrap's native precision: TorusPrecision(scale_bits)
+        // = TorusPrecision(8) for INT8. The blind rotation LUT is indexed by the top
+        // (log_message_modulus+1) = 8 bits of the torus, so the value MUST be placed
+        // at this precision for the bootstrap to see it.
+        //
+        // Note: this is different from encode_int8() which now encodes at
+        // TorusPrecision(encoding_scale=26) for compatibility with tensor products.
+        // The bootstrap operates at its own native precision.
+        let bootstrap_precision = (bp.log_message_modulus + 1) as u32; // 8 for INT8
+        let n = module.n() as usize;
+        let mut data = vec![0i64; n];
+        data[0] = 5;
+
+        let pt_layout = poulpy_core::layouts::GLWEPlaintextLayout {
+            n: params.degree,
+            base2k: poulpy_core::layouts::Base2K(params.in_base2k() as u32),
+            k: params.k_pt,
+        };
+        let mut pt = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&pt_layout);
+        pt.encode_vec_i64(&data, TorusPrecision(bootstrap_precision));
+
         let ct = chimera_encrypt(&module, &key, &pt, [1u8; 32], [2u8; 32]);
 
-        // Verify pre-bootstrap decryption
-        let pt_pre = chimera_decrypt(&module, &key, &ct, &params);
-        let dec_pre = pt_pre.decode_coeff_i64(TorusPrecision(params.scale_bits as u32), 0);
+        // Verify pre-bootstrap decryption at bootstrap precision
+        let pt_pre = {
+            use poulpy_core::layouts::GLWEPlaintextLayout;
+            let pt_layout = GLWEPlaintextLayout {
+                n: ct.n(),
+                base2k: ct.base2k(),
+                k: ct.k(),
+            };
+            let mut pt_dec = GLWEPlaintext::<Vec<u8>>::alloc_from_infos(&pt_layout);
+            let ct_layout = GLWELayout {
+                n: ct.n(),
+                base2k: ct.base2k(),
+                k: ct.k(),
+                rank: key.layout.rank,
+            };
+            let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(GLWE::decrypt_tmp_bytes(&module, &ct_layout));
+            ct.decrypt(&module, &mut pt_dec, &key.prepared, scratch.borrow());
+            pt_dec
+        };
+        let dec_pre = pt_pre.decode_coeff_i64(TorusPrecision(bootstrap_precision), 0);
         assert_eq!(dec_pre, 5, "pre-bootstrap decryption should give 5, got {dec_pre}");
 
         // Inline bootstrapping: sample_extract → keyswitch → blind_rotation
-        use poulpy_core::layouts::GLWEPlaintext;
 
         let n_glwe: usize = module.n();
 

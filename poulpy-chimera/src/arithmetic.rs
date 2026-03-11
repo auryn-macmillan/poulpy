@@ -90,6 +90,99 @@ where
     res
 }
 
+/// Multiplies a CHIMERA ciphertext by a plaintext constant polynomial and
+/// compensates for an extra fixed-point scale factor carried by the ciphertext.
+pub fn chimera_mul_const_scaled<BE: Backend>(
+    module: &Module<BE>,
+    ct: &GLWE<Vec<u8>>,
+    constants: &[i64],
+    scale_shift_bits: usize,
+) -> GLWE<Vec<u8>>
+where
+    Module<BE>: GLWEMulConst<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchAvailable,
+{
+    let base2k = ct.base2k().0 as usize;
+    assert!(
+        scale_shift_bits <= base2k,
+        "chimera_mul_const_scaled: scale_shift_bits ({scale_shift_bits}) must be <= base2k ({base2k})"
+    );
+    let res_offset = base2k.saturating_sub(scale_shift_bits);
+    let mut res = GLWE::<Vec<u8>>::alloc_from_infos(ct);
+    let tmp_bytes = module.glwe_mul_const_tmp_bytes(&res, res_offset, ct, constants.len());
+    let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp_bytes);
+    module.glwe_mul_const(&mut res, res_offset, ct, constants, scratch.borrow());
+    res
+}
+
+/// Multiplies a CHIMERA ciphertext by a plaintext constant with a torus bit-shift.
+///
+/// Computes `res ≈ ct * constants / 2^shift_bits` by using a reduced `res_offset`.
+///
+/// When `shift_bits > 0`, the output is effectively right-shifted on the torus,
+/// dividing the encrypted value by `2^shift_bits`. This is used to implement
+/// integer division by powers of 2 (e.g., dividing sum-of-squares by `d_model`
+/// in RMSNorm when `d_model` is a power of 2).
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `ct` - Input ciphertext.
+/// * `constants` - Plaintext polynomial coefficients.
+/// * `shift_bits` - Number of torus bits to right-shift (0 = identity, same as `chimera_mul_const`).
+///
+/// # Panics
+///
+/// Panics if `shift_bits >= ct.base2k()` (would shift away all signal).
+pub fn chimera_mul_const_with_shift<BE: Backend>(
+    module: &Module<BE>,
+    ct: &GLWE<Vec<u8>>,
+    constants: &[i64],
+    shift_bits: usize,
+) -> GLWE<Vec<u8>>
+where
+    Module<BE>: GLWEMulConst<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchAvailable,
+{
+    let base2k = ct.base2k().0 as usize;
+    assert!(
+        shift_bits < base2k,
+        "chimera_mul_const_with_shift: shift_bits ({shift_bits}) must be < base2k ({base2k})"
+    );
+    // res_offset = base2k - shift_bits gives res_offset_lo = -shift_bits,
+    // which right-shifts the torus representation by shift_bits, effectively
+    // dividing the encoded value by 2^shift_bits.
+    let res_offset = base2k - shift_bits;
+    let mut res = GLWE::<Vec<u8>>::alloc_from_infos(ct);
+    let tmp_bytes = module.glwe_mul_const_tmp_bytes(&res, res_offset, ct, constants.len());
+    let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp_bytes);
+    module.glwe_mul_const(&mut res, res_offset, ct, constants, scratch.borrow());
+    res
+}
+
+/// Multiplies a CHIMERA ciphertext by a plaintext constant and left-shifts the
+/// torus representation by `shift_bits`.
+pub fn chimera_mul_const_with_left_shift<BE: Backend>(
+    module: &Module<BE>,
+    ct: &GLWE<Vec<u8>>,
+    constants: &[i64],
+    shift_bits: usize,
+) -> GLWE<Vec<u8>>
+where
+    Module<BE>: GLWEMulConst<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchAvailable,
+{
+    let res_offset = ct.base2k().0 as usize + shift_bits;
+    let mut res = GLWE::<Vec<u8>>::alloc_from_infos(ct);
+    let tmp_bytes = module.glwe_mul_const_tmp_bytes(&res, res_offset, ct, constants.len());
+    let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp_bytes);
+    module.glwe_mul_const(&mut res, res_offset, ct, constants, scratch.borrow());
+    res
+}
+
 /// Aligns a ciphertext to a target layout for mixed-level arithmetic.
 ///
 /// This is used when two ciphertexts at different base2k levels need to be
@@ -244,6 +337,41 @@ where
 
         for i in 1..cts.len() {
             let ro = cts[i].base2k().0 as usize;
+            module.glwe_mul_const(&mut term, ro, &cts[i], &weights[i], scratch.borrow());
+            module.glwe_add_inplace(&mut acc, &term);
+        }
+    }
+
+    acc
+}
+
+/// Accumulates a sum of ciphertext × plaintext products where each ciphertext
+/// carries an extra fixed-point scale factor of `2^scale_shift_bits`.
+pub fn chimera_dot_product_scaled<BE: Backend>(
+    module: &Module<BE>,
+    cts: &[GLWE<Vec<u8>>],
+    weights: &[Vec<i64>],
+    scale_shift_bits: usize,
+) -> GLWE<Vec<u8>>
+where
+    Module<BE>: GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchAvailable,
+{
+    assert_eq!(cts.len(), weights.len());
+    assert!(!cts.is_empty());
+
+    let mut acc = chimera_mul_const_scaled(module, &cts[0], &weights[0], scale_shift_bits);
+
+    if cts.len() > 1 {
+        let res_offset = cts[1].base2k().0 as usize - scale_shift_bits;
+        let max_wlen = weights[1..].iter().map(|w| w.len()).max().unwrap_or(1);
+        let tmp_bytes = module.glwe_mul_const_tmp_bytes(&acc, res_offset, &cts[1], max_wlen);
+        let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp_bytes);
+        let mut term = GLWE::<Vec<u8>>::alloc_from_infos(&cts[1]);
+
+        for i in 1..cts.len() {
+            let ro = cts[i].base2k().0 as usize - scale_shift_bits;
             module.glwe_mul_const(&mut term, ro, &cts[i], &weights[i], scratch.borrow());
             module.glwe_add_inplace(&mut acc, &term);
         }

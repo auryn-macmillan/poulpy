@@ -233,6 +233,49 @@ security, L∞ error decreases from ~63 (1 layer) to ~31 (2-4 layers).
 Residual connections + RMSNorm stabilize noise across layers. Bootstrapping
 is not needed for at least 4 layers at either security level.
 
+#### d_model=256, 4 heads, d_ffn=512 (128-bit security, N=16384)
+
+| Layers | FHE time   | L∞ error | MAE   | Poly approx L∞ | FHE noise L∞ |
+|--------|-----------|----------|-------|----------------|-------------|
+| 1      | 137.1 s   | 64.0     | 33.6  | 0.32           | 64.1        |
+
+Per-layer breakdown (d_model=256, 128-bit, 4 heads):
+- Pre-attention RMSNorm: 1.7 s
+- Attention total: 53.6 s
+  - QKV projection (3×256 dot products): 40.1 s
+  - Per-head attention (4 heads): 1.6 s
+  - Output projection (256 dot products): 11.9 s
+- Pre-FFN RMSNorm: 2.8 s
+- SwiGLU FFN total: 73.7 s
+  - Gate + SiLU + up projection: 50.6 s
+  - Down projection: 23.1 s
+- Residual connections: 2.6 s
+- **Total per layer: ~134.4 s**
+
+Scaling from d_model=64 → d_model=256 at 128-bit security:
+
+| Metric           | d_model=64   | d_model=256  | Ratio | Expected (d²) |
+|------------------|-------------|-------------|:-----:|:--------------:|
+| Per-layer time   | 12.1 s      | 134.4 s     | 11.1x | 16x            |
+| L∞ (1 layer)     | 63.2        | 64.0        | 1.0x  | ~1x            |
+| MAE (1 layer)    | 34.5        | 33.6        | 1.0x  | ~1x            |
+| Encrypt time     | 99 ms       | 860 ms      | 8.7x  | 4x (linear)    |
+| Decrypt time     | 70 ms       | 299 ms      | 4.3x  | 4x (linear)    |
+
+**Key finding**: Error is independent of d_model. L∞ ~64 and MAE ~34 are
+nearly identical at d_model=64 and d_model=256. This means noise is per-element
+(from individual dot products), not cumulative across the embedding dimension.
+
+**Key finding**: Latency scales as ~O(d_model^1.7) rather than the expected
+O(d_model²). The sub-quadratic scaling is likely due to Rayon parallelization
+being more efficient at larger dimensions (more work per thread, better
+amortization of thread scheduling overhead).
+
+**Bottleneck analysis**: At d_model=256, the SwiGLU FFN dominates (55% of
+layer time), followed by attention (40%). Within attention, QKV projection
+(3 matmuls of 256×256) is the most expensive single operation at 40.1s.
+Within FFN, the gate+up projection (2 matmuls of 256×512) costs 50.6s.
+
 ### 3.5 Full Forward Pass Estimates
 
 Based on measured per-layer extrapolation:

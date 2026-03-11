@@ -335,16 +335,12 @@ where
 {
     let n = module.n() as usize;
     assert!(count <= n, "decode_raw_coeffs: count ({count}) exceeds ring degree ({n})");
-    let shift = params.in_base2k() - params.scale_bits as usize;
+    let scale = params.encoding_scale(); // 2 * in_base2k
 
-    let raw: &[u8] = pt.data.data.as_ref();
-    let coeffs: &[i64] = bytemuck::cast_slice(&raw[..n * 8]);
+    let mut decoded = vec![0i64; n];
+    pt.decode_vec_i64(&mut decoded, poulpy_core::layouts::TorusPrecision(scale as u32));
 
-    let mut result = Vec::with_capacity(count);
-    for i in 0..count {
-        result.push(coeffs[i] >> shift);
-    }
-    result
+    decoded[..count].to_vec()
 }
 
 /// Returns the plaintext modulus for MAC verification.

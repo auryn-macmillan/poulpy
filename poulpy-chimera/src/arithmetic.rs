@@ -230,12 +230,23 @@ where
     assert_eq!(cts.len(), weights.len());
     assert!(!cts.is_empty());
 
+    // First term: allocate accumulator
     let mut acc = chimera_mul_const(module, &cts[0], &weights[0]);
 
-    for i in 1..cts.len() {
-        let term = chimera_mul_const(module, &cts[i], &weights[i]);
-        let sum = chimera_add(module, &acc, &term);
-        acc = sum;
+    if cts.len() > 1 {
+        // Pre-allocate a reusable scratch ciphertext for subsequent terms.
+        // This avoids allocating a new GLWE for every mul_const + add pair.
+        let res_offset = cts[1].base2k().0 as usize;
+        let max_wlen = weights[1..].iter().map(|w| w.len()).max().unwrap_or(1);
+        let tmp_bytes = module.glwe_mul_const_tmp_bytes(&acc, res_offset, &cts[1], max_wlen);
+        let mut scratch: ScratchOwned<BE> = ScratchOwned::alloc(tmp_bytes);
+        let mut term = GLWE::<Vec<u8>>::alloc_from_infos(&cts[1]);
+
+        for i in 1..cts.len() {
+            let ro = cts[i].base2k().0 as usize;
+            module.glwe_mul_const(&mut term, ro, &cts[i], &weights[i], scratch.borrow());
+            module.glwe_add_inplace(&mut acc, &term);
+        }
     }
 
     acc

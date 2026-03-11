@@ -1067,23 +1067,32 @@ where
     // Phase 1: Up-projection — h_j = Σ_k W1[j][k] * x_k
     let approx = activation_to_poly(activation);
     let d_ffn = weights.w1.len();
-    let mut h_act = Vec::with_capacity(d_ffn);
-    for j in 0..d_ffn {
-        let w_vecs: Vec<Vec<i64>> = weights.w1[j][..d_in].iter().map(|&w| vec![w]).collect();
-        let hj = crate::arithmetic::chimera_dot_product(module, x_cts, &w_vecs);
+    let h_act: Vec<GLWE<Vec<u8>>> = {
+        use rayon::prelude::*;
+        (0..d_ffn)
+            .into_par_iter()
+            .map(|j| {
+                let w_vecs: Vec<Vec<i64>> = weights.w1[j][..d_in].iter().map(|&w| vec![w]).collect();
+                let hj = crate::arithmetic::chimera_dot_product(module, x_cts, &w_vecs);
 
-        // Phase 2: Activation on each hidden dimension
-        let hj_act = apply_poly_activation(module, eval_key, &hj, &approx);
-        h_act.push(hj_act);
-    }
+                // Phase 2: Activation on each hidden dimension
+                apply_poly_activation(module, eval_key, &hj, &approx)
+            })
+            .collect()
+    };
 
     // Phase 3: Down-projection — y_i = Σ_j W2[i][j] * h'_j
-    let mut outputs = Vec::with_capacity(weights.w2.len());
-    for w2_row in &weights.w2 {
-        let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
-        let dot = crate::arithmetic::chimera_dot_product(module, &h_act, &w2_vecs);
-        outputs.push(dot);
-    }
+    let outputs: Vec<GLWE<Vec<u8>>> = {
+        use rayon::prelude::*;
+        weights
+            .w2
+            .par_iter()
+            .map(|w2_row| {
+                let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
+                crate::arithmetic::chimera_dot_product(module, &h_act, &w2_vecs)
+            })
+            .collect()
+    };
 
     outputs
 }
@@ -1110,45 +1119,60 @@ where
     let d_ffn = weights.w1.len();
 
     // Phase 1+2: Gate projection + SiLU, Up projection, element-wise product
+    let t_phase1 = std::time::Instant::now();
     let silu_approx = silu_poly_approx();
-    let mut h = Vec::with_capacity(d_ffn);
-    for j in 0..d_ffn {
-        // Gate: gate_j = Σ_k W_gate[j][k] * x_k
-        let wg_vecs: Vec<Vec<i64>> = weights.w1[j][..d_in].iter().map(|&w| vec![w]).collect();
-        let gate_j = crate::arithmetic::chimera_dot_product(module, x_cts, &wg_vecs);
+    let h: Vec<GLWE<Vec<u8>>> = {
+        use rayon::prelude::*;
+        (0..d_ffn)
+            .into_par_iter()
+            .map(|j| {
+                // Gate: gate_j = Σ_k W_gate[j][k] * x_k
+                let wg_vecs: Vec<Vec<i64>> = weights.w1[j][..d_in].iter().map(|&w| vec![w]).collect();
+                let gate_j = crate::arithmetic::chimera_dot_product(module, x_cts, &wg_vecs);
 
-        // Up: up_j = Σ_k W_up[j][k] * x_k
-        let wu_vecs: Vec<Vec<i64>> = w_up[j][..d_in].iter().map(|&w| vec![w]).collect();
-        let up_j = crate::arithmetic::chimera_dot_product(module, x_cts, &wu_vecs);
+                // Up: up_j = Σ_k W_up[j][k] * x_k
+                let wu_vecs: Vec<Vec<i64>> = w_up[j][..d_in].iter().map(|&w| vec![w]).collect();
+                let up_j = crate::arithmetic::chimera_dot_product(module, x_cts, &wu_vecs);
 
-        // SiLU(gate_j)
-        let gate_activated = apply_poly_activation(module, eval_key, &gate_j, &silu_approx);
+                // SiLU(gate_j)
+                let gate_activated = apply_poly_activation(module, eval_key, &gate_j, &silu_approx);
 
-        // Project up_j to match gate_activated's layout
-        let gate_layout = GLWELayout {
-            n: gate_activated.n(),
-            base2k: gate_activated.base2k(),
-            k: gate_activated.k(),
-            rank: gate_activated.rank(),
-        };
-        let up_proj = if up_j.base2k() == gate_activated.base2k() {
-            up_j
-        } else {
-            chimera_align_layout(module, &up_j, &gate_layout)
-        };
+                // Project up_j to match gate_activated's layout
+                let gate_layout = GLWELayout {
+                    n: gate_activated.n(),
+                    base2k: gate_activated.base2k(),
+                    k: gate_activated.k(),
+                    rank: gate_activated.rank(),
+                };
+                let up_proj = if up_j.base2k() == gate_activated.base2k() {
+                    up_j
+                } else {
+                    chimera_align_layout(module, &up_j, &gate_layout)
+                };
 
-        // Element-wise: SiLU(gate_j) ⊙ up_j
-        let hj = chimera_ct_mul(module, eval_key, &gate_activated, &up_proj);
-        h.push(hj);
-    }
+                // Element-wise: SiLU(gate_j) ⊙ up_j
+                chimera_ct_mul(module, eval_key, &gate_activated, &up_proj)
+            })
+            .collect()
+    };
+    let phase1_ms = t_phase1.elapsed().as_millis();
 
     // Phase 3: Down projection — y_i = Σ_j W_down[i][j] * h_j
-    let mut outputs = Vec::with_capacity(weights.w2.len());
-    for w2_row in &weights.w2 {
-        let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
-        let dot = crate::arithmetic::chimera_dot_product(module, &h, &w2_vecs);
-        outputs.push(dot);
-    }
+    let t_down = std::time::Instant::now();
+    let outputs: Vec<GLWE<Vec<u8>>> = {
+        use rayon::prelude::*;
+        weights
+            .w2
+            .par_iter()
+            .map(|w2_row| {
+                let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
+                crate::arithmetic::chimera_dot_product(module, &h, &w2_vecs)
+            })
+            .collect()
+    };
+    let down_ms = t_down.elapsed().as_millis();
+
+    eprintln!("[profile]   swiglu_ffn d_in={d_in} d_ffn={d_ffn} | gate+silu+up={phase1_ms}ms down_proj={down_ms}ms");
 
     outputs
 }
@@ -1212,45 +1236,63 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
-    let _d_model = x_cts.len();
+    let d_model = x_cts.len();
+    let block_start = std::time::Instant::now();
 
     // Step 1: Pre-attention RMSNorm
+    let t0 = std::time::Instant::now();
     let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
         Some(gamma) => config.pre_attn_norm.clone().with_gamma(gamma.clone()),
         None => config.pre_attn_norm.clone(),
     };
     let normed_pre_attn = chimera_rms_norm_vec(module, eval_key, x_cts, &pre_attn_norm_cfg);
+    let pre_attn_norm_ms = t0.elapsed().as_millis();
 
     // Step 2: Multi-head attention (vector representation)
-    //
-    // chimera_multi_head_attention_vec takes Vec<GLWE> input (one per dim)
-    // and returns Vec<GLWE> output (one per dim). It uses dot products
-    // for QKV projection and output projection rather than ring products.
+    let t1 = std::time::Instant::now();
     let attn_out = chimera_multi_head_attention_vec(module, eval_key, &normed_pre_attn, &weights.attention, &config.attention);
+    let attn_ms = t1.elapsed().as_millis();
 
     // Step 3: Residual connection (attention)
+    let t2 = std::time::Instant::now();
     let residual_1 = if config.residual {
         project_and_add_vec(module, x_cts, &attn_out)
     } else {
         attn_out
     };
+    let residual1_ms = t2.elapsed().as_millis();
 
     // Step 4: Pre-FFN RMSNorm
+    let t3 = std::time::Instant::now();
     let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
         Some(gamma) => config.pre_ffn_norm.clone().with_gamma(gamma.clone()),
         None => config.pre_ffn_norm.clone(),
     };
     let normed_pre_ffn = chimera_rms_norm_vec(module, eval_key, &residual_1, &pre_ffn_norm_cfg);
+    let pre_ffn_norm_ms = t3.elapsed().as_millis();
 
     // Step 5: FFN (vector representation — returns full d_model output)
+    let t4 = std::time::Instant::now();
     let ffn_out = chimera_ffn_vec(module, eval_key, &normed_pre_ffn, &weights.ffn, &config.ffn);
+    let ffn_ms = t4.elapsed().as_millis();
 
     // Step 6: Residual connection (FFN)
-    if config.residual {
+    let t5 = std::time::Instant::now();
+    let result = if config.residual {
         project_and_add_vec(module, &residual_1, &ffn_out)
     } else {
         ffn_out
-    }
+    };
+    let residual2_ms = t5.elapsed().as_millis();
+
+    let total_ms = block_start.elapsed().as_millis();
+    eprintln!(
+        "[profile] transformer_block d_model={d_model} total={total_ms}ms | \
+         pre_attn_norm={pre_attn_norm_ms}ms attn={attn_ms}ms residual1={residual1_ms}ms \
+         pre_ffn_norm={pre_ffn_norm_ms}ms ffn={ffn_ms}ms residual2={residual2_ms}ms"
+    );
+
+    result
 }
 
 /// Projects two ciphertext vectors to matching layouts and adds element-wise.

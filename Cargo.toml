@@ -25,3 +25,4 @@ safetensors = "0.5"
 memmap2 = "0.9"
 half = { version = "2.4", features = ["std"] }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+rayon = "1.10"

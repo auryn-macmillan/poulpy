@@ -248,8 +248,11 @@ where
 
     let d = x_cts.len();
 
-    // Step 1: Square each dimension — sq_i = x_i * x_i
-    let sq: Vec<GLWE<Vec<u8>>> = x_cts.iter().map(|xi| chimera_ct_mul(module, eval_key, xi, xi)).collect();
+    // Step 1: Square each dimension — sq_i = x_i * x_i (parallelized)
+    let sq: Vec<GLWE<Vec<u8>>> = {
+        use rayon::prelude::*;
+        x_cts.par_iter().map(|xi| chimera_ct_mul(module, eval_key, xi, xi)).collect()
+    };
 
     // Step 2: Sum all squared values — sum_sq = Σ_i sq_i
     // All sq_i should have the same layout after ct*ct (out_base2k).
@@ -277,7 +280,7 @@ where
     // Step 4: Inverse square root — evaluate polynomial approx of 1/√x
     let inv_rms = apply_poly_activation(module, eval_key, &mean_sq, &config.inv_sqrt_approx);
 
-    // Step 5: Scale each dimension — out_i = x_i * inv_rms
+    // Step 5: Scale each dimension — out_i = x_i * inv_rms (parallelized)
     // We need to project each x_i to match inv_rms's layout before ct*ct multiply.
     let inv_rms_layout = poulpy_core::layouts::GLWELayout {
         n: inv_rms.n(),
@@ -286,26 +289,30 @@ where
         rank: inv_rms.rank(),
     };
 
-    let mut outputs = Vec::with_capacity(d);
-    for xi in x_cts {
-        let xi_proj = if xi.base2k() == inv_rms.base2k() && xi.k() == inv_rms.k() {
-            use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
-            let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(xi);
-            {
-                let src_ref = xi.to_ref();
-                let src: &[u8] = src_ref.data().data;
-                let mut dst_mut = cloned.to_mut();
-                let dst: &mut [u8] = dst_mut.data_mut().data;
-                let len = src.len().min(dst.len());
-                dst[..len].copy_from_slice(&src[..len]);
-            }
-            cloned
-        } else {
-            chimera_align_layout(module, xi, &inv_rms_layout)
-        };
-        let normed = chimera_ct_mul(module, eval_key, &xi_proj, &inv_rms);
-        outputs.push(normed);
-    }
+    let mut outputs: Vec<GLWE<Vec<u8>>> = {
+        use rayon::prelude::*;
+        x_cts
+            .par_iter()
+            .map(|xi| {
+                let xi_proj = if xi.base2k() == inv_rms.base2k() && xi.k() == inv_rms.k() {
+                    use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+                    let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(xi);
+                    {
+                        let src_ref = xi.to_ref();
+                        let src: &[u8] = src_ref.data().data;
+                        let mut dst_mut = cloned.to_mut();
+                        let dst: &mut [u8] = dst_mut.data_mut().data;
+                        let len = src.len().min(dst.len());
+                        dst[..len].copy_from_slice(&src[..len]);
+                    }
+                    cloned
+                } else {
+                    chimera_align_layout(module, xi, &inv_rms_layout)
+                };
+                chimera_ct_mul(module, eval_key, &xi_proj, &inv_rms)
+            })
+            .collect()
+    };
 
     // Step 6: Optional gamma scaling
     if let Some(gamma) = &config.gamma {

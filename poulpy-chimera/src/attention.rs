@@ -935,23 +935,22 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchAvailable,
 {
+    use rayon::prelude::*;
     let d_in = x_cts.len();
 
     let project_one_matrix = |w_rows: &[Vec<i64>], n_rows: usize| -> Vec<GLWE<Vec<u8>>> {
-        let mut outs = Vec::with_capacity(n_rows);
-        for i in 0..n_rows {
-            // W[i] is [d_model] — one weight per input dimension.
-            // Convert to single-coefficient weight vectors for dot product.
-            assert!(
-                w_rows[i].len() >= d_in,
-                "Weight row {i} has {} elements, need {d_in}",
-                w_rows[i].len()
-            );
-            let w_vecs: Vec<Vec<i64>> = w_rows[i][..d_in].iter().map(|&w| vec![w]).collect();
-            let dot = crate::arithmetic::chimera_dot_product(module, x_cts, &w_vecs);
-            outs.push(dot);
-        }
-        outs
+        (0..n_rows)
+            .into_par_iter()
+            .map(|i| {
+                assert!(
+                    w_rows[i].len() >= d_in,
+                    "Weight row {i} has {} elements, need {d_in}",
+                    w_rows[i].len()
+                );
+                let w_vecs: Vec<Vec<i64>> = w_rows[i][..d_in].iter().map(|&w| vec![w]).collect();
+                crate::arithmetic::chimera_dot_product(module, x_cts, &w_vecs)
+            })
+            .collect()
     };
 
     let q_cts = project_one_matrix(&weights.w_q, n_q_rows);
@@ -1019,10 +1018,13 @@ where
 
     // Step 1: QKV projections
     // Q produces d_model outputs; K and V produce d_kv outputs each.
+    let t_qkv = std::time::Instant::now();
     let (q_all, k_all, v_all) = chimera_qkv_project_vec(module, x_cts, weights, d_model, d_kv);
+    let qkv_ms = t_qkv.elapsed().as_millis();
 
     // Step 1b: Apply RoPE to Q and K if configured.
     // RoPE is applied per-head: each head's d_head slice is rotated in pairs.
+    let t_rope = std::time::Instant::now();
     let (q_all, k_all) = if let Some(rope) = &config.rope {
         let mut q_rope = Vec::with_capacity(q_all.len());
         let mut k_rope = Vec::with_capacity(k_all.len());
@@ -1048,8 +1050,10 @@ where
     } else {
         (q_all, k_all)
     };
+    let rope_ms = t_rope.elapsed().as_millis();
 
     // Step 2: Per-head attention with GQA mapping
+    let t_heads = std::time::Instant::now();
     let mut all_head_contexts: Vec<GLWE<Vec<u8>>> = Vec::with_capacity(d_model);
 
     for h in 0..n_heads {
@@ -1066,14 +1070,30 @@ where
         let head_context = chimera_single_head_attention(module, eval_key, q_h, k_h, v_h, &config.softmax_approx);
         all_head_contexts.extend(head_context);
     }
+    let heads_ms = t_heads.elapsed().as_millis();
 
     // Step 3: Output projection — out_i = Σ_j W_O[i][j] * context[j]
-    let mut outputs = Vec::with_capacity(d_model);
-    for row in weights.w_o.iter().take(d_model) {
-        let w_vecs: Vec<Vec<i64>> = row.iter().map(|&w| vec![w]).collect();
-        let dot = crate::arithmetic::chimera_dot_product(module, &all_head_contexts, &w_vecs);
-        outputs.push(dot);
-    }
+    let t_out = std::time::Instant::now();
+    let outputs: Vec<GLWE<Vec<u8>>> = {
+        use rayon::prelude::*;
+        weights
+            .w_o
+            .iter()
+            .take(d_model)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|row| {
+                let w_vecs: Vec<Vec<i64>> = row.iter().map(|&w| vec![w]).collect();
+                crate::arithmetic::chimera_dot_product(module, &all_head_contexts, &w_vecs)
+            })
+            .collect()
+    };
+    let out_proj_ms = t_out.elapsed().as_millis();
+
+    eprintln!(
+        "[profile]   attention d_model={d_model} n_heads={n_heads} d_head={d_head} d_kv={d_kv} | \
+         qkv={qkv_ms}ms rope={rope_ms}ms heads={heads_ms}ms out_proj={out_proj_ms}ms"
+    );
 
     outputs
 }

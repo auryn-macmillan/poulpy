@@ -720,6 +720,7 @@ dependencies = [
  "poulpy-hal",
  "poulpy-schemes",
  "rand 0.10.0",
+ "rayon",
  "safetensors",
  "tokenizers",
 ]

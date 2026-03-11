@@ -5905,4 +5905,54 @@ mod integration {
         let text = pipeline.decode(&tokens).expect("decode failed");
         eprintln!("[convenience] 'Test' → tokens={:?} → decoded={:?}", tokens, text);
     }
+
+    /// E2E test: Single-token generation at d_model=128, d_ffn=256 to profile
+    /// scaling behaviour. With 4-core rayon parallelism this exercises a more
+    /// realistic matrix dimension.
+    #[test]
+    #[ignore] // Requires TinyLlama model files on disk; takes ~10-20s in release
+    fn test_inference_pipeline_e2e_d128() {
+        use crate::inference::{InferenceConfig, InferencePipeline, ModelSpec};
+
+        let model_path = "/home/dev/models/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6/model.safetensors";
+        let tokenizer_path = "/home/dev/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6/tokenizer.json";
+
+        if !std::path::Path::new(model_path).exists() || !std::path::Path::new(tokenizer_path).exists() {
+            eprintln!("[SKIP] model or tokenizer files not found");
+            return;
+        }
+
+        let config = InferenceConfig {
+            security: SecurityLevel::Bits80,
+            precision: Precision::Int8,
+            num_layers: Some(1),
+            trunc_d_model: Some(128),
+            trunc_d_ffn: Some(256),
+            num_heads: Some(2),
+            num_kv_heads: Some(2),
+            softmax_strategy: SoftmaxStrategy::ReluSquared,
+            apply_final_norm: true,
+            max_new_tokens: 1,
+            ..InferenceConfig::default()
+        };
+
+        eprintln!("[e2e_d128] Loading pipeline (d_model=128, d_ffn=256, 2 heads)...");
+        let pipeline = InferencePipeline::load(model_path, tokenizer_path, ModelSpec::tinyllama_1_1b(), config)
+            .expect("Failed to load pipeline");
+
+        eprintln!("[e2e_d128] Pipeline loaded. Effective dims: {:?}", pipeline.effective_dims());
+
+        let tokens = pipeline.tokenize("Hello").expect("tokenize failed");
+        let last_token = *tokens.last().unwrap();
+        eprintln!("[e2e_d128] Running step on token {}...", last_token);
+        let step = pipeline.step(last_token).expect("step failed");
+
+        eprintln!("[e2e_d128] Result: token_id={}, text={:?}", step.token_id, step.token_text);
+        eprintln!("[e2e_d128] FHE forward: {:.2?}", step.fhe_time);
+        eprintln!("[e2e_d128] Total: {:.2?}", step.total_time);
+        eprintln!("[e2e_d128] Top 5 logits: {:?}", step.top_logits);
+
+        assert!(step.token_id < 32000);
+        assert_eq!(step.hidden_state.len(), 128);
+    }
 }

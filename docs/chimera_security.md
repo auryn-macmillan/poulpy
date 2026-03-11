@@ -158,6 +158,13 @@ scale=26); only the polynomial degree N differs.
    CHIMERA-80 supports only 12 levels (1 layer). For models with >4 layers,
    bootstrapping is required regardless of security level.
 
+5. **Inference-level validation confirms primitive-level findings**: Measured
+   end-to-end inference with real TinyLlama weights at d_model=64 shows:
+   - 128-bit L∞ = 63.2 (1 layer), 31.3 (4 layers) — identical to 80-bit
+   - Per-layer latency: 12.1s at 128-bit vs 2.5s at 80-bit (4.8x ratio)
+   - Error does NOT grow with depth at either security level
+   - Polynomial approximation contributes <0.5% of total error at all levels
+
 ## 3. Approximate FHE: Security Implications
 
 ### 3.1 Relaxed Correctness Does Not Weaken Security

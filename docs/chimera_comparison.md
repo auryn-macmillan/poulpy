@@ -193,7 +193,47 @@ d_ffn=11008):
 with AVX2/AVX-512, multi-threading, and N=16384 (128-bit security) would have
 different absolute numbers but similar relative speedups.*
 
-### 3.4 Full Forward Pass Estimates
+### 3.4 Measured End-to-End Inference at 128-bit Security
+
+Measured on the Rayon-parallelized backend (4 CPU cores, release build) with
+real TinyLlama 1.1B weights (INT8 quantized, truncated dimensions).
+
+#### d_model=64, 1 head, d_ffn=128 (128-bit security, N=16384)
+
+| Layers | FHE time   | L∞ error | MAE   | Poly approx L∞ | FHE noise L∞ |
+|--------|-----------|----------|-------|----------------|-------------|
+| 1      | 12.7 s    | 63.2     | 34.5  | 0.19           | 63.2        |
+| 2      | 25.1 s    | 30.9     | 14.4  | 0.45           | 30.9        |
+| 4      | 49.6 s    | 31.3     | 15.4  | 0.60           | 31.5        |
+
+Per-layer breakdown (d_model=64, 128-bit):
+- Pre-attention RMSNorm: 600 ms
+- Attention (QKV + heads + output proj): 4.6 s
+- Pre-FFN RMSNorm: 600 ms
+- SwiGLU FFN (gate+SiLU+up + down): 6.2 s
+- Residual connections: ~140 ms
+- **Total per layer: ~12.1 s**
+
+Comparison with 80-bit security (d_model=64, same workload):
+
+| Metric           | CHIMERA-80 (N=4096) | CHIMERA-128 (N=16384) | Ratio |
+|------------------|--------------------:|----------------------:|:-----:|
+| Per-layer time   | 2.5 s              | 12.1 s                | 4.8x  |
+| L∞ (1 layer)     | 63                  | 63.2                  | 1.0x  |
+| MAE (1 layer)    | 34                  | 34.5                  | 1.0x  |
+| L∞ (4 layers)    | 32                  | 31.3                  | 1.0x  |
+| MAE (4 layers)   | 15                  | 15.4                  | 1.0x  |
+
+**Key finding**: Accuracy is identical at 80-bit and 128-bit security.
+The ~4.8x latency overhead is consistent with the N=16384/N=4096 ratio
+(4x ring size × O(N log N) FFT scaling).
+
+**Key finding**: Error does NOT grow with depth. At both 80-bit and 128-bit
+security, L∞ error decreases from ~63 (1 layer) to ~31 (2-4 layers).
+Residual connections + RMSNorm stabilize noise across layers. Bootstrapping
+is not needed for at least 4 layers at either security level.
+
+### 3.5 Full Forward Pass Estimates
 
 Based on measured per-layer extrapolation:
 

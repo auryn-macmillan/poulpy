@@ -21,7 +21,7 @@
 
 use poulpy_core::{
     layouts::{GLWEInfos, GLWELayout, LWEInfos, GLWE},
-    GLWEAdd, GLWEMulConst, GLWETensoring, GLWETrace,
+    GLWEAdd, GLWEMulConst, GLWESub, GLWETensoring, GLWETrace,
 };
 use poulpy_core::{GLWEAutomorphism, ScratchTakeCore};
 use poulpy_hal::{
@@ -269,6 +269,7 @@ pub fn default_block_config(dims: ModelDims, params: ChimeraParams) -> Transform
             params: params.clone(),
             softmax_approx: SoftmaxStrategy::PolynomialDeg4,
             causal: true,
+            rope: None,
         },
         pre_attn_norm: LayerNormConfig::rms_norm(dims.d_model),
         pre_ffn_norm: LayerNormConfig::rms_norm(dims.d_model),
@@ -1207,7 +1208,7 @@ pub fn chimera_transformer_block_vec<BE: Backend>(
     weights: &TransformerBlockWeights,
 ) -> Vec<GLWE<Vec<u8>>>
 where
-    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE> + GLWEAutomorphism<BE>,
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWESub + GLWETrace<BE> + GLWEAutomorphism<BE>,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
@@ -1327,7 +1328,7 @@ pub fn chimera_forward_pass_vec<BE: Backend>(
     layer_weights: &[TransformerBlockWeights],
 ) -> Vec<GLWE<Vec<u8>>>
 where
-    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE> + GLWEAutomorphism<BE>,
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWESub + GLWETrace<BE> + GLWEAutomorphism<BE>,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
@@ -1338,6 +1339,141 @@ where
     }
 
     current
+}
+
+/// Configuration for the full forward pass pipeline (vec representation).
+///
+/// Extends the basic block-loop with optional bootstrapping, final norm,
+/// and noise tracking — everything needed for a real model forward pass.
+#[derive(Clone, Debug)]
+pub struct ForwardPassConfig {
+    /// Transformer block config (shared across layers unless overridden per-layer).
+    pub block: TransformerBlockConfig,
+
+    /// CHIMERA parameters (needed for noise budget calculations).
+    pub params: ChimeraParams,
+
+    /// Bootstrapping configuration. Use [`BootstrappingConfig::no_bootstrap()`]
+    /// if the model fits within a single noise budget.
+    pub bootstrap: BootstrappingConfig,
+
+    /// Optional final RMSNorm gamma weights (applied after the last
+    /// transformer layer, before the LM head). When `None`, no final norm
+    /// is applied.
+    pub final_norm_gamma: Option<Vec<i64>>,
+
+    /// RMSNorm configuration for the final norm layer.
+    /// Only used when `final_norm_gamma` is `Some`.
+    pub final_norm_config: LayerNormConfig,
+}
+
+/// Evaluates a full transformer forward pass in the vector representation
+/// with bootstrapping support and optional final RMSNorm.
+///
+/// This is the production entry point for real model inference. It:
+///
+/// 1. Chains `layer_weights.len()` transformer blocks
+/// 2. Optionally checks noise budget between layers and bootstraps all
+///    d_model ciphertexts when the budget is low
+/// 3. Applies a final RMSNorm (with learned gamma) after the last layer
+///    if `config.final_norm_gamma` is set
+///
+/// # Arguments
+///
+/// * `module` - Backend module.
+/// * `eval_key` - Evaluation key.
+/// * `x_cts` - Initial input: d_model ciphertexts.
+/// * `config` - Full forward pass configuration (block config + bootstrapping + final norm).
+/// * `layer_weights` - Per-layer weights.
+/// * `bsk_prepared` - Prepared bootstrap key (required if bootstrapping is enabled;
+///   pass `None` if bootstrapping is disabled).
+///
+/// # Returns
+///
+/// A tuple of:
+/// - d_model ciphertexts representing the final output (after final norm if configured).
+/// - The final [`NoiseTracker`] state (useful for diagnostics).
+pub fn chimera_forward_pass_vec_full<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    config: &ForwardPassConfig,
+    layer_weights: &[TransformerBlockWeights],
+    bsk_prepared: Option<&ChimeraBootstrapKeyPrepared<BE>>,
+) -> (Vec<GLWE<Vec<u8>>>, NoiseTracker)
+where
+    Module<BE>: GLWETensoring<BE>
+        + GLWEMulConst<BE>
+        + GLWEAdd
+        + GLWESub
+        + GLWETrace<BE>
+        + GLWEAutomorphism<BE>
+        + poulpy_hal::api::ModuleN
+        + poulpy_core::LWESampleExtract
+        + poulpy_core::LWEKeySwitch<BE>
+        + poulpy_schemes::bin_fhe::blind_rotation::BlindRotationExecute<poulpy_schemes::bin_fhe::blind_rotation::CGGI, BE>
+        + poulpy_schemes::bin_fhe::blind_rotation::LookupTableFactory,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    let mut current: Vec<GLWE<Vec<u8>>> = x_cts.iter().map(|ct| clone_glwe(ct)).collect();
+    let mut tracker = NoiseTracker::fresh();
+    let mut bootstrap_count: usize = 0;
+    let ring_degree = config.params.degree.0 as usize;
+
+    for (layer_idx, weights) in layer_weights.iter().enumerate() {
+        // --- Check noise budget before this layer ---
+        if needs_bootstrap(&tracker, &config.params, &config.bootstrap) {
+            let bsk = bsk_prepared.expect(
+                "chimera_forward_pass_vec_full: bootstrapping triggered \
+                 but no bootstrap key provided (bsk_prepared is None)",
+            );
+
+            if config.bootstrap.max_bootstraps_per_pass == 0 || bootstrap_count < config.bootstrap.max_bootstraps_per_pass {
+                // Bootstrap every ciphertext in the vec
+                current = current
+                    .iter()
+                    .map(|ct| {
+                        let mut t = tracker.clone();
+                        chimera_bootstrap(module, ct, &mut t, &config.params, bsk, &config.bootstrap)
+                    })
+                    .collect();
+
+                // Reset tracker after bootstrap (noise is refreshed)
+                tracker = NoiseTracker::fresh();
+                bootstrap_count += 1;
+
+                eprintln!(
+                    "[forward_pass_vec_full] Bootstrapped all {} cts before layer {} (bootstrap #{})",
+                    current.len(),
+                    layer_idx,
+                    bootstrap_count,
+                );
+            }
+        }
+
+        // --- Evaluate transformer block ---
+        current = chimera_transformer_block_vec(module, eval_key, &current, &config.block, weights);
+
+        // --- Update noise tracker ---
+        // Approximate the noise cost of one transformer block as several ct*ct muls.
+        let block_ct_ct_muls = match &config.block.ffn {
+            FFNConfig::SwiGLU => 8,
+            FFNConfig::Standard { activation } => 6 + activation.depth(),
+        };
+        for _ in 0..block_ct_ct_muls {
+            let other = NoiseTracker::fresh();
+            tracker.mul_ct(&other, ring_degree);
+        }
+    }
+
+    // --- Apply final RMSNorm if configured ---
+    if let Some(ref gamma) = config.final_norm_gamma {
+        let norm_cfg = config.final_norm_config.clone().with_gamma(gamma.clone());
+        current = chimera_rms_norm_vec(module, eval_key, &current, &norm_cfg);
+    }
+
+    (current, tracker)
 }
 
 #[cfg(test)]
@@ -1396,6 +1532,7 @@ mod tests {
                 params: params.clone(),
                 softmax_approx: SoftmaxStrategy::ReluSquared,
                 causal: true,
+                rope: None,
             },
             pre_attn_norm: LayerNormConfig::rms_norm(dims.d_model),
             pre_ffn_norm: LayerNormConfig::rms_norm(dims.d_model),

@@ -57,6 +57,7 @@ pub mod attention;
 pub mod bootstrapping;
 pub mod encoding;
 pub mod encrypt;
+pub mod inference;
 pub mod layernorm;
 pub mod lut;
 pub mod model_loader;

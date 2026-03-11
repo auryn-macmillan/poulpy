@@ -269,9 +269,9 @@ Agents should treat the following as active research questions and document find
 
 ## Implementation Status
 
-> Last updated: 2026-03-10
+> Last updated: 2026-03-11
 
-### Crate: `poulpy-chimera` (16 source files, 175 tests passing)
+### Crate: `poulpy-chimera` (17 source files, 191 tests passing)
 
 The CHIMERA scheme is implemented as a new crate in the Poulpy workspace, reusing
 `poulpy-hal` (backend traits, FFT) and `poulpy-core` (RLWE encryption, keyswitching,
@@ -282,7 +282,7 @@ tensor products, automorphisms).
 | Deliverable | Location | Status |
 |-------------|----------|--------|
 | Scheme specification | `docs/chimera_spec.md` | ✅ Complete |
-| Reference implementation | `poulpy-chimera/src/` | ✅ Complete (16 modules) |
+| Reference implementation | `poulpy-chimera/src/` | ✅ Complete (17 modules) |
 | Benchmark harness | `poulpy-chimera/benches/chimera_ops.rs` | ✅ Complete |
 | Comparison report vs CKKS | `docs/chimera_comparison.md` | ✅ Complete (updated with measured multi-security-level data) |
 | Security analysis | `docs/chimera_security.md` | ✅ Complete (updated with measured benchmarks at 80/100/128-bit) |
@@ -299,14 +299,15 @@ tensor products, automorphisms).
 | `activations.rs` | Polynomial GELU/SiLU/SquaredReLU/inv_sqrt approximations, ct×ct multiply | ✅ |
 | `lut.rs` | LUT-based nonlinearity evaluation via blind rotation | ✅ |
 | `layernorm.rs` | Approximate RMSNorm/LayerNorm under FHE (with optional gamma/beta) | ✅ |
-| `attention.rs` | QKV projection, attention scores, softmax approximation, context, output | ✅ |
-| `transformer.rs` | Full transformer block, forward pass, FFN (standard + SwiGLU) | ✅ |
+| `attention.rs` | QKV projection, attention scores, softmax approximation, context, output, RoPE | ✅ |
+| `transformer.rs` | Full transformer block, forward pass (basic + full), FFN (standard + SwiGLU) | ✅ |
 | `moe.rs` | MoE routing: homomorphic router, sign extraction, top-k, expert dispatch | ✅ |
 | `noise.rs` | Noise tracking and budget estimation | ✅ |
 | `bootstrapping.rs` | Full bootstrap pipeline: sample extract → LWE keyswitch → blind rotation | ✅ |
 | `model_loader.rs` | Safetensors loading, INT8/FP16/BF16/FP32 quantization, transpose, sharded models | ✅ |
 | `verification.rs` | MAC-based user-side computation verification (linear ops) | ✅ |
-| `tests.rs` | 175 integration tests (including 8 accuracy + 3 security sweep + 11 MAC verification tests) | ✅ |
+| `inference.rs` | End-to-end inference pipeline: tokenize → embed → encrypt → FHE forward → decrypt → LM head → decode | ✅ |
+| `tests.rs` | 183 integration tests (including 8 accuracy + 3 security sweep + 11 MAC verification + 4 RoPE/full-pipeline tests) + 3 E2E inference pipeline tests (ignored, require model files) | ✅ |
 | `benches/chimera_ops.rs` | Criterion benchmarks for all operations (toy + d_model=128 + security sweep) | ✅ |
 
 ### Key Design Decisions Implemented
@@ -318,6 +319,7 @@ tensor products, automorphisms).
 - **Encoding scale**: `2 * in_base2k = 26` (torus encoding for INT8 values)
 - **Bootstrapping**: sample_extract → LWE keyswitch (N→n_lwe) → blind rotation with identity LUT
 - **Model loading**: safetensors with automatic PyTorch→CHIMERA transpose, per-tensor INT8 quantization
+- **Inference pipeline**: tokenize (HuggingFace `tokenizers` crate) → embed → encrypt → FHE transformer → decrypt → LM head → argmax → decode
 
 ### What Works End-to-End
 
@@ -327,6 +329,10 @@ tensor products, automorphisms).
 4. Bootstrapping roundtrip: encrypt value → bootstrap through identity LUT → recover original
 5. Matmul with multi-coefficient polynomial weights (d_model=4)
 6. Load model weights from safetensors (INT8/FP16/BF16/FP32, sharded, memory-mapped)
+7. RoPE wired into multi-head attention vec path (tested at d_model=4 with n_heads=2)
+8. Full forward pass with final RMSNorm (`chimera_forward_pass_vec_full`) — production entry point
+9. Full forward pass with bootstrapping support (per-layer noise check, all-ct bootstrap)
+10. **Full text-in → text-out inference pipeline** (`inference.rs`): tokenize → embed → encrypt → FHE transformer → decrypt → LM head → decode. Tested with TinyLlama 1.1B (truncated d_model=64, 1 layer, 80-bit security). Single token generation: ~190s. Multi-token generation (3 tokens): ~570s.
 
 ---
 
@@ -385,11 +391,13 @@ To run CHIMERA on a real model (e.g., a quantized LLaMA-7B):
 
 1. ~~Complete P0 items (gamma wiring, bootstrapping integration, multi-head attention)~~ ✅ Done
 2. ~~Verify numerical accuracy at d_model=128 (P1 item 4)~~ ✅ Done (accuracy characterized)
-3. Load real safetensors weights via `model_loader.rs` (already implemented)
-4. Run a single-token forward pass and compare output logits to cleartext inference
-5. Profile bottlenecks and optimize hot paths
+3. ~~Load real safetensors weights via `model_loader.rs`~~ ✅ Done (implemented)
+4. ~~Build end-to-end inference pipeline (tokenize → embed → encrypt → FHE → decrypt → LM head → decode)~~ ✅ Done (`inference.rs`)
+5. Run a single-token forward pass and compare output logits to cleartext inference
+6. Profile bottlenecks and optimize hot paths
 
 The model loader already supports LLaMA naming conventions and handles INT8 quantized
-weights. All P0 and P1 items are complete. The next concrete step toward real model
-inference is loading a quantized model's weights and running a single forward pass
-at d_model >= 128.
+weights. All P0 and P1 items are complete. The inference pipeline (`inference.rs`) has
+been tested end-to-end with TinyLlama 1.1B at truncated dimensions (d_model=64, 1 layer,
+80-bit security), generating tokens at ~190s per token. The next concrete step is scaling
+to larger dimensions (d_model >= 128) and profiling the hot paths for optimization.

@@ -71,6 +71,11 @@ pub struct AttentionConfig {
     pub softmax_approx: SoftmaxStrategy,
     /// Whether to use causal masking.
     pub causal: bool,
+    /// Optional RoPE (Rotary Position Embedding) configuration.
+    /// When `Some`, RoPE rotation is applied to Q and K after projection
+    /// and before score computation in `chimera_multi_head_attention_vec`.
+    /// When `None`, no positional encoding is applied (legacy behaviour).
+    pub rope: Option<RoPEConfig>,
 }
 
 /// Strategy for evaluating softmax under FHE.
@@ -990,7 +995,7 @@ pub fn chimera_multi_head_attention_vec<BE: Backend>(
     config: &AttentionConfig,
 ) -> Vec<GLWE<Vec<u8>>>
 where
-    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE>,
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWESub + GLWETrace<BE>,
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
@@ -1015,6 +1020,34 @@ where
     // Step 1: QKV projections
     // Q produces d_model outputs; K and V produce d_kv outputs each.
     let (q_all, k_all, v_all) = chimera_qkv_project_vec(module, x_cts, weights, d_model, d_kv);
+
+    // Step 1b: Apply RoPE to Q and K if configured.
+    // RoPE is applied per-head: each head's d_head slice is rotated in pairs.
+    let (q_all, k_all) = if let Some(rope) = &config.rope {
+        let mut q_rope = Vec::with_capacity(q_all.len());
+        let mut k_rope = Vec::with_capacity(k_all.len());
+
+        // Apply RoPE to each Q head
+        for h in 0..n_heads {
+            let q_start = h * d_head;
+            let q_end = q_start + d_head;
+            let q_h_rotated = chimera_apply_rope_vec(module, &q_all[q_start..q_end], rope);
+            q_rope.extend(q_h_rotated);
+        }
+
+        // Apply RoPE to each K head (d_kv / d_head heads)
+        let n_kv_heads = d_kv / d_head;
+        for kv_h in 0..n_kv_heads {
+            let kv_start = kv_h * d_head;
+            let kv_end = kv_start + d_head;
+            let k_h_rotated = chimera_apply_rope_vec(module, &k_all[kv_start..kv_end], rope);
+            k_rope.extend(k_h_rotated);
+        }
+
+        (q_rope, k_rope)
+    } else {
+        (q_all, k_all)
+    };
 
     // Step 2: Per-head attention with GQA mapping
     let mut all_head_contexts: Vec<GLWE<Vec<u8>>> = Vec::with_capacity(d_model);
@@ -1137,6 +1170,7 @@ mod tests {
             params,
             softmax_approx: SoftmaxStrategy::PolynomialDeg4,
             causal: true,
+            rope: None,
         };
 
         let plan = plan_attention(&config);

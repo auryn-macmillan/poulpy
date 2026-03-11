@@ -26,6 +26,7 @@ paste = {workspace = true}
 safetensors = {workspace = true}
 memmap2 = {workspace = true}
 half = {workspace = true}
+tokenizers = {workspace = true}
 
 [dev-dependencies]
 criterion = {workspace = true}

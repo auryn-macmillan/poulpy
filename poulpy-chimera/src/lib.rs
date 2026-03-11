@@ -64,6 +64,7 @@ pub mod model_loader;
 pub mod moe;
 pub mod noise;
 pub mod params;
+pub mod plaintext_forward;
 pub mod transformer;
 pub mod verification;
 

@@ -590,6 +590,155 @@ impl InferencePipeline {
         current
     }
 
+    /// Runs the plaintext forward pass using exact f64 nonlinearities.
+    ///
+    /// This is the gold-standard reference for comparing FHE outputs.
+    /// It uses the same INT8 quantised weights but operates entirely in
+    /// f64 domain with exact softmax, SiLU, and 1/sqrt.
+    ///
+    /// # Arguments
+    ///
+    /// * `embedding` - Token embedding as i8 values (d_model dimensions).
+    ///
+    /// # Returns
+    ///
+    /// Hidden state in f64 domain (d_model dimensions).
+    pub fn plaintext_forward(&self, embedding: &[i8]) -> Vec<f64> {
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let x: Vec<f64> = embedding.iter().map(|&v| v as f64).collect();
+
+        crate::plaintext_forward::forward_pass_with_final_norm(
+            &x,
+            &block_config,
+            &self.layer_weights,
+            self.final_norm_gamma.as_deref(),
+            block_config.pre_attn_norm.epsilon,
+        )
+    }
+
+    /// Runs the polynomial-approximation plaintext forward pass.
+    ///
+    /// Uses the same polynomial approximations as the FHE pipeline but
+    /// without encryption noise. This isolates the FHE noise contribution
+    /// when compared against the FHE output.
+    pub fn plaintext_forward_poly(&self, embedding: &[i8]) -> Vec<f64> {
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let x: Vec<f64> = embedding.iter().map(|&v| v as f64).collect();
+
+        crate::plaintext_forward::forward_pass_poly_approx(
+            &x,
+            &block_config,
+            &self.layer_weights,
+            self.final_norm_gamma.as_deref(),
+            block_config.pre_attn_norm.epsilon,
+        )
+    }
+
+    /// Runs a plaintext inference step and returns the result.
+    ///
+    /// This is the plaintext equivalent of [`step`], returning both the
+    /// hidden state (in f64) and LM head logits for comparison with FHE.
+    pub fn plaintext_step(&self, token_id: u32) -> crate::plaintext_forward::PlaintextStepResult {
+        let embedding = self.embed_token(token_id);
+        let d = self.effective_dims.d_model;
+
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        // Prepare LM head weights (truncated if needed)
+        let lm_weights: Vec<Vec<i64>> = if d < self.lm_head.d_model {
+            self.lm_head.weights.iter().map(|row| row[..d].to_vec()).collect()
+        } else {
+            self.lm_head.weights.clone()
+        };
+
+        crate::plaintext_forward::plaintext_step(
+            &embedding,
+            &block_config,
+            &self.layer_weights,
+            self.final_norm_gamma.as_deref(),
+            &lm_weights,
+            d,
+        )
+    }
+
+    /// Performs a three-way error comparison after an FHE inference step.
+    ///
+    /// Given the FHE-decrypted hidden state and the original token ID,
+    /// computes error metrics that decompose the total error into:
+    /// - Polynomial approximation error
+    /// - FHE noise
+    ///
+    /// # Returns
+    ///
+    /// A [`ThreeWayComparison`] with L-inf, L2, and MAE for each pair.
+    pub fn compare_fhe_vs_plaintext(&self, fhe_hidden: &[i8], token_id: u32) -> crate::plaintext_forward::ThreeWayComparison {
+        let embedding = self.embed_token(token_id);
+        let d = self.effective_dims.d_model;
+
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        crate::plaintext_forward::three_way_comparison(
+            fhe_hidden,
+            &embedding,
+            &block_config,
+            &self.layer_weights,
+            self.final_norm_gamma.as_deref(),
+            block_config.pre_attn_norm.epsilon,
+        )
+    }
+
     /// Applies the LM head to a decrypted hidden state and returns logits.
     ///
     /// If the model was truncated, this uses a truncated LM head

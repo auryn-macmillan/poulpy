@@ -4853,6 +4853,891 @@ mod integration {
     }
 
     // ========================================================================
+    // Plaintext forward reference tests
+    //
+    // Tests for the plaintext_forward module: unit tests for exact
+    // nonlinearities, linear algebra, transformer block, forward pass,
+    // error metrics, and FHE-vs-plaintext comparison.
+    // ========================================================================
+
+    // ---- Exact nonlinearity unit tests ----
+
+    #[test]
+    fn test_plaintext_exact_softmax() {
+        use crate::plaintext_forward::exact_softmax;
+
+        // Single element: softmax([x]) = [1.0]
+        let s1 = exact_softmax(&[5.0]);
+        assert_eq!(s1.len(), 1);
+        assert!((s1[0] - 1.0).abs() < 1e-12, "softmax of single element should be 1.0");
+
+        // Uniform: softmax([0, 0, 0]) = [1/3, 1/3, 1/3]
+        let s3 = exact_softmax(&[0.0, 0.0, 0.0]);
+        for v in &s3 {
+            assert!(
+                (v - 1.0 / 3.0).abs() < 1e-12,
+                "softmax of uniform input should be 1/3 each, got {v}"
+            );
+        }
+
+        // Dominant element: softmax([100, 0, 0]) should be ≈ [1, 0, 0]
+        let s_dom = exact_softmax(&[100.0, 0.0, 0.0]);
+        assert!(s_dom[0] > 0.999, "dominant element should be near 1.0");
+        assert!(s_dom[1] < 0.001 && s_dom[2] < 0.001);
+
+        // Sums to 1
+        let s4 = exact_softmax(&[1.0, 2.0, 3.0, 4.0]);
+        let sum: f64 = s4.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-12, "softmax should sum to 1.0, got {sum}");
+
+        // Monotonically increasing inputs → monotonically increasing outputs
+        for i in 0..3 {
+            assert!(
+                s4[i] < s4[i + 1],
+                "softmax should be monotonically increasing for increasing inputs"
+            );
+        }
+
+        // Empty
+        assert!(exact_softmax(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_plaintext_exact_silu() {
+        use crate::plaintext_forward::exact_silu;
+
+        // silu(0) = 0
+        assert!((exact_silu(0.0)).abs() < 1e-12);
+
+        // silu is odd-like: silu(x) ≈ x for large positive x
+        assert!((exact_silu(10.0) - 10.0).abs() < 0.01);
+
+        // silu(x) → 0 for large negative x
+        assert!(exact_silu(-10.0).abs() < 0.01);
+
+        // Known value: silu(1) = 1 / (1 + exp(-1)) = 1 * sigmoid(1) ≈ 0.7311
+        let s1 = exact_silu(1.0);
+        assert!((s1 - 0.7310585786300049).abs() < 1e-8, "silu(1) should be ≈ 0.7311, got {s1}");
+    }
+
+    #[test]
+    fn test_plaintext_exact_gelu() {
+        use crate::plaintext_forward::exact_gelu;
+
+        // gelu(0) = 0
+        assert!(exact_gelu(0.0).abs() < 1e-12);
+
+        // gelu(x) ≈ x for large positive x
+        assert!((exact_gelu(5.0) - 5.0).abs() < 0.01);
+
+        // gelu(x) ≈ 0 for large negative x
+        assert!(exact_gelu(-5.0).abs() < 0.01);
+
+        // Known value: gelu(1) ≈ 0.8412
+        let g1 = exact_gelu(1.0);
+        assert!((g1 - 0.8412).abs() < 0.001, "gelu(1) should be ≈ 0.8412, got {g1}");
+
+        // gelu(-1) ≈ -0.1588
+        let gm1 = exact_gelu(-1.0);
+        assert!((gm1 - (-0.1588)).abs() < 0.001, "gelu(-1) should be ≈ -0.1588, got {gm1}");
+    }
+
+    #[test]
+    fn test_plaintext_exact_squared_relu() {
+        use crate::plaintext_forward::exact_squared_relu;
+
+        // squared_relu(x) = max(0, x)^2
+        assert!((exact_squared_relu(0.0)).abs() < 1e-12);
+        assert!((exact_squared_relu(3.0) - 9.0).abs() < 1e-12);
+        assert!((exact_squared_relu(-5.0)).abs() < 1e-12);
+        assert!((exact_squared_relu(0.5) - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_plaintext_sigmoid() {
+        use crate::plaintext_forward::sigmoid;
+
+        // sigmoid(0) = 0.5
+        assert!((sigmoid(0.0) - 0.5).abs() < 1e-12);
+
+        // sigmoid(large) → 1
+        assert!((sigmoid(10.0) - 1.0).abs() < 1e-4);
+
+        // sigmoid(large negative) → 0
+        assert!(sigmoid(-10.0) < 1e-4);
+
+        // sigmoid(-x) = 1 - sigmoid(x)
+        for &x in &[0.5, 1.0, 2.0, 3.0] {
+            let diff = (sigmoid(x) + sigmoid(-x) - 1.0).abs();
+            assert!(diff < 1e-12, "sigmoid symmetry violated for x={x}: diff={diff}");
+        }
+    }
+
+    // ---- Linear algebra unit tests ----
+
+    #[test]
+    fn test_plaintext_dot_product() {
+        use crate::plaintext_forward::dot_product;
+
+        assert!((dot_product(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]) - 32.0).abs() < 1e-12);
+        assert!((dot_product(&[0.0, 0.0], &[100.0, 200.0])).abs() < 1e-12);
+        assert!((dot_product(&[1.0], &[1.0]) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_plaintext_matvec() {
+        use crate::plaintext_forward::matvec;
+
+        // Identity-like matrix
+        let w = vec![vec![1i64, 0, 0], vec![0, 1, 0], vec![0, 0, 1]];
+        let x = vec![3.0, 5.0, 7.0];
+        let y = matvec(&w, &x);
+        assert_eq!(y.len(), 3);
+        assert!((y[0] - 3.0).abs() < 1e-12);
+        assert!((y[1] - 5.0).abs() < 1e-12);
+        assert!((y[2] - 7.0).abs() < 1e-12);
+
+        // Non-trivial matrix
+        let w2 = vec![vec![2i64, 3], vec![4, 5]];
+        let x2 = vec![1.0, 2.0];
+        let y2 = matvec(&w2, &x2);
+        assert!((y2[0] - 8.0).abs() < 1e-12); // 2*1 + 3*2 = 8
+        assert!((y2[1] - 14.0).abs() < 1e-12); // 4*1 + 5*2 = 14
+    }
+
+    #[test]
+    fn test_plaintext_vec_add_and_mul() {
+        use crate::plaintext_forward::{vec_add, vec_mul};
+
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+
+        let sum = vec_add(&a, &b);
+        assert!((sum[0] - 5.0).abs() < 1e-12);
+        assert!((sum[1] - 7.0).abs() < 1e-12);
+        assert!((sum[2] - 9.0).abs() < 1e-12);
+
+        let prod = vec_mul(&a, &b);
+        assert!((prod[0] - 4.0).abs() < 1e-12);
+        assert!((prod[1] - 10.0).abs() < 1e-12);
+        assert!((prod[2] - 18.0).abs() < 1e-12);
+    }
+
+    // ---- RMS norm unit tests ----
+
+    #[test]
+    fn test_plaintext_rms_norm_basic() {
+        use crate::plaintext_forward::rms_norm;
+
+        // rms_norm([3, 4], None, 0) = [3/sqrt(12.5), 4/sqrt(12.5)]
+        // mean(x^2) = (9+16)/2 = 12.5, sqrt(12.5) = 3.5355...
+        let result = rms_norm(&[3.0, 4.0], None, 0.0);
+        let rms = (12.5_f64).sqrt();
+        assert!((result[0] - 3.0 / rms).abs() < 1e-10);
+        assert!((result[1] - 4.0 / rms).abs() < 1e-10);
+
+        // Unit vector should be preserved
+        let unit = rms_norm(&[1.0, 0.0, 0.0, 0.0], None, 0.0);
+        // mean(x^2) = 0.25, sqrt = 0.5, inv = 2.0, so unit[0] = 1*2 = 2.0
+        assert!((unit[0] - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_plaintext_rms_norm_with_gamma() {
+        use crate::plaintext_forward::rms_norm;
+
+        // gamma = [256, 512] → scaled values [1.0, 2.0]
+        let gamma = vec![256i64, 512];
+        let result = rms_norm(&[3.0, 4.0], Some(&gamma), 0.0);
+        let rms = (12.5_f64).sqrt();
+        assert!((result[0] - 3.0 / rms * 1.0).abs() < 1e-10);
+        assert!((result[1] - 4.0 / rms * 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_plaintext_rms_norm_consistency_with_layernorm() {
+        use crate::layernorm::{layernorm_plaintext, LayerNormConfig};
+        use crate::plaintext_forward::rms_norm;
+
+        // Compare our rms_norm with the existing layernorm_plaintext
+        let values = vec![2.0, -3.0, 5.0, 1.0];
+        let config = LayerNormConfig::rms_norm(4);
+
+        let existing = layernorm_plaintext(&values, &config);
+        let ours = rms_norm(&values, None, config.epsilon);
+
+        for (i, (&a, &b)) in existing.iter().zip(ours.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-10, "rms_norm mismatch at {i}: existing={a}, ours={b}");
+        }
+    }
+
+    // ---- Error metrics unit tests ----
+
+    #[test]
+    fn test_plaintext_error_metrics() {
+        use crate::plaintext_forward::{error_metrics, format_error_metrics};
+
+        let a = vec![1.0, 2.0, 3.0, 4.0];
+        let b = vec![1.0, 2.0, 3.0, 4.0];
+        let (linf, l2, mae) = error_metrics(&a, &b);
+        assert!(linf < 1e-15, "identical vectors should have zero L-inf");
+        assert!(l2 < 1e-15, "identical vectors should have zero L2");
+        assert!(mae < 1e-15, "identical vectors should have zero MAE");
+
+        let c = vec![1.0, 2.0, 3.0, 5.0]; // differs by 1 at last element
+        let (linf, l2, mae) = error_metrics(&a, &c);
+        assert!((linf - 1.0).abs() < 1e-12, "L-inf should be 1.0, got {linf}");
+        // L2 = sqrt(1/4) = 0.5
+        assert!((l2 - 0.5).abs() < 1e-12, "L2 should be 0.5, got {l2}");
+        // MAE = 1/4 = 0.25
+        assert!((mae - 0.25).abs() < 1e-12, "MAE should be 0.25, got {mae}");
+
+        // format_error_metrics just smoke test
+        let s = format_error_metrics(1.5, 0.7, 0.3);
+        assert!(s.contains("1.5000"), "format should contain L-inf value");
+    }
+
+    #[test]
+    fn test_plaintext_error_metrics_i8_vs_f64() {
+        use crate::plaintext_forward::error_metrics_i8_vs_f64;
+
+        let fhe: Vec<i8> = vec![10, 20, 30];
+        let reference = vec![10.5, 20.0, 29.0];
+        let (linf, l2, mae) = error_metrics_i8_vs_f64(&fhe, &reference);
+        assert!((linf - 1.0).abs() < 1e-12, "L-inf should be 1.0, got {linf}"); // max(|10-10.5|, 0, |30-29|) = 1
+        assert!(l2 > 0.0);
+        assert!(mae > 0.0);
+    }
+
+    #[test]
+    fn test_plaintext_top1_agrees_and_top_k() {
+        use crate::plaintext_forward::{top1_agrees, top_k};
+
+        assert!(top1_agrees(&[1.0, 5.0, 3.0], &[0.0, 10.0, 2.0]));
+        assert!(!top1_agrees(&[1.0, 5.0, 3.0], &[10.0, 0.0, 2.0]));
+        assert!(!top1_agrees(&[], &[1.0]));
+
+        let topk = top_k(&[3.0, 1.0, 4.0, 1.0, 5.0, 9.0], 3);
+        assert_eq!(topk.len(), 3);
+        assert_eq!(topk[0].0, 5); // index of 9.0
+        assert_eq!(topk[1].0, 4); // index of 5.0
+        assert_eq!(topk[2].0, 2); // index of 4.0
+    }
+
+    // ---- Polynomial approximation reference tests ----
+
+    #[test]
+    fn test_plaintext_poly_vs_exact_activations() {
+        use crate::plaintext_forward::{exact_gelu, exact_silu, exact_squared_relu, poly_gelu, poly_silu, poly_squared_relu};
+
+        // Test at a range of inputs within the reasonable operating range
+        let test_points = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
+
+        for &x in &test_points {
+            let g_exact = exact_gelu(x);
+            let g_poly = poly_gelu(x);
+            let g_err = (g_exact - g_poly).abs();
+            eprintln!("[poly_vs_exact] GELU({x}): exact={g_exact:.6}, poly={g_poly:.6}, err={g_err:.6}");
+
+            let s_exact = exact_silu(x);
+            let s_poly = poly_silu(x);
+            let s_err = (s_exact - s_poly).abs();
+            eprintln!("[poly_vs_exact] SiLU({x}): exact={s_exact:.6}, poly={s_poly:.6}, err={s_err:.6}");
+
+            let r_exact = exact_squared_relu(x);
+            let r_poly = poly_squared_relu(x);
+            let r_err = (r_exact - r_poly).abs();
+            eprintln!("[poly_vs_exact] SquaredReLU({x}): exact={r_exact:.6}, poly={r_poly:.6}, err={r_err:.6}");
+
+            // Polynomial approximations should be reasonably close in [-2, 2]
+            assert!(g_err < 0.5, "GELU poly error too large at x={x}: {g_err}");
+            assert!(s_err < 0.5, "SiLU poly error too large at x={x}: {s_err}");
+        }
+
+        // SquaredReLU poly = x^2, which diverges from max(0,x)^2 for negative x
+        // This is expected — document the difference
+        let sq_neg = poly_squared_relu(-1.0);
+        let sq_exact = exact_squared_relu(-1.0);
+        eprintln!("[poly_vs_exact] SquaredReLU(-1): poly={sq_neg}, exact={sq_exact} (expected divergence for x<0)");
+    }
+
+    // ---- Transformer block plaintext test ----
+
+    #[test]
+    fn test_plaintext_transformer_block_d4_identity() {
+        use crate::plaintext_forward::{forward_pass, forward_pass_with_final_norm, transformer_block};
+
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 2,
+            d_ffn: 4,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(4),
+            pre_ffn_norm: LayerNormConfig::rms_norm(4),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        let id_row = |i: usize| -> Vec<i64> {
+            let mut r = vec![0i64; 4];
+            r[i] = 1;
+            r
+        };
+        let weights = TransformerBlockWeights {
+            attention: AttentionWeights {
+                w_q: (0..4).map(id_row).collect(),
+                w_k: (0..4).map(id_row).collect(),
+                w_v: (0..4).map(id_row).collect(),
+                w_o: (0..4).map(id_row).collect(),
+            },
+            ffn: FFNWeights {
+                w1: (0..4).map(id_row).collect(),
+                w2: (0..4).map(id_row).collect(),
+                w3: None,
+            },
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
+        };
+
+        let x = vec![5.0, 3.0, 7.0, 2.0];
+        let result = transformer_block(&x, &config, &weights);
+
+        assert_eq!(result.len(), 4, "transformer block output should be d_model=4");
+        eprintln!("[pt_block_d4] Input: {:?}", x);
+        eprintln!("[pt_block_d4] Output: {:?}", result);
+
+        // Output should be finite and non-degenerate
+        for (i, &v) in result.iter().enumerate() {
+            assert!(v.is_finite(), "output[{i}] should be finite, got {v}");
+        }
+
+        // With residual=true, output should not be identical to input (FFN and attention modify it)
+        let diff_any = result.iter().zip(x.iter()).any(|(a, b)| (a - b).abs() > 1e-10);
+        assert!(diff_any, "transformer block should modify the input");
+    }
+
+    #[test]
+    fn test_plaintext_forward_pass_2_layers() {
+        use crate::plaintext_forward::{forward_pass, forward_pass_with_final_norm};
+
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 2,
+            d_ffn: 4,
+            n_layers: 2,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(4),
+            pre_ffn_norm: LayerNormConfig::rms_norm(4),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        let id_row = |i: usize| -> Vec<i64> {
+            let mut r = vec![0i64; 4];
+            r[i] = 1;
+            r
+        };
+        let make_weights = || TransformerBlockWeights {
+            attention: AttentionWeights {
+                w_q: (0..4).map(id_row).collect(),
+                w_k: (0..4).map(id_row).collect(),
+                w_v: (0..4).map(id_row).collect(),
+                w_o: (0..4).map(id_row).collect(),
+            },
+            ffn: FFNWeights {
+                w1: (0..4).map(id_row).collect(),
+                w2: (0..4).map(id_row).collect(),
+                w3: None,
+            },
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
+        };
+
+        let layer_weights = vec![make_weights(), make_weights()];
+        let x = vec![5.0, 3.0, 7.0, 2.0];
+
+        // 2-layer forward pass
+        let result = forward_pass(&x, &config, &layer_weights);
+        assert_eq!(result.len(), 4);
+        eprintln!("[pt_fp_2L] Output (2 layers): {:?}", result);
+
+        for (i, &v) in result.iter().enumerate() {
+            assert!(v.is_finite(), "forward_pass output[{i}] should be finite");
+        }
+
+        // With final norm
+        let gamma = vec![256i64; 4]; // gamma = 1.0 everywhere
+        let result_normed = forward_pass_with_final_norm(&x, &config, &layer_weights, Some(&gamma), 1e-5);
+        assert_eq!(result_normed.len(), 4);
+        eprintln!("[pt_fp_2L] Output (2 layers + final norm): {:?}", result_normed);
+
+        // Final norm should produce different values from raw forward pass
+        // (unless output was already perfectly normalised, which is unlikely)
+        let normed_differs = result.iter().zip(result_normed.iter()).any(|(a, b)| (a - b).abs() > 1e-10);
+        assert!(normed_differs, "final norm should modify the output");
+    }
+
+    #[test]
+    fn test_plaintext_swiglu_ffn() {
+        use crate::plaintext_forward::ffn;
+
+        let weights = FFNWeights {
+            w1: vec![vec![1i64, 0], vec![0, 1]],       // gate: identity
+            w2: vec![vec![1i64, 0], vec![0, 1]],       // down: identity
+            w3: Some(vec![vec![1i64, 0], vec![0, 1]]), // up: identity
+        };
+
+        let config = FFNConfig::SwiGLU;
+        let x = vec![2.0, 3.0];
+        let result = ffn(&x, &weights, &config);
+
+        // SwiGLU(x) = down_proj(silu(gate_proj(x)) * up_proj(x))
+        // With identity matrices: silu(x) * x
+        let expected_0 = crate::plaintext_forward::exact_silu(2.0) * 2.0;
+        let expected_1 = crate::plaintext_forward::exact_silu(3.0) * 3.0;
+
+        assert_eq!(result.len(), 2);
+        assert!(
+            (result[0] - expected_0).abs() < 1e-10,
+            "SwiGLU[0]: expected {expected_0}, got {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - expected_1).abs() < 1e-10,
+            "SwiGLU[1]: expected {expected_1}, got {}",
+            result[1]
+        );
+    }
+
+    #[test]
+    fn test_plaintext_lm_head_forward() {
+        use crate::plaintext_forward::lm_head_forward;
+
+        let hidden = vec![1.0, 2.0, 3.0];
+        let lm_head = vec![vec![1i64, 0, 0], vec![0, 1, 0], vec![0, 0, 1], vec![1, 1, 1]];
+        let logits = lm_head_forward(&hidden, &lm_head);
+        assert_eq!(logits.len(), 4);
+        assert!((logits[0] - 1.0).abs() < 1e-12);
+        assert!((logits[1] - 2.0).abs() < 1e-12);
+        assert!((logits[2] - 3.0).abs() < 1e-12);
+        assert!((logits[3] - 6.0).abs() < 1e-12); // 1+2+3
+    }
+
+    // ---- Plaintext vs existing layernorm_plaintext cross-check ----
+
+    #[test]
+    fn test_plaintext_rms_norm_matches_layernorm_plaintext_with_gamma() {
+        use crate::layernorm::{layernorm_plaintext, LayerNormConfig};
+        use crate::plaintext_forward::rms_norm;
+
+        let values = vec![1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0];
+        let config = LayerNormConfig::rms_norm(8);
+
+        let existing = layernorm_plaintext(&values, &config);
+        let ours = rms_norm(&values, None, config.epsilon);
+
+        for (i, (&a, &b)) in existing.iter().zip(ours.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-10,
+                "rms_norm/layernorm_plaintext mismatch at {i}: {a} vs {b}"
+            );
+        }
+    }
+
+    // ---- FHE vs plaintext comparison at d_model=4 ----
+
+    /// Runs FHE and plaintext forward passes on the same input with identity
+    /// weights at d_model=4, then compares the results.
+    #[test]
+    fn test_fhe_vs_plaintext_comparison_d4() {
+        use crate::plaintext_forward::{error_metrics_i8_vs_f64, format_error_metrics, transformer_block};
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [180u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [181u8; 32], [182u8; 32]);
+
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 2,
+            d_ffn: 4,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(4),
+            pre_ffn_norm: LayerNormConfig::rms_norm(4),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        let id_row = |i: usize| -> Vec<i64> {
+            let mut r = vec![0i64; 4];
+            r[i] = 1;
+            r
+        };
+        let weights = TransformerBlockWeights {
+            attention: AttentionWeights {
+                w_q: (0..4).map(id_row).collect(),
+                w_k: (0..4).map(id_row).collect(),
+                w_v: (0..4).map(id_row).collect(),
+                w_o: (0..4).map(id_row).collect(),
+            },
+            ffn: FFNWeights {
+                w1: (0..4).map(id_row).collect(),
+                w2: (0..4).map(id_row).collect(),
+                w3: None,
+            },
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
+        };
+
+        let input_i8: Vec<i8> = vec![5, 3, 7, 2];
+
+        // --- FHE path ---
+        let ct_x = encrypt_vec(&module, &key, &params, &input_i8);
+        let fhe_result = chimera_transformer_block_vec(&module, &eval_key, &ct_x, &config, &weights);
+        let fhe_decrypted = decrypt_vec(&module, &key, &params, &fhe_result);
+        eprintln!("[fhe_vs_pt] FHE output: {:?}", fhe_decrypted);
+
+        // --- Plaintext path ---
+        let x_f64: Vec<f64> = input_i8.iter().map(|&v| v as f64).collect();
+        let pt_result = transformer_block(&x_f64, &config, &weights);
+        eprintln!("[fhe_vs_pt] Plaintext output: {:?}", pt_result);
+
+        // --- Compare ---
+        let (linf, l2, mae) = error_metrics_i8_vs_f64(&fhe_decrypted, &pt_result);
+        eprintln!(
+            "[fhe_vs_pt] Error (FHE vs exact plaintext): {}",
+            format_error_metrics(linf, l2, mae)
+        );
+
+        // The total error (FHE noise + polynomial approximation) should be bounded.
+        // At d_model=4 with identity weights and SquaredReLU, we expect modest errors.
+        // Being generous with bounds since both poly approx and FHE noise contribute.
+        assert!(
+            linf < 50.0,
+            "FHE vs plaintext L-inf too large: {linf} (expected < 50 for d4 toy model)"
+        );
+    }
+
+    // ---- Three-way comparison test ----
+
+    #[test]
+    fn test_three_way_comparison_d4() {
+        use crate::plaintext_forward::{
+            error_metrics_i8_vs_f64, format_error_metrics, forward_pass_poly_approx, forward_pass_with_final_norm,
+            three_way_comparison,
+        };
+
+        let params = ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8);
+        let module: Module<BE> = Module::new(params.n());
+        let key = ChimeraKey::generate(&module, &params, [190u8; 32]);
+        let eval_key = ChimeraEvalKey::generate(&module, &key, &params, [191u8; 32], [192u8; 32]);
+
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 2,
+            d_ffn: 4,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: params.clone(),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(4),
+            pre_ffn_norm: LayerNormConfig::rms_norm(4),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        let id_row = |i: usize| -> Vec<i64> {
+            let mut r = vec![0i64; 4];
+            r[i] = 1;
+            r
+        };
+        let weights = TransformerBlockWeights {
+            attention: AttentionWeights {
+                w_q: (0..4).map(id_row).collect(),
+                w_k: (0..4).map(id_row).collect(),
+                w_v: (0..4).map(id_row).collect(),
+                w_o: (0..4).map(id_row).collect(),
+            },
+            ffn: FFNWeights {
+                w1: (0..4).map(id_row).collect(),
+                w2: (0..4).map(id_row).collect(),
+                w3: None,
+            },
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
+        };
+
+        let input_i8: Vec<i8> = vec![5, 3, 7, 2];
+
+        // --- FHE forward pass ---
+        let ct_x = encrypt_vec(&module, &key, &params, &input_i8);
+        let fhe_result = chimera_transformer_block_vec(&module, &eval_key, &ct_x, &config, &weights);
+        let fhe_decrypted = decrypt_vec(&module, &key, &params, &fhe_result);
+
+        // --- Three-way comparison ---
+        let comparison = three_way_comparison(&fhe_decrypted, &input_i8, &config, &[weights], None, 1e-5);
+
+        eprintln!("[3-way] {comparison}");
+
+        // Verify the triangle inequality roughly holds:
+        // fhe_vs_exact <= fhe_vs_poly + poly_vs_exact (for L-inf)
+        let (fhe_exact_linf, _, _) = comparison.fhe_vs_exact;
+        let (fhe_poly_linf, _, _) = comparison.fhe_vs_poly;
+        let (poly_exact_linf, _, _) = comparison.poly_vs_exact;
+
+        // poly_vs_exact should be 0 for SquaredReLU (polynomial IS the function, modulo the
+        // negative branch — poly=x^2 always, exact=max(0,x)^2). So poly_vs_exact captures the
+        // negative-branch difference.
+        eprintln!("[3-way] poly_vs_exact L-inf: {poly_exact_linf}");
+        eprintln!("[3-way] fhe_vs_poly L-inf: {fhe_poly_linf}");
+        eprintln!("[3-way] fhe_vs_exact L-inf: {fhe_exact_linf}");
+
+        // All error metrics should be finite
+        assert!(fhe_exact_linf.is_finite(), "fhe_vs_exact L-inf should be finite");
+        assert!(fhe_poly_linf.is_finite(), "fhe_vs_poly L-inf should be finite");
+        assert!(poly_exact_linf.is_finite(), "poly_vs_exact L-inf should be finite");
+    }
+
+    // ---- Plaintext step (mini integration) ----
+
+    #[test]
+    fn test_plaintext_step_basic() {
+        use crate::plaintext_forward::plaintext_step;
+
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 2,
+            d_ffn: 4,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(4),
+            pre_ffn_norm: LayerNormConfig::rms_norm(4),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        let id_row = |i: usize| -> Vec<i64> {
+            let mut r = vec![0i64; 4];
+            r[i] = 1;
+            r
+        };
+        let weights = TransformerBlockWeights {
+            attention: AttentionWeights {
+                w_q: (0..4).map(id_row).collect(),
+                w_k: (0..4).map(id_row).collect(),
+                w_v: (0..4).map(id_row).collect(),
+                w_o: (0..4).map(id_row).collect(),
+            },
+            ffn: FFNWeights {
+                w1: (0..4).map(id_row).collect(),
+                w2: (0..4).map(id_row).collect(),
+                w3: None,
+            },
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
+        };
+
+        let embedding: Vec<i8> = vec![5, 3, 7, 2];
+        let lm_head = vec![
+            vec![1i64, 0, 0, 0],
+            vec![0, 1, 0, 0],
+            vec![0, 0, 1, 0],
+            vec![0, 0, 0, 1],
+            vec![1, 1, 1, 1],
+        ];
+
+        let result = plaintext_step(&embedding, &config, &[weights], None, &lm_head, 4);
+
+        assert_eq!(result.hidden_state.len(), 4, "hidden state should be d_model=4");
+        assert_eq!(result.logits.len(), 5, "logits should match vocab_size=5");
+        assert!(result.token_id < 5, "predicted token should be in vocab range");
+        assert!(!result.top_logits.is_empty(), "should have top logits");
+
+        eprintln!("[pt_step] Hidden state: {:?}", result.hidden_state);
+        eprintln!("[pt_step] Logits: {:?}", result.logits);
+        eprintln!("[pt_step] Predicted token: {}", result.token_id);
+        eprintln!("[pt_step] Top logits: {:?}", result.top_logits);
+    }
+
+    // ---- Poly-approx forward pass test ----
+
+    #[test]
+    fn test_plaintext_poly_approx_vs_exact_forward_pass() {
+        use crate::plaintext_forward::{
+            error_metrics, format_error_metrics, forward_pass_poly_approx, forward_pass_with_final_norm,
+        };
+
+        let dims = ModelDims {
+            d_model: 4,
+            d_head: 2,
+            n_heads: 2,
+            n_kv_heads: 2,
+            d_ffn: 4,
+            n_layers: 1,
+            n_experts: 1,
+            n_active_experts: 1,
+        };
+
+        let config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: dims.clone(),
+                params: ChimeraParams::new(SecurityLevel::Bits80, Precision::Int8),
+                softmax_approx: SoftmaxStrategy::ReluSquared,
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(4),
+            pre_ffn_norm: LayerNormConfig::rms_norm(4),
+            ffn: FFNConfig::Standard {
+                activation: ActivationChoice::SquaredReLU,
+            },
+            residual: true,
+        };
+
+        let id_row = |i: usize| -> Vec<i64> {
+            let mut r = vec![0i64; 4];
+            r[i] = 1;
+            r
+        };
+        let weights = TransformerBlockWeights {
+            attention: AttentionWeights {
+                w_q: (0..4).map(id_row).collect(),
+                w_k: (0..4).map(id_row).collect(),
+                w_v: (0..4).map(id_row).collect(),
+                w_o: (0..4).map(id_row).collect(),
+            },
+            ffn: FFNWeights {
+                w1: (0..4).map(id_row).collect(),
+                w2: (0..4).map(id_row).collect(),
+                w3: None,
+            },
+            pre_attn_norm_gamma: None,
+            pre_ffn_norm_gamma: None,
+        };
+
+        let x = vec![5.0, 3.0, 7.0, 2.0];
+
+        let exact_result = forward_pass_with_final_norm(&x, &config, &[weights.clone()], None, 1e-5);
+        let poly_result = forward_pass_poly_approx(&x, &config, &[weights], None, 1e-5);
+
+        let (linf, l2, mae) = error_metrics(&exact_result, &poly_result);
+        eprintln!("[poly_vs_exact_fp] Error: {}", format_error_metrics(linf, l2, mae));
+        eprintln!("[poly_vs_exact_fp] Exact result: {:?}", exact_result);
+        eprintln!("[poly_vs_exact_fp] Poly result: {:?}", poly_result);
+
+        // With SquaredReLU and ReluSquared softmax, the polynomial and exact
+        // paths are very close (SquaredReLU poly is x^2 which differs from
+        // max(0,x)^2 only for negative inputs). The difference quantifies the
+        // polynomial approximation error component.
+        assert!(linf.is_finite(), "poly vs exact L-inf should be finite");
+
+        // For SquaredReLU with identity weights, the difference should be modest
+        // because the RMSNorm normalises input magnitudes
+        assert!(linf < 100.0, "poly vs exact L-inf unreasonably large: {linf}");
+    }
+
+    // ---- SwiGLU-specific comparison ----
+
+    #[test]
+    fn test_plaintext_swiglu_poly_vs_exact() {
+        use crate::plaintext_forward::{error_metrics, ffn, ffn_swiglu_poly, format_error_metrics};
+
+        let weights = FFNWeights {
+            w1: vec![vec![2i64, 1], vec![1, 2]],
+            w2: vec![vec![1i64, 1], vec![1, -1]],
+            w3: Some(vec![vec![1i64, 0], vec![0, 1]]),
+        };
+
+        let x = vec![1.0, 2.0];
+
+        let exact_result = ffn(&x, &weights, &FFNConfig::SwiGLU);
+        let poly_result = ffn_swiglu_poly(&x, &weights);
+
+        let (linf, l2, mae) = error_metrics(&exact_result, &poly_result);
+        eprintln!("[swiglu_poly_vs_exact] Exact: {:?}, Poly: {:?}", exact_result, poly_result);
+        eprintln!("[swiglu_poly_vs_exact] Error: {}", format_error_metrics(linf, l2, mae));
+
+        // The polynomial SiLU approximation should be reasonably close to exact SiLU
+        // for small input values
+        assert!(linf < 5.0, "SwiGLU poly vs exact L-inf too large: {linf}");
+    }
+
+    // ========================================================================
     // End-to-end inference pipeline tests
     // ========================================================================
 

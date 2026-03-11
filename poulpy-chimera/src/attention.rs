@@ -197,29 +197,32 @@ where
     );
 
     let n_pairs = d_head / 2;
-    let mut out = Vec::with_capacity(d_head);
+    let out: Vec<GLWE<Vec<u8>>> = {
+        use rayon::prelude::*;
+        (0..n_pairs)
+            .into_par_iter()
+            .flat_map(|i| {
+                let cos_i = rope.cos_table[i];
+                let sin_i = rope.sin_table[i];
 
-    for i in 0..n_pairs {
-        let cos_i = rope.cos_table[i];
-        let sin_i = rope.sin_table[i];
+                // q[2i] * cos[i]
+                let even_cos = chimera_mul_const(module, &q_or_k[2 * i], &[cos_i]);
+                // q[2i+1] * sin[i]
+                let odd_sin = chimera_mul_const(module, &q_or_k[2 * i + 1], &[sin_i]);
+                // out[2i] = q[2i] * cos[i] - q[2i+1] * sin[i]
+                let out_even = chimera_sub(module, &even_cos, &odd_sin);
 
-        // q[2i] * cos[i]
-        let even_cos = chimera_mul_const(module, &q_or_k[2 * i], &[cos_i]);
-        // q[2i+1] * sin[i]
-        let odd_sin = chimera_mul_const(module, &q_or_k[2 * i + 1], &[sin_i]);
-        // out[2i] = q[2i] * cos[i] - q[2i+1] * sin[i]
-        let out_even = chimera_sub(module, &even_cos, &odd_sin);
+                // q[2i] * sin[i]
+                let even_sin = chimera_mul_const(module, &q_or_k[2 * i], &[sin_i]);
+                // q[2i+1] * cos[i]
+                let odd_cos = chimera_mul_const(module, &q_or_k[2 * i + 1], &[cos_i]);
+                // out[2i+1] = q[2i] * sin[i] + q[2i+1] * cos[i]
+                let out_odd = chimera_add(module, &even_sin, &odd_cos);
 
-        // q[2i] * sin[i]
-        let even_sin = chimera_mul_const(module, &q_or_k[2 * i], &[sin_i]);
-        // q[2i+1] * cos[i]
-        let odd_cos = chimera_mul_const(module, &q_or_k[2 * i + 1], &[cos_i]);
-        // out[2i+1] = q[2i] * sin[i] + q[2i+1] * cos[i]
-        let out_odd = chimera_add(module, &even_sin, &odd_cos);
-
-        out.push(out_even);
-        out.push(out_odd);
-    }
+                vec![out_even, out_odd]
+            })
+            .collect()
+    };
 
     out
 }
@@ -879,27 +882,30 @@ where
         k: attn_weight.k(),
         rank: attn_weight.rank(),
     };
-    let mut context = Vec::with_capacity(d_head);
-    for j in 0..d_head {
-        let v_proj = if v_h[j].base2k() == attn_weight.base2k() && v_h[j].k() == attn_weight.k() {
-            // Layouts match — clone V[j]
-            use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
-            let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(&v_h[j]);
-            {
-                let src_ref = v_h[j].to_ref();
-                let src: &[u8] = src_ref.data().data;
-                let mut dst_mut = cloned.to_mut();
-                let dst: &mut [u8] = dst_mut.data_mut().data;
-                let len = src.len().min(dst.len());
-                dst[..len].copy_from_slice(&src[..len]);
-            }
-            cloned
-        } else {
-            chimera_align_layout(module, &v_h[j], &attn_layout)
-        };
-        let ctx_j = chimera_ct_mul(module, eval_key, attn_weight, &v_proj);
-        context.push(ctx_j);
-    }
+    let context: Vec<GLWE<Vec<u8>>> = {
+        use rayon::prelude::*;
+        (0..d_head)
+            .into_par_iter()
+            .map(|j| {
+                let v_proj = if v_h[j].base2k() == attn_weight.base2k() && v_h[j].k() == attn_weight.k() {
+                    use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+                    let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(&v_h[j]);
+                    {
+                        let src_ref = v_h[j].to_ref();
+                        let src: &[u8] = src_ref.data().data;
+                        let mut dst_mut = cloned.to_mut();
+                        let dst: &mut [u8] = dst_mut.data_mut().data;
+                        let len = src.len().min(dst.len());
+                        dst[..len].copy_from_slice(&src[..len]);
+                    }
+                    cloned
+                } else {
+                    chimera_align_layout(module, &v_h[j], &attn_layout)
+                };
+                chimera_ct_mul(module, eval_key, attn_weight, &v_proj)
+            })
+            .collect()
+    };
 
     context
 }
@@ -1026,25 +1032,28 @@ where
     // RoPE is applied per-head: each head's d_head slice is rotated in pairs.
     let t_rope = std::time::Instant::now();
     let (q_all, k_all) = if let Some(rope) = &config.rope {
-        let mut q_rope = Vec::with_capacity(q_all.len());
-        let mut k_rope = Vec::with_capacity(k_all.len());
+        use rayon::prelude::*;
 
-        // Apply RoPE to each Q head
-        for h in 0..n_heads {
-            let q_start = h * d_head;
-            let q_end = q_start + d_head;
-            let q_h_rotated = chimera_apply_rope_vec(module, &q_all[q_start..q_end], rope);
-            q_rope.extend(q_h_rotated);
-        }
+        // Apply RoPE to each Q head (parallelized across heads)
+        let q_rope: Vec<GLWE<Vec<u8>>> = (0..n_heads)
+            .into_par_iter()
+            .flat_map(|h| {
+                let q_start = h * d_head;
+                let q_end = q_start + d_head;
+                chimera_apply_rope_vec(module, &q_all[q_start..q_end], rope)
+            })
+            .collect();
 
-        // Apply RoPE to each K head (d_kv / d_head heads)
+        // Apply RoPE to each K head (parallelized across KV heads)
         let n_kv_heads = d_kv / d_head;
-        for kv_h in 0..n_kv_heads {
-            let kv_start = kv_h * d_head;
-            let kv_end = kv_start + d_head;
-            let k_h_rotated = chimera_apply_rope_vec(module, &k_all[kv_start..kv_end], rope);
-            k_rope.extend(k_h_rotated);
-        }
+        let k_rope: Vec<GLWE<Vec<u8>>> = (0..n_kv_heads)
+            .into_par_iter()
+            .flat_map(|kv_h| {
+                let kv_start = kv_h * d_head;
+                let kv_end = kv_start + d_head;
+                chimera_apply_rope_vec(module, &k_all[kv_start..kv_end], rope)
+            })
+            .collect();
 
         (q_rope, k_rope)
     } else {
@@ -1052,24 +1061,34 @@ where
     };
     let rope_ms = t_rope.elapsed().as_millis();
 
-    // Step 2: Per-head attention with GQA mapping
+    // Step 2: Per-head attention with GQA mapping (parallelized across heads)
     let t_heads = std::time::Instant::now();
-    let mut all_head_contexts: Vec<GLWE<Vec<u8>>> = Vec::with_capacity(d_model);
+    let all_head_contexts: Vec<GLWE<Vec<u8>>> = if n_heads > 1 {
+        use rayon::prelude::*;
+        let head_results: Vec<Vec<GLWE<Vec<u8>>>> = (0..n_heads)
+            .into_par_iter()
+            .map(|h| {
+                let q_start = h * d_head;
+                let q_end = q_start + d_head;
+                let q_h = &q_all[q_start..q_end];
 
-    for h in 0..n_heads {
-        let q_start = h * d_head;
-        let q_end = q_start + d_head;
-        let q_h = &q_all[q_start..q_end];
+                let kv_h = h / gqa_group;
+                let kv_start = kv_h * d_head;
+                let kv_end = kv_start + d_head;
+                let k_h = &k_all[kv_start..kv_end];
+                let v_h = &v_all[kv_start..kv_end];
 
-        let kv_h = h / gqa_group;
-        let kv_start = kv_h * d_head;
-        let kv_end = kv_start + d_head;
-        let k_h = &k_all[kv_start..kv_end];
-        let v_h = &v_all[kv_start..kv_end];
-
-        let head_context = chimera_single_head_attention(module, eval_key, q_h, k_h, v_h, &config.softmax_approx);
-        all_head_contexts.extend(head_context);
-    }
+                chimera_single_head_attention(module, eval_key, q_h, k_h, v_h, &config.softmax_approx)
+            })
+            .collect();
+        head_results.into_iter().flatten().collect()
+    } else {
+        // Single head — no parallelism overhead
+        let q_h = &q_all[..d_head];
+        let k_h = &k_all[..d_head];
+        let v_h = &v_all[..d_head];
+        chimera_single_head_attention(module, eval_key, q_h, k_h, v_h, &config.softmax_approx)
+    };
     let heads_ms = t_heads.elapsed().as_millis();
 
     // Step 3: Output projection — out_i = Σ_j W_O[i][j] * context[j]

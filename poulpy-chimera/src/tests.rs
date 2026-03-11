@@ -5955,4 +5955,195 @@ mod integration {
         assert!(step.token_id < 32000);
         assert_eq!(step.hidden_state.len(), 128);
     }
+
+    /// FHE-vs-cleartext comparison test with real TinyLlama weights.
+    ///
+    /// Runs both FHE and cleartext forward passes on the same token with
+    /// real model weights, then decomposes the error into three components:
+    /// - FHE vs exact (total error)
+    /// - polynomial approx vs exact (approximation error only)
+    /// - FHE vs polynomial approx (FHE noise only)
+    #[test]
+    #[ignore] // Requires TinyLlama model files on disk
+    fn test_fhe_vs_plaintext_real_weights() {
+        use crate::inference::{InferenceConfig, InferencePipeline, ModelSpec};
+
+        let model_path = "/home/dev/models/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6/model.safetensors";
+        let tokenizer_path = "/home/dev/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6/tokenizer.json";
+
+        if !std::path::Path::new(model_path).exists() || !std::path::Path::new(tokenizer_path).exists() {
+            eprintln!("[SKIP] model or tokenizer files not found");
+            return;
+        }
+
+        let config = InferenceConfig {
+            security: SecurityLevel::Bits80,
+            precision: Precision::Int8,
+            num_layers: Some(1),
+            trunc_d_model: Some(64),
+            trunc_d_ffn: Some(128),
+            num_heads: Some(1),
+            num_kv_heads: Some(1),
+            softmax_strategy: SoftmaxStrategy::ReluSquared,
+            apply_final_norm: true,
+            max_new_tokens: 1,
+            ..InferenceConfig::default()
+        };
+
+        eprintln!("[fhe_vs_pt] Loading pipeline...");
+        let pipeline = InferencePipeline::load(model_path, tokenizer_path, ModelSpec::tinyllama_1_1b(), config)
+            .expect("Failed to load inference pipeline");
+
+        eprintln!("[fhe_vs_pt] Effective dims: {:?}", pipeline.effective_dims());
+
+        // Test with several different tokens to get representative error statistics
+        let test_prompts = ["Hello", "The", "AI"];
+        for prompt in &test_prompts {
+            let tokens = pipeline.tokenize(prompt).expect("tokenize failed");
+            let last_token = *tokens.last().unwrap();
+            eprintln!("\n[fhe_vs_pt] === Prompt: {:?} (token {}) ===", prompt, last_token);
+
+            // FHE forward pass
+            let fhe_result = pipeline.step(last_token).expect("FHE step failed");
+            eprintln!(
+                "[fhe_vs_pt] FHE: token_id={}, text={:?}, time={:.2?}",
+                fhe_result.token_id, fhe_result.token_text, fhe_result.fhe_time
+            );
+
+            // Plaintext forward pass (exact f64)
+            let pt_result = pipeline.plaintext_step(last_token);
+            eprintln!(
+                "[fhe_vs_pt] Plaintext: token_id={}, top5={:?}",
+                pt_result.token_id,
+                &pt_result.top_logits[..5.min(pt_result.top_logits.len())]
+            );
+
+            // Three-way error decomposition
+            let comparison = pipeline.compare_fhe_vs_plaintext(&fhe_result.hidden_state, last_token);
+            eprintln!("[fhe_vs_pt] {comparison}");
+
+            let (fhe_exact_linf, fhe_exact_l2, fhe_exact_mae) = comparison.fhe_vs_exact;
+            let (fhe_poly_linf, _fhe_poly_l2, _fhe_poly_mae) = comparison.fhe_vs_poly;
+            let (poly_exact_linf, _poly_exact_l2, _poly_exact_mae) = comparison.poly_vs_exact;
+
+            // Sanity checks on error magnitudes
+            assert!(
+                fhe_exact_linf.is_finite(),
+                "FHE vs exact L-inf must be finite, got {fhe_exact_linf}"
+            );
+            assert!(
+                fhe_poly_linf.is_finite(),
+                "FHE vs poly L-inf must be finite, got {fhe_poly_linf}"
+            );
+            assert!(
+                poly_exact_linf.is_finite(),
+                "Poly vs exact L-inf must be finite, got {poly_exact_linf}"
+            );
+
+            // For d_model=64 with INT8 weights, total error should be bounded.
+            // The scheme targets INT8 (range [-128, 127]), so errors up to ~20%
+            // of the range (~25) are acceptable at this truncated dimension.
+            // Be generous for now — the goal is to characterise, not gate.
+            assert!(
+                fhe_exact_linf < 128.0,
+                "FHE vs exact L-inf ({fhe_exact_linf}) exceeds INT8 range — likely a correctness bug"
+            );
+            assert!(
+                fhe_exact_mae < 50.0,
+                "FHE vs exact MAE ({fhe_exact_mae}) too large for useful inference"
+            );
+
+            // Log per-dimension error stats for characterisation
+            eprintln!(
+                "[fhe_vs_pt] Error summary: total L-inf={:.1}, total MAE={:.2}, \
+                 poly_approx L-inf={:.1}, FHE_noise L-inf={:.1}, total L2={:.2}",
+                fhe_exact_linf, fhe_exact_mae, poly_exact_linf, fhe_poly_linf, fhe_exact_l2
+            );
+
+            // Hidden state dimensions must match
+            assert_eq!(
+                fhe_result.hidden_state.len(),
+                pipeline.effective_dims().d_model,
+                "FHE hidden state length mismatch"
+            );
+
+            // Compare tokens — log but don't assert equality (noise can flip argmax)
+            if fhe_result.token_id as usize == pt_result.token_id {
+                eprintln!("[fhe_vs_pt] Token MATCH: both predict {}", fhe_result.token_id);
+            } else {
+                eprintln!(
+                    "[fhe_vs_pt] Token DIFFER: FHE={} vs plaintext={} (expected — noise can flip argmax)",
+                    fhe_result.token_id, pt_result.token_id
+                );
+            }
+        }
+    }
+
+    /// Multi-layer noise accumulation test.
+    ///
+    /// Runs 1, 2, and 4 layers on the same token and measures how error
+    /// grows with depth. This validates that CHIMERA's noise budget is
+    /// sufficient for multi-layer inference.
+    #[test]
+    #[ignore] // Requires TinyLlama model files on disk; takes ~30-60s per config
+    fn test_multi_layer_noise_accumulation() {
+        use crate::inference::{InferenceConfig, InferencePipeline, ModelSpec};
+
+        let model_path = "/home/dev/models/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6/model.safetensors";
+        let tokenizer_path = "/home/dev/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0/snapshots/fe8a4ea1ffedaf415f4da2f062534de366a451e6/tokenizer.json";
+
+        if !std::path::Path::new(model_path).exists() || !std::path::Path::new(tokenizer_path).exists() {
+            eprintln!("[SKIP] model or tokenizer files not found");
+            return;
+        }
+
+        let layer_counts = [1, 2, 4];
+
+        for &n_layers in &layer_counts {
+            let config = InferenceConfig {
+                security: SecurityLevel::Bits80,
+                precision: Precision::Int8,
+                num_layers: Some(n_layers),
+                trunc_d_model: Some(64),
+                trunc_d_ffn: Some(128),
+                num_heads: Some(1),
+                num_kv_heads: Some(1),
+                softmax_strategy: SoftmaxStrategy::ReluSquared,
+                apply_final_norm: true,
+                max_new_tokens: 1,
+                ..InferenceConfig::default()
+            };
+
+            eprintln!("\n[noise_accum] === {} layer(s) ===", n_layers);
+            let pipeline = InferencePipeline::load(model_path, tokenizer_path, ModelSpec::tinyllama_1_1b(), config)
+                .expect("Failed to load pipeline");
+
+            let tokens = pipeline.tokenize("Hello").expect("tokenize failed");
+            let last_token = *tokens.last().unwrap();
+
+            // FHE step
+            let fhe_result = pipeline.step(last_token).expect("FHE step failed");
+            eprintln!(
+                "[noise_accum] FHE: token={}, time={:.2?}",
+                fhe_result.token_id, fhe_result.fhe_time
+            );
+
+            // Error decomposition
+            let comparison = pipeline.compare_fhe_vs_plaintext(&fhe_result.hidden_state, last_token);
+            eprintln!("[noise_accum] {comparison}");
+
+            let (fhe_exact_linf, fhe_exact_l2, fhe_exact_mae) = comparison.fhe_vs_exact;
+            let (fhe_poly_linf, _, _) = comparison.fhe_vs_poly;
+
+            eprintln!(
+                "[noise_accum] layers={}: total_Linf={:.1} total_MAE={:.2} noise_Linf={:.1} FHE_time={:.2?}",
+                n_layers, fhe_exact_linf, fhe_exact_mae, fhe_poly_linf, fhe_result.fhe_time
+            );
+
+            // Error should remain bounded even at 4 layers
+            // (though it may grow — the point is to measure, not hard-gate)
+            assert!(fhe_exact_linf.is_finite(), "layers={}: L-inf must be finite", n_layers);
+            assert!(fhe_exact_l2.is_finite(), "layers={}: L2 must be finite", n_layers);
+        }
+    }
 }

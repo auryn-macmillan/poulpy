@@ -269,9 +269,9 @@ Agents should treat the following as active research questions and document find
 
 ## Implementation Status
 
-> Last updated: 2026-03-11
+> Last updated: 2026-03-13
 
-### Crate: `poulpy-chimera` (18 source files, 210 tests passing)
+### Crate: `poulpy-chimera` (18 source files, 217 tests passing)
 
 The CHIMERA scheme is implemented as a new crate in the Poulpy workspace, reusing
 `poulpy-hal` (backend traits, FFT) and `poulpy-core` (RLWE encryption, keyswitching,
@@ -333,7 +333,12 @@ tensor products, automorphisms).
 7. RoPE wired into multi-head attention vec path (tested at d_model=4 with n_heads=2)
 8. Full forward pass with final RMSNorm (`chimera_forward_pass_vec_full`) — production entry point
 9. Full forward pass with bootstrapping support (per-layer noise check, all-ct bootstrap)
-10. **Full text-in → text-out inference pipeline** (`inference.rs`): tokenize → embed → encrypt → FHE transformer → decrypt → LM head → decode. Tested with TinyLlama 1.1B (truncated d_model=64, 1 layer, 80-bit security). Single token generation: ~2.74s (release, parallelized). Multi-token generation (3 tokens): ~8.2s.
+10. **Full text-in → text-out inference pipeline** (`inference.rs`): tokenize → embed → encrypt → refreshed FHE transformer → decrypt → optional client-side final RMSNorm → LM head → decode. Validated with TinyLlama 1.1B at multiple truncated dimensions:
+    - d_model=64, 1 layer, 80-bit: 5.50s FHE, L-inf=7.0, MAE=2.09
+    - d_model=128, 1 layer, 80-bit: 18.69s FHE, L-inf=7.0, MAE=2.19 in release E2E; best refreshed decode comparison reaches L-inf=2.0, MAE=1.96
+    - d_model=256, 1 layer, 128-bit: 291.95s FHE, L-inf=7.0, MAE=2.293
+    - d_model=256, 2 layers, 128-bit: 622.90s FHE, L-inf=7.0, MAE=2.367
+    - Multi-token generation (3 tokens) still works on the smaller truncated setup.
 11. **Rayon parallelization** of all hot paths (QKV projection, output projection, SwiGLU FFN, RMSNorm) — 3.2x speedup over sequential on 4 cores
 12. **Cleartext reference inference** (`plaintext_forward.rs`) for FHE-vs-plaintext comparison with 25 tests
 
@@ -410,37 +415,36 @@ has been validated end-to-end with real TinyLlama 1.1B weights.
    - Also parallelized: per-head attention loop, context computation, RoPE pairs
    - Fused multiply-accumulate in `chimera_dot_product` (buffer reuse, eliminates
      2*(d-1) GLWE allocations per dot product call)
-   - Results at d_model=64, 80-bit security, 4 cores:
-     - Single token FHE forward pass: 8.77s → 2.74s (3.2x speedup)
-     - QKV projection: 3.5x, output projection: 3.7x
-     - SwiGLU gate+up: 3.7x, down projection: 3.3x
-     - RMSNorm: 2.5-3.0x
-   - d_model=128 (2 heads, d_ffn=256): 9.64s per layer (parallelized)
-   - Profiling instrumentation added to transformer block, attention, and SwiGLU FFN
+    - Results at d_model=64, 80-bit security, 4 cores (older non-refreshed baseline):
+      - Single token FHE forward pass: 8.77s → 2.74s (3.2x speedup)
+      - QKV projection: 3.5x, output projection: 3.7x
+      - SwiGLU gate+up: 3.7x, down projection: 3.3x
+      - RMSNorm: 2.5-3.0x
+    - Current refreshed release measurements: d_model=128 is 18.69s for 1 layer at 80-bit; d_model=256 is 291.95s for 1 layer at 128-bit
+    - Profiling instrumentation added to transformer block, attention, and SwiGLU FFN
 
 ### P4 — FHE-vs-Cleartext Validation — COMPLETE ✅
 
 10. ~~**FHE-vs-cleartext comparison with real TinyLlama weights**~~ ✅ Done
     - Three-way error decomposition: total (FHE vs exact), poly approx, FHE noise
-    - Results at d_model=64, 1 layer, 80-bit security, 3 prompts:
-      - Polynomial approximation error: negligible (L-inf ~0.1-0.2)
-      - FHE noise dominates: L-inf ~63, MAE ~34 (INT8 range is 128)
-      - Token predictions differ from cleartext — expected at this noise level
-    - Key finding: polynomial approximation contributes <0.3% of total error
+    - Older encrypted-final-norm path at d_model=64 showed large error (L-inf ~63, MAE ~34)
+    - Current refreshed/client-side-final-RMSNorm path is materially better:
+      - d_model=64, 1 layer, 80-bit: L-inf=7.0, MAE=2.09
+      - d_model=128, 1 layer, 80-bit: L-inf=7.0, MAE=2.19 in release E2E; best decode calibration gives L-inf=2.0, MAE=1.96
+      - d_model=256, 1 layer, 128-bit: L-inf=7.0, MAE=2.293
+    - Key finding: once client-side final RMSNorm is used, the refreshed transformer body stays stable and polynomial approximation error is negligible in the measured path
 
 11. ~~**Multi-layer noise accumulation**~~ ✅ Done
-    - Tested 1, 2, and 4 layers with real TinyLlama weights:
-      - 1 layer: L-inf=63, MAE=34, time=2.53s
-      - 2 layers: L-inf=31, MAE=18, time=4.98s
-      - 4 layers: L-inf=32, MAE=15, time=9.89s
-    - **Error does NOT grow with depth** — stays bounded or decreases
-    - Residual connections + RMSNorm stabilize noise across layers
-    - Linear latency scaling: ~2.5s per layer
-    - Bootstrapping not needed for at least 4 layers at 80-bit security
+    - Refreshed production-path measurements:
+      - d_model=64, 80-bit: 1 layer `5.50s / L-inf=7.0 / MAE=2.09`; 2 layers `11.09s / L-inf=7.0 / MAE=2.19`; 4 layers `21.73s / L-inf=6.0 / MAE=2.12`
+      - d_model=256, 128-bit: 1 layer `291.95s / L-inf=7.0 / MAE=2.293`; 2 layers `622.90s / L-inf=7.0 / MAE=2.367`
+    - **Error does NOT grow materially with depth** on the refreshed path
+    - Residual connections + RMSNorm + refresh boundaries stabilize noise across layers
+    - Latency is approximately linear in layer count on the measured CPU backend
+    - Bootstrapping was not needed for the measured 4-layer d64 run or 2-layer d256/128-bit run
 
 ### Remaining Optimization Opportunities
 
-- Scale to d_model=256 and profile (~40s/layer estimated)
-- Investigate noise reduction: the L-inf ~63 at d_model=64 suggests encoding
-  or weight scaling could be tuned to reduce FHE noise further
+- Scale beyond d_model=256 and profile multi-layer refreshed runs at 128-bit
+- Investigate whether refreshed decode precision can be fixed automatically rather than selected by sweep diagnostics
 - Multi-token KV cache (currently re-processes single token per step)

@@ -448,24 +448,22 @@ fn load_norm_weights(
     let dtype = view.dtype();
     let data = view.data();
 
-    if dtype == Dtype::I8 {
-        let values: Vec<i64> = data.iter().map(|&b| (b as i8) as i64).collect();
-        return Ok((
-            values,
-            QuantInfo {
-                scale: 1.0,
-                abs_max: 127.0,
-            },
-        ));
-    }
-
     let float_values = tensor_to_f64(data, dtype).map_err(|e| ModelLoadError::UnsupportedDtype {
         tensor_name: name.to_string(),
         dtype: e,
     })?;
 
-    let (quantized, quant) = quantize_to_int8(&float_values);
-    Ok((quantized, quant))
+    let fixed_scale = (1u64 << crate::activations::COEFF_SCALE_BITS) as f64;
+    let fixed_point: Vec<i64> = float_values.iter().map(|&v| (v * fixed_scale).round() as i64).collect();
+    let abs_max = float_values.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+
+    Ok((
+        fixed_point,
+        QuantInfo {
+            scale: 1.0 / fixed_scale,
+            abs_max,
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,17 +1326,22 @@ mod tests {
         serialize(&tensors, &None).unwrap()
     }
 
-    /// Creates a safetensors buffer with a 1D INT8 norm tensor.
-    /// Shape [4], values [10, -5, 127, -128] as i8.
+    /// Creates a safetensors buffer with a 1D FP16 norm tensor.
+    /// Shape [4], values [1.0, -0.5, 0.25, 2.0].
     fn make_test_final_norm() -> Vec<u8> {
         use safetensors::tensor::serialize;
         use std::collections::HashMap;
 
         let mut tensors = HashMap::new();
-        let data: Vec<u8> = vec![10u8, (-5i8) as u8, 127u8, (-128i8) as u8];
+        let values = [1.0_f32, -0.5, 0.25, 2.0];
+        let mut data = Vec::new();
+        for &v in &values {
+            let h = half::f16::from_f32(v);
+            data.extend_from_slice(&h.to_le_bytes());
+        }
         tensors.insert(
             "model.norm.weight".to_string(),
-            safetensors::tensor::TensorView::new(Dtype::I8, vec![4], &data).unwrap(),
+            safetensors::tensor::TensorView::new(Dtype::F16, vec![4], &data).unwrap(),
         );
         serialize(&tensors, &None).unwrap()
     }
@@ -1462,12 +1465,11 @@ mod tests {
         let (weights, quant) = load_final_norm(&tensors, "model.norm.weight", 4).unwrap();
 
         assert_eq!(weights.len(), 4);
-        assert_eq!(weights[0], 10);
-        assert_eq!(weights[1], -5);
-        assert_eq!(weights[2], 127);
-        assert_eq!(weights[3], -128);
-        // INT8 path: scale=1.0, abs_max=127.0
-        assert_eq!(quant.scale, 1.0);
-        assert_eq!(quant.abs_max, 127.0);
+        assert_eq!(weights[0], 256);
+        assert_eq!(weights[1], -128);
+        assert_eq!(weights[2], 64);
+        assert_eq!(weights[3], 512);
+        assert!((quant.scale - (1.0 / 256.0)).abs() < 1e-12);
+        assert!((quant.abs_max - 2.0).abs() < 1e-12);
     }
 }

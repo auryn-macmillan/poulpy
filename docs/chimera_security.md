@@ -158,12 +158,32 @@ scale=26); only the polynomial degree N differs.
    CHIMERA-80 supports only 12 levels (1 layer). For models with >4 layers,
    bootstrapping is required regardless of security level.
 
-5. **Inference-level validation confirms primitive-level findings**: Measured
-   end-to-end inference with real TinyLlama weights at d_model=64 shows:
-   - 128-bit L∞ = 63.2 (1 layer), 31.3 (4 layers) — identical to 80-bit
-   - Per-layer latency: 12.1s at 128-bit vs 2.5s at 80-bit (4.8x ratio)
-   - Error does NOT grow with depth at either security level
-   - Polynomial approximation contributes <0.5% of total error at all levels
+5. **Inference-level validation confirms primitive-level findings**:
+    - On the older fully encrypted path, d_model=64 at 128-bit shows the same
+      high-noise profile as 80-bit and error does not grow with depth.
+    - On the refreshed production path, d_model=256 at 128-bit with client-side
+      final RMSNorm stays bounded across 1-2 layers:
+      - 1 layer: FHE time 291.95s, L∞ = 7.0, MAE = 2.293
+      - 2 layers: FHE time 622.90s, L∞ = 7.0, MAE = 2.367
+    - This supports the security/performance claim that changing N primarily
+      changes cost, while correctness is dominated by encoding/path design rather
+      than the nominal security level.
+
+For the refreshed production path used for real single-token inference, the final
+model RMSNorm is intentionally applied as client-side final RMSNorm after decryption. This
+does not change the confidentiality of the encrypted transformer body: the server
+still only sees encrypted activations, and the user was already required to decrypt
+the final hidden state locally before applying the LM head.
+
+Security consequence of this design choice:
+
+- The encrypted computation boundary ends at the final transformer residual output.
+- The final RMSNorm and LM head are trusted local post-processing on the client.
+- No extra oracle surface is introduced, because no intermediate decrypted value is
+  returned to the provider.
+- The refreshed d_model=256 validation at 128-bit uses this boundary and remains
+  stable over multiple layers, so the boundary choice is not just theoretical but
+  operationally validated on the larger truncated setting.
 
 ## 3. Approximate FHE: Security Implications
 

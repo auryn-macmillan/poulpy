@@ -25,10 +25,131 @@ use poulpy_hal::{
 };
 
 use crate::activations::{
-    activation_decode_precision, apply_poly_activation, chimera_ct_mul, chimera_ct_mul_with_res_offset, PolyApprox,
+    activation_decode_precision, apply_poly_activation_with_encoding_scale, chimera_ct_mul, chimera_ct_mul_with_res_offset,
+    PolyApprox,
 };
-use crate::arithmetic::{chimera_add, chimera_align_layout, chimera_mul_const, chimera_slot_sum};
+use crate::arithmetic::{chimera_add, chimera_align_layout, chimera_mul_const, chimera_mul_const_scaled, chimera_slot_sum};
 use crate::encrypt::ChimeraEvalKey;
+
+const GAMMA_SCALE_BITS: usize = crate::activations::COEFF_SCALE_BITS;
+const MEAN_SCALE_BITS: usize = crate::activations::COEFF_SCALE_BITS;
+const RMS_NARROW_INPUT_SCALE: usize = 10;
+const RMS_MEAN_TO_NARROW_COEFF: i64 = 1;
+const RMS_NARROW_TO_REAL_COEFF: i64 = 16;
+pub const RMS_OUTPUT_SCALE_SHIFT_BITS: usize = 10;
+
+#[derive(Clone, Debug)]
+pub struct RmsNormDebugStages {
+    pub sum_sq: GLWE<Vec<u8>>,
+    pub mean_sq: GLWE<Vec<u8>>,
+    pub mean_sq_for_poly: GLWE<Vec<u8>>,
+    pub inv_rms_pre: GLWE<Vec<u8>>,
+    pub inv_rms: GLWE<Vec<u8>>,
+}
+
+fn use_direct_midrange_inv_sqrt(config: &LayerNormConfig) -> bool {
+    config.inv_sqrt_approx.range.1 > 2.0
+}
+
+pub fn chimera_rms_norm_vec_debug_stages<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    config: &LayerNormConfig,
+) -> RmsNormDebugStages
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    assert!(
+        config.use_rms_norm,
+        "chimera_rms_norm_vec_debug_stages: RMSNorm config required"
+    );
+    assert!(
+        !x_cts.is_empty(),
+        "chimera_rms_norm_vec_debug_stages: input vector must not be empty"
+    );
+
+    let d = x_cts.len();
+    let sq: Vec<GLWE<Vec<u8>>> = x_cts.iter().map(|xi| chimera_ct_mul(module, eval_key, xi, xi)).collect();
+
+    let mut sum_sq = {
+        use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+        let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(&sq[0]);
+        let src_ref = sq[0].to_ref();
+        let src: &[u8] = src_ref.data().data;
+        let mut dst_mut = cloned.to_mut();
+        let dst: &mut [u8] = dst_mut.data_mut().data;
+        let len = src.len().min(dst.len());
+        dst[..len].copy_from_slice(&src[..len]);
+        cloned
+    };
+    for ct in sq.iter().skip(1) {
+        sum_sq = chimera_add(module, &sum_sq, ct);
+    }
+
+    let mean_sq = scale_sum_to_mean(module, &sum_sq, d);
+    let (mean_sq_for_poly, inv_rms_pre, inv_rms) = if use_direct_midrange_inv_sqrt(config) {
+        let mean_sq_for_poly = mean_sq.clone();
+        let inv_rms_pre = apply_poly_activation_with_encoding_scale(
+            module,
+            eval_key,
+            &mean_sq_for_poly,
+            &config.inv_sqrt_approx,
+            RMS_NARROW_INPUT_SCALE,
+        );
+        let inv_rms = inv_rms_pre.clone();
+        (mean_sq_for_poly, inv_rms_pre, inv_rms)
+    } else {
+        let mean_sq_for_poly = chimera_mul_const_scaled(module, &mean_sq, &[RMS_MEAN_TO_NARROW_COEFF], GAMMA_SCALE_BITS);
+        let inv_rms_pre = apply_poly_activation_with_encoding_scale(
+            module,
+            eval_key,
+            &mean_sq_for_poly,
+            &config.inv_sqrt_approx,
+            RMS_NARROW_INPUT_SCALE,
+        );
+        let inv_rms = chimera_mul_const_scaled(module, &inv_rms_pre, &[RMS_NARROW_TO_REAL_COEFF], GAMMA_SCALE_BITS);
+        (mean_sq_for_poly, inv_rms_pre, inv_rms)
+    };
+
+    RmsNormDebugStages {
+        sum_sq,
+        mean_sq,
+        mean_sq_for_poly,
+        inv_rms_pre,
+        inv_rms,
+    }
+}
+
+fn mean_scale_params(base2k: usize, norm_size: usize) -> (i64, usize) {
+    assert!(norm_size > 0, "mean_scale_params: norm_size must be > 0");
+    assert!(base2k > 0, "mean_scale_params: base2k must be > 0");
+
+    let max_shift = base2k - 1;
+
+    if norm_size.is_power_of_two() {
+        let exact_shift = norm_size.trailing_zeros() as usize;
+        if exact_shift <= max_shift {
+            return (1, exact_shift);
+        }
+    }
+
+    let numerator = 1u128 << max_shift;
+    let coeff = ((numerator + (norm_size as u128 / 2)) / norm_size as u128).max(1);
+    (coeff as i64, max_shift)
+}
+
+fn scale_sum_to_mean<BE: Backend>(module: &Module<BE>, sum_sq: &GLWE<Vec<u8>>, norm_size: usize) -> GLWE<Vec<u8>>
+where
+    Module<BE>: GLWEMulConst<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchAvailable,
+{
+    let coeff = (((1u64 << MEAN_SCALE_BITS) as f64 / norm_size as f64).round() as i64).max(1);
+    chimera_mul_const(module, sum_sq, &[coeff])
+}
 
 /// Configuration for LayerNorm/RMSNorm evaluation under FHE.
 #[derive(Clone, Debug)]
@@ -53,11 +174,23 @@ impl LayerNormConfig {
     /// RMSNorm is preferred because it avoids the mean computation,
     /// saving log₂(norm_size) rotations and one multiplication depth level.
     pub fn rms_norm(norm_size: usize) -> Self {
-        use crate::activations::inv_sqrt_poly_approx;
+        use crate::activations::inv_sqrt_poly_approx_narrow;
         LayerNormConfig {
             norm_size,
             use_rms_norm: true,
-            inv_sqrt_approx: inv_sqrt_poly_approx(),
+            inv_sqrt_approx: inv_sqrt_poly_approx_narrow(),
+            epsilon: 1e-5,
+            gamma: None,
+            beta: None,
+        }
+    }
+
+    pub fn rms_norm_midrange(norm_size: usize) -> Self {
+        use crate::activations::inv_sqrt_poly_approx_midrange;
+        LayerNormConfig {
+            norm_size,
+            use_rms_norm: true,
+            inv_sqrt_approx: inv_sqrt_poly_approx_midrange(),
             epsilon: 1e-5,
             gamma: None,
             beta: None,
@@ -275,12 +408,27 @@ where
         sum_sq = chimera_add(module, &sum_sq, &sq[i]);
     }
 
-    // Step 3: Mean — multiply by 1/d_model
-    let inv_n_scaled = ((1i64 << crate::activations::COEFF_SCALE_BITS) as f64 / d as f64).round() as i64;
-    let mean_sq = chimera_mul_const(module, &sum_sq, &[inv_n_scaled]);
+    // Step 3: Mean — multiply by 1/d_model while preserving the original
+    // torus scale. This keeps the inverse-sqrt polynomial input near the true
+    // mean(x^2) range instead of inflating it by 2^COEFF_SCALE_BITS.
+    let mean_sq = scale_sum_to_mean(module, &sum_sq, d);
 
-    // Step 4: Inverse square root — evaluate polynomial approx of 1/√x
-    let inv_rms = apply_poly_activation(module, eval_key, &mean_sq, &config.inv_sqrt_approx);
+    // Step 4: Inverse square root — narrow configs remap mean(x^2) into a
+    // smaller range first; midrange configs evaluate directly on mean(x^2)
+    // at the effective decode scale used by the real vec pipeline.
+    let inv_rms = if use_direct_midrange_inv_sqrt(config) {
+        apply_poly_activation_with_encoding_scale(module, eval_key, &mean_sq, &config.inv_sqrt_approx, RMS_NARROW_INPUT_SCALE)
+    } else {
+        let mean_sq_for_poly = chimera_mul_const_scaled(module, &mean_sq, &[RMS_MEAN_TO_NARROW_COEFF], GAMMA_SCALE_BITS);
+        let inv_rms_pre = apply_poly_activation_with_encoding_scale(
+            module,
+            eval_key,
+            &mean_sq_for_poly,
+            &config.inv_sqrt_approx,
+            RMS_NARROW_INPUT_SCALE,
+        );
+        chimera_mul_const_scaled(module, &inv_rms_pre, &[RMS_NARROW_TO_REAL_COEFF], GAMMA_SCALE_BITS)
+    };
 
     // Step 5: Scale each dimension — out_i = x_i * inv_rms (parallelized)
     // We need to project each x_i to match inv_rms's layout before ct*ct multiply.
@@ -316,7 +464,7 @@ where
                     eval_key,
                     &xi_proj,
                     &inv_rms,
-                    activation_decode_precision(eval_key.res_offset),
+                    activation_decode_precision(RMS_NARROW_INPUT_SCALE),
                 )
             })
             .collect()
@@ -326,7 +474,138 @@ where
     if let Some(gamma) = &config.gamma {
         for (i, out) in outputs.iter_mut().enumerate() {
             if i < gamma.len() {
-                *out = chimera_mul_const(module, out, &[gamma[i]]);
+                *out = chimera_mul_const_scaled(module, out, &[gamma[i]], GAMMA_SCALE_BITS);
+            }
+        }
+    }
+
+    outputs
+}
+
+pub fn chimera_rms_norm_vec_prescaled_input<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    config: &LayerNormConfig,
+    input_scale_shift_bits: usize,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    if input_scale_shift_bits == 0 {
+        return chimera_rms_norm_vec(module, eval_key, x_cts, config);
+    }
+
+    let adjusted: Vec<GLWE<Vec<u8>>> = x_cts
+        .iter()
+        .map(|ct| chimera_mul_const_scaled(module, ct, &[1], input_scale_shift_bits))
+        .collect();
+
+    chimera_rms_norm_vec(module, eval_key, &adjusted, config)
+}
+
+pub fn chimera_rms_norm_vec_with_square_res_offset<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    config: &LayerNormConfig,
+    square_res_offset: usize,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    assert!(
+        config.use_rms_norm,
+        "chimera_rms_norm_vec_with_square_res_offset: RMSNorm config required"
+    );
+    assert!(
+        !x_cts.is_empty(),
+        "chimera_rms_norm_vec_with_square_res_offset: input vector must not be empty"
+    );
+
+    let d = x_cts.len();
+    let sq: Vec<GLWE<Vec<u8>>> = {
+        use rayon::prelude::*;
+        x_cts
+            .par_iter()
+            .map(|xi| crate::activations::chimera_ct_mul_with_res_offset(module, eval_key, xi, xi, square_res_offset))
+            .collect()
+    };
+
+    let mut sum_sq = {
+        use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+        let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(&sq[0]);
+        {
+            let src_ref = sq[0].to_ref();
+            let src: &[u8] = src_ref.data().data;
+            let mut dst_mut = cloned.to_mut();
+            let dst: &mut [u8] = dst_mut.data_mut().data;
+            let len = src.len().min(dst.len());
+            dst[..len].copy_from_slice(&src[..len]);
+        }
+        cloned
+    };
+    for i in 1..d {
+        sum_sq = chimera_add(module, &sum_sq, &sq[i]);
+    }
+
+    let mean_sq = scale_sum_to_mean(module, &sum_sq, d);
+    let mean_sq_for_poly = chimera_mul_const_scaled(module, &mean_sq, &[RMS_MEAN_TO_NARROW_COEFF], GAMMA_SCALE_BITS);
+    let inv_rms_pre = apply_poly_activation_with_encoding_scale(
+        module,
+        eval_key,
+        &mean_sq_for_poly,
+        &config.inv_sqrt_approx,
+        RMS_NARROW_INPUT_SCALE,
+    );
+    let inv_rms = chimera_mul_const_scaled(module, &inv_rms_pre, &[RMS_NARROW_TO_REAL_COEFF], GAMMA_SCALE_BITS);
+
+    let inv_rms_layout = poulpy_core::layouts::GLWELayout {
+        n: inv_rms.n(),
+        base2k: inv_rms.base2k(),
+        k: inv_rms.k(),
+        rank: inv_rms.rank(),
+    };
+
+    let mut outputs: Vec<GLWE<Vec<u8>>> = {
+        use rayon::prelude::*;
+        x_cts
+            .par_iter()
+            .map(|xi| {
+                let xi_proj = if xi.base2k() == inv_rms.base2k() && xi.k() == inv_rms.k() {
+                    use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+                    let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(xi);
+                    {
+                        let src_ref = xi.to_ref();
+                        let src: &[u8] = src_ref.data().data;
+                        let mut dst_mut = cloned.to_mut();
+                        let dst: &mut [u8] = dst_mut.data_mut().data;
+                        let len = src.len().min(dst.len());
+                        dst[..len].copy_from_slice(&src[..len]);
+                    }
+                    cloned
+                } else {
+                    chimera_align_layout(module, xi, &inv_rms_layout)
+                };
+                chimera_ct_mul_with_res_offset(
+                    module,
+                    eval_key,
+                    &xi_proj,
+                    &inv_rms,
+                    activation_decode_precision(RMS_NARROW_INPUT_SCALE),
+                )
+            })
+            .collect()
+    };
+
+    if let Some(gamma) = &config.gamma {
+        for (i, out) in outputs.iter_mut().enumerate() {
+            if i < gamma.len() {
+                *out = chimera_mul_const_scaled(module, out, &[gamma[i]], GAMMA_SCALE_BITS);
             }
         }
     }
@@ -399,15 +678,27 @@ where
     // skip=0 means full trace (sum all N slots).
     let sum_sq = chimera_slot_sum(module, eval_key, &ct_sq, 0);
 
-    // Step 3: Mean — multiply by 1/N encoded as fixed-point.
-    // We use COEFF_SCALE_BITS for the scaling factor so it integrates
-    // cleanly with the subsequent polynomial evaluation.
-    let inv_n_scaled = ((1i64 << crate::activations::COEFF_SCALE_BITS) as f64 / config.norm_size as f64).round() as i64;
-    let mean_sq = chimera_mul_const(module, &sum_sq, &[inv_n_scaled]);
+    // Step 3: Mean — multiply by 1/N while preserving the original torus
+    // scale. The inverse-sqrt polynomial expects the real mean(x^2), not a
+    // value inflated by the coefficient fixed-point scale.
+    let mean_sq = scale_sum_to_mean(module, &sum_sq, config.norm_size);
 
-    // Step 4: Inverse square root — evaluate polynomial approx of 1/√x
-    // on the replicated scalar (all slots hold the same mean(x²) value).
-    let inv_rms = apply_poly_activation(module, eval_key, &mean_sq, &config.inv_sqrt_approx);
+    // Step 4: Inverse square root — narrow configs remap mean(x^2) into a
+    // smaller range first; midrange configs evaluate directly on mean(x^2)
+    // at the effective decode scale used by the real vec pipeline.
+    let inv_rms = if use_direct_midrange_inv_sqrt(config) {
+        apply_poly_activation_with_encoding_scale(module, eval_key, &mean_sq, &config.inv_sqrt_approx, RMS_NARROW_INPUT_SCALE)
+    } else {
+        let mean_sq_for_poly = chimera_mul_const_scaled(module, &mean_sq, &[RMS_MEAN_TO_NARROW_COEFF], GAMMA_SCALE_BITS);
+        let inv_rms_pre = apply_poly_activation_with_encoding_scale(
+            module,
+            eval_key,
+            &mean_sq_for_poly,
+            &config.inv_sqrt_approx,
+            RMS_NARROW_INPUT_SCALE,
+        );
+        chimera_mul_const_scaled(module, &inv_rms_pre, &[RMS_NARROW_TO_REAL_COEFF], GAMMA_SCALE_BITS)
+    };
 
     // Step 5: Normalise — ct * inv_rms (element-wise broadcast multiplication).
     // The original ct is at in_base2k; inv_rms is at a lower base2k after
@@ -439,13 +730,13 @@ where
         eval_key,
         &ct_projected,
         &inv_rms,
-        activation_decode_precision(eval_key.res_offset),
+        activation_decode_precision(RMS_NARROW_INPUT_SCALE),
     );
 
     // Optional: apply learnable scale (gamma) via plaintext multiplication.
     // Gamma is stored as fixed-point i64 values (one per slot).
     if let Some(gamma) = &config.gamma {
-        chimera_mul_const(module, &normalised, gamma)
+        chimera_mul_const_scaled(module, &normalised, gamma, GAMMA_SCALE_BITS)
     } else {
         normalised
     }
@@ -520,5 +811,19 @@ mod tests {
         let config = LayerNormConfig::rms_norm(128);
         // depth = 1 (square) + 3 (inv_sqrt degree-3) = 4
         assert_eq!(config.depth(), 4);
+    }
+
+    #[test]
+    fn test_mean_scale_params_power_of_two_is_exact_shift() {
+        let (coeff, shift) = mean_scale_params(12, 4);
+        assert_eq!(coeff, 1);
+        assert_eq!(shift, 2);
+    }
+
+    #[test]
+    fn test_mean_scale_params_non_power_of_two_is_close_reciprocal() {
+        let (coeff, shift) = mean_scale_params(12, 6);
+        let approx = coeff as f64 / (1u64 << shift) as f64;
+        assert!((approx - (1.0 / 6.0)).abs() < 0.001, "approx reciprocal = {approx}");
     }
 }

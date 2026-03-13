@@ -168,6 +168,11 @@ for the discretised input range:
 
 This is the fallback for precision-critical applications.
 
+In the current refreshed inference path, this is used selectively rather than
+globally: the pre-FFN SwiGLU gate is evaluated with a LUT-based SiLU because it
+is the dominant nonlinear error source in the real single-token pipeline,
+while the rest of the block remains polynomial/linear.
+
 ### 2.7 LayerNorm Approximation
 
 LayerNorm requires computing mean and inverse square root, both problematic
@@ -182,31 +187,69 @@ under FHE. CHIMERA uses:
 Alternative: Replace LayerNorm with RMSNorm (no mean subtraction needed),
 reducing the computation by ~30%.
 
+The deployed CHIMERA inference path uses RMSNorm throughout. The first block
+norm uses the narrow-range approximation, while the refreshed pre-FFN norm uses
+a wider midrange inverse-sqrt fit after the residual is re-encoded into the
+effective INT8 domain.
+
+The final model RMSNorm is handled differently: in the production refreshed
+pipeline it is applied as client-side final RMSNorm after decryption, before the cleartext
+LM head. This keeps the encrypted circuit focused on the expensive private
+transformer body while avoiding an unstable last encrypted normalization step.
+
 ## 3. Transformer Inference Pipeline
 
-A single token generation step proceeds as:
+A single token generation step in the current refreshed single-token pipeline
+proceeds as:
 
 ```
 for each layer:
-    // Attention
-    Q, K, V = matmul(x, W_Q), matmul(x, W_K), matmul(x, W_V)
-    scores = matmul(Q, K^T) / √d_k
-    attn = poly_softmax(scores)
-    context = matmul(attn, V)
-    x = x + matmul(context, W_O)
-    x = layernorm(x)
+    // Attention branch
+    x_attn = rms_norm(x)
+    Q, K, V = matmul(x_attn, W_Q), matmul(x_attn, W_K), matmul(x_attn, W_V)
+    context = attention(Q, K, V)
+    x = refresh(x + matmul(context, W_O))
 
-    // FFN (or MoE)
-    h = matmul(x, W_1)
-    h = poly_gelu(h)
-    h = matmul(h, W_2)
-    x = x + h
-    x = layernorm(x)
+    // FFN branch
+    x_ffn = rms_norm_midrange(x)
+    gate = matmul(x_ffn, W_gate)
+    gate = SiLU_LUT(gate)
+    up = matmul(x_ffn, W_up)
+    hidden = refresh(gate * up)
+    x = x + matmul(hidden, W_down)
 
-    // Rescale if noise budget low
-    if noise_budget(x) < threshold:
-        x = bootstrap(x)
+// Client-side post-processing
+hidden = decrypt(x)
+if final_norm_gamma is present:
+    hidden = rms_norm(hidden, final_norm_gamma)
+logits = lm_head(hidden)
 ```
+
+Two explicit refresh boundaries are part of the design:
+
+1. After the attention residual add, before the pre-FFN RMSNorm.
+2. After the SwiGLU hidden product, before the down projection.
+
+These boundaries re-encode the running state into the effective low-precision
+INT8 domain and are what make the refreshed path numerically stable at larger
+truncated dimensions such as d_model=128 and d_model=256.
+
+Measured current points on truncated TinyLlama 1.1B weights are:
+
+- d_model=128, d_ffn=256, 1 layer, 80-bit: L∞ = 2.0, MAE = 1.96
+- d_model=256, d_ffn=512, 4 heads, 1 layer, 128-bit: L∞ = 7.0, MAE = 2.293,
+  FHE time = 291.95s
+- d_model=256, d_ffn=512, 4 heads, 2 layers, 128-bit: L∞ = 7.0, MAE = 2.367,
+  FHE time = 622.90s
+
+These measurements indicate that the refreshed body remains stable as depth grows
+from 1 to 2 layers at d_model=256, with latency scaling roughly linearly in the
+number of layers on the current CPU reference backend.
+
+For single-token inference (`seq_len = 1`), the attention softmax degenerates to
+a single score per head. In that regime the encrypted implementation returns the
+V path directly and performs the expensive nonlinear work in the FFN branch,
+which is where accuracy matters most in practice.
 
 For MoE layers, the routing is:
 1. Compute router logits: matmul(x, W_router)

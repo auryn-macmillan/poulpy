@@ -194,6 +194,17 @@ pub fn silu_poly_approx() -> PolyApprox {
     }
 }
 
+/// Returns a narrower degree-2 SiLU approximation for inputs concentrated in
+/// roughly [-2, 2], as observed after refreshed pre-FFN norm in the real vec
+/// pipeline.
+pub fn silu_poly_approx_narrow() -> PolyApprox {
+    PolyApprox {
+        coeffs: vec![0.019442724636358162, 0.5, 0.196317700469638, 0.0],
+        range: (-2.0, 2.0),
+        max_error: 0.044,
+    }
+}
+
 /// Returns a degree-3 polynomial approximation of 1/√x on [1.0, 32.0].
 ///
 /// Used for RMSNorm's inverse square root computation. The input to this
@@ -219,6 +230,24 @@ pub fn inv_sqrt_poly_approx() -> PolyApprox {
     }
 }
 
+/// Returns a degree-3 polynomial approximation of 1/sqrt(x) on [64, 256].
+///
+/// This range matches the observed mean(x^2) regime for real TinyLlama
+/// embeddings and first-layer residuals in the d_model=64 truncated pipeline.
+/// Maximum absolute error is ~0.00154 with max relative error ~1.24%.
+pub fn inv_sqrt_poly_approx_wide() -> PolyApprox {
+    PolyApprox {
+        coeffs: vec![
+            0.19158786862658272,
+            -0.001393197015913495,
+            0.000005693380721344401,
+            -0.000000008721492247664818,
+        ],
+        range: (64.0, 256.0),
+        max_error: 0.00155,
+    }
+}
+
 /// Returns a degree-3 polynomial approximation of 1/√x on [0.5, 2.0].
 ///
 /// This is the original narrow-range approximation, retained for use in
@@ -231,6 +260,24 @@ pub fn inv_sqrt_poly_approx_narrow() -> PolyApprox {
         coeffs: vec![1.8810, -1.1963, 0.5240, -0.1053],
         range: (0.5, 2.0),
         max_error: 0.01,
+    }
+}
+
+/// Returns a degree-3 polynomial approximation of 1/sqrt(x) on [0.5, 8.0].
+///
+/// This range matches the observed effective decoded mean(x^2) regime for the
+/// refreshed residual entering the second RMSNorm in the real vec pipeline.
+/// All coefficients survive COEFF_SCALE_BITS=8 quantization.
+pub fn inv_sqrt_poly_approx_midrange() -> PolyApprox {
+    PolyApprox {
+        coeffs: vec![
+            1.477894319744409,
+            -0.5402021439427809,
+            0.0955870071646127,
+            -0.005793188974628922,
+        ],
+        range: (0.5, 8.0),
+        max_error: 0.184,
     }
 }
 
@@ -291,7 +338,22 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
-    apply_poly_activation_scaled(module, eval_key, ct, approx)
+    apply_poly_activation_with_encoding_scale(module, eval_key, ct, approx, eval_key.res_offset)
+}
+
+pub fn apply_poly_activation_with_encoding_scale<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    ct: &GLWE<Vec<u8>>,
+    approx: &PolyApprox,
+    encoding_scale: usize,
+) -> GLWE<Vec<u8>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    apply_poly_activation_scaled(module, eval_key, ct, approx, encoding_scale)
 }
 
 /// Internal: evaluates a polynomial activation WITHOUT removing the
@@ -304,6 +366,7 @@ fn apply_poly_activation_scaled<BE: Backend>(
     eval_key: &ChimeraEvalKey<BE>,
     ct: &GLWE<Vec<u8>>,
     approx: &PolyApprox,
+    encoding_scale: usize,
 ) -> GLWE<Vec<u8>>
 where
     Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd,
@@ -316,10 +379,6 @@ where
         "polynomial must have at least one non-zero coefficient above degree 0"
     );
     assert!(degree <= 4, "polynomials above degree 4 are not supported");
-
-    // The encoding scale is res_offset = 2 * in_base2k. This is the torus precision
-    // at which values are encoded, and must be used (not ct.k()) for add_constant_term.
-    let encoding_scale = eval_key.res_offset;
 
     // For degree 1: result = c₀ + c₁·ct (no tensor product needed)
     if degree == 1 {

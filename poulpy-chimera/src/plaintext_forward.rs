@@ -944,3 +944,32 @@ pub fn three_way_comparison(
         fhe_vs_poly: error_metrics(&fhe, &poly),
     }
 }
+
+/// Performs a three-way comparison after quantizing plaintext references into
+/// the same effective integer representation as the decrypted FHE hidden state.
+pub fn three_way_comparison_quantized(
+    fhe_hidden: &[i8],
+    embedding: &[i8],
+    block_config: &TransformerBlockConfig,
+    layer_weights: &[TransformerBlockWeights],
+    final_norm_gamma: Option<&[i64]>,
+    epsilon: f64,
+    quant_scale: f64,
+) -> ThreeWayComparison {
+    let x: Vec<f64> = embedding.iter().map(|&v| v as f64).collect();
+
+    let exact = forward_pass_with_final_norm(&x, block_config, layer_weights, final_norm_gamma, epsilon);
+    let poly = forward_pass_poly_approx(&x, block_config, layer_weights, final_norm_gamma, epsilon);
+    let fhe: Vec<f64> = fhe_hidden.iter().map(|&v| v as f64).collect();
+
+    let quantize = |vals: &[f64]| -> Vec<f64> { vals.iter().map(|&v| (v / quant_scale).round().clamp(-128.0, 127.0)).collect() };
+
+    let exact_q = quantize(&exact);
+    let poly_q = quantize(&poly);
+
+    ThreeWayComparison {
+        fhe_vs_exact: error_metrics(&fhe, &exact_q),
+        poly_vs_exact: error_metrics(&poly_q, &exact_q),
+        fhe_vs_poly: error_metrics(&fhe, &poly_q),
+    }
+}

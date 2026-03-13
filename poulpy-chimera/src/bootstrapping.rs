@@ -763,6 +763,90 @@ where
     res_glwe
 }
 
+/// Bootstraps a GLWE ciphertext through an arbitrary integer lookup table.
+///
+/// The LUT entries are interpreted in the same message domain as the existing
+/// identity bootstrap path: `bp.log_message_modulus + 1` bits on the torus.
+pub fn chimera_bootstrap_with_lut<BE: Backend>(
+    module: &Module<BE>,
+    ct: &GLWE<Vec<u8>>,
+    tracker: &mut NoiseTracker,
+    bsk_prepared: &ChimeraBootstrapKeyPrepared<BE>,
+    lut_entries: &[i64],
+) -> GLWE<Vec<u8>>
+where
+    Module<BE>: ModuleN + LWESampleExtract + LWEKeySwitch<BE> + BlindRotationExecute<CGGI, BE> + LookupTableFactory,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
+    let bp = &bsk_prepared.bootstrap_params;
+    let n_glwe: usize = module.n();
+
+    use poulpy_core::layouts::LWEInfos;
+    let ct_base2k = ct.base2k();
+    let ct_k = ct.k();
+    let lwe_big_layout = LWELayout {
+        n: Degree(n_glwe as u32),
+        k: ct_k,
+        base2k: ct_base2k,
+    };
+    let mut lwe_big = LWE::<Vec<u8>>::alloc_from_infos(&lwe_big_layout);
+    lwe_big.sample_extract(module, ct);
+
+    let lwe_small_layout = LWELayout {
+        n: Degree(bp.n_lwe as u32),
+        k: TorusPrecision(bp.k_lwe_small as u32),
+        base2k: Base2K(bp.base2k_lwe_small as u32),
+    };
+    let mut lwe_small = LWE::<Vec<u8>>::alloc_from_infos(&lwe_small_layout);
+
+    let ks_bytes = LWE::keyswitch_tmp_bytes(module, &lwe_small_layout, &lwe_big_layout, &bsk_prepared.ksk_prepared);
+    let mut ks_scratch: ScratchOwned<BE> = ScratchOwned::alloc(ks_bytes);
+    lwe_small.keyswitch(module, &lwe_big, &bsk_prepared.ksk_prepared, ks_scratch.borrow());
+
+    let message_modulus: usize = 1 << bp.log_message_modulus;
+    assert_eq!(
+        lut_entries.len(),
+        message_modulus,
+        "chimera_bootstrap_with_lut: lut length {} must equal message modulus {}",
+        lut_entries.len(),
+        message_modulus
+    );
+
+    let lut_layout = LookUpTableLayout {
+        n: Degree(n_glwe as u32),
+        extension_factor: bp.extension_factor,
+        k: TorusPrecision(bp.k_lut as u32),
+        base2k: Base2K(bp.base2k_brk as u32),
+    };
+    let mut lut = LookupTable::alloc(&lut_layout);
+    lut.set(module, lut_entries, bp.log_message_modulus + 1);
+
+    let res_glwe_layout = GLWELayout {
+        n: Degree(n_glwe as u32),
+        base2k: Base2K(bp.base2k_brk as u32),
+        k: TorusPrecision(bp.k_res as u32),
+        rank: Rank(1),
+    };
+    let mut res_glwe = GLWE::<Vec<u8>>::alloc_from_infos(&res_glwe_layout);
+
+    let br_bytes = BlindRotationKeyPrepared::execute_tmp_bytes(
+        module,
+        bp.block_size,
+        bp.extension_factor,
+        &res_glwe_layout,
+        &bsk_prepared.brk_prepared,
+    );
+    let mut br_scratch: ScratchOwned<BE> = ScratchOwned::alloc(br_bytes);
+
+    bsk_prepared
+        .brk_prepared
+        .execute(module, &mut res_glwe, &lwe_small, &lut, br_scratch.borrow());
+
+    tracker.bootstrap_reset();
+    res_glwe
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,11 +16,11 @@
 //!
 //! **Provider side (encrypted):**
 //! 5. Run N transformer layers homomorphically
-//! 6. Apply final RMSNorm
-//! 7. Return encrypted hidden state to user
+//! 6. Return encrypted hidden state to user
 //!
 //! **User side (cleartext):**
-//! 8. Decrypt hidden state → `Vec<i8>`
+//! 7. Decrypt hidden state → `Vec<i8>`
+//! 8. Apply final RMSNorm locally when configured
 //! 9. Apply LM head (cleartext matmul) → logits
 //! 10. Argmax → next token ID
 //! 11. Decode token ID → text
@@ -43,21 +43,27 @@
 use std::path::Path;
 use std::time::Instant;
 
-use poulpy_core::layouts::GLWE;
+use poulpy_core::layouts::{GLWEInfos, LWEInfos, GLWE};
 use poulpy_hal::api::ModuleNew;
 use poulpy_hal::layouts::Module;
 use tokenizers::Tokenizer;
 
-use crate::attention::{AttentionConfig, AttentionWeights, SoftmaxStrategy};
-use crate::encoding::{decode_int8, encode_int8};
+use crate::arithmetic::{chimera_add, chimera_align_layout};
+use crate::attention::{chimera_multi_head_attention_vec, AttentionConfig, AttentionWeights, SoftmaxStrategy};
+use crate::bootstrapping::{BootstrappingConfig, ChimeraBootstrapKey, ChimeraBootstrapKeyPrepared};
+use crate::encoding::encode_int8;
 use crate::encrypt::{chimera_decrypt, chimera_encrypt, ChimeraEvalKey, ChimeraKey};
-use crate::layernorm::LayerNormConfig;
+use crate::layernorm::{chimera_rms_norm_vec, chimera_rms_norm_vec_debug_stages, LayerNormConfig};
 use crate::model_loader::{
     load_embedding_from_file, load_final_norm, load_layer_from_file, load_lm_head_from_file, EmbeddingTable, LMHead,
     LoaderConfig, ModelLoadError,
 };
+use crate::noise::NoiseTracker;
 use crate::params::{ChimeraParams, ModelDims, Precision, SecurityLevel};
-use crate::transformer::{chimera_transformer_block_vec, FFNConfig, TransformerBlockConfig, TransformerBlockWeights};
+use crate::transformer::{
+    chimera_ffn_vec, chimera_ffn_vec_scaled, chimera_transformer_block_vec, FFNConfig, TransformerBlockConfig,
+    TransformerBlockWeights,
+};
 
 // ---------------------------------------------------------------------------
 // Backend selection (mirrors tests.rs)
@@ -67,6 +73,10 @@ use crate::transformer::{chimera_transformer_block_vec, FFNConfig, TransformerBl
 type BE = poulpy_cpu_ref::FFT64Ref;
 #[cfg(all(feature = "enable-avx", target_arch = "x86_64"))]
 type BE = poulpy_cpu_avx::FFT64Avx;
+
+const VEC_EFFECTIVE_DECODE_SCALE: u32 = 8;
+const VEC_EFFECTIVE_QUANT_SCALE: f64 = 1.0;
+const REFRESHED_EFFECTIVE_DECODE_SCALE: u32 = 18;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -238,6 +248,54 @@ pub struct GenerationResult {
     pub total_time: std::time::Duration,
 }
 
+#[derive(Clone, Debug)]
+pub struct HiddenRangeStats {
+    pub stage: String,
+    pub min: i64,
+    pub max: i64,
+    pub overflow_dims: usize,
+    pub total_dims: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlaintextRmsStats {
+    pub stage: String,
+    pub mean_sq: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScalarStageValue {
+    pub stage: String,
+    pub value: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct StageErrorStats {
+    pub stage: String,
+    pub linf: f64,
+    pub l2: f64,
+    pub mae: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RefreshedDecodeEval {
+    pub precision: u32,
+    pub range: HiddenRangeStats,
+    pub linf: f64,
+    pub l2: f64,
+    pub mae: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct VariantRangeStats {
+    pub variant: String,
+    pub decode_precision: u32,
+    pub min: i64,
+    pub max: i64,
+    pub overflow_dims: usize,
+    pub total_dims: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -324,6 +382,8 @@ pub struct InferencePipeline {
     key: ChimeraKey<BE>,
     /// FHE evaluation key (sent to provider).
     eval_key: ChimeraEvalKey<BE>,
+    /// Prepared bootstrap key for LUT/refresh experiments.
+    bsk_prepared: Option<ChimeraBootstrapKeyPrepared<BE>>,
 }
 
 impl InferencePipeline {
@@ -469,6 +529,25 @@ impl InferencePipeline {
         let eval_key = ChimeraEvalKey::generate(&module, &key, &params, config.eval_seed_a, config.eval_seed_b);
         eprintln!("[inference] FHE keys generated");
 
+        let bootstrap_config = BootstrappingConfig::with_functional_bootstrap(6.0, 1);
+        let bsk_prepared = if bootstrap_config.enabled {
+            eprintln!("[inference] Generating bootstrap key...");
+            let bsk = ChimeraBootstrapKey::generate(
+                &module,
+                &params,
+                &key.secret,
+                &key.prepared,
+                [201u8; 32],
+                [202u8; 32],
+                [203u8; 32],
+            );
+            let prepared = ChimeraBootstrapKeyPrepared::prepare(&module, &bsk);
+            eprintln!("[inference] Bootstrap key prepared");
+            Some(prepared)
+        } else {
+            None
+        };
+
         Ok(InferencePipeline {
             tokenizer,
             embedding,
@@ -482,6 +561,7 @@ impl InferencePipeline {
             module,
             key,
             eval_key,
+            bsk_prepared,
         })
     }
 
@@ -536,20 +616,35 @@ impl InferencePipeline {
             .collect()
     }
 
-    /// Decrypts a vector of per-dimension ciphertexts back to i8 values.
-    fn decrypt_hidden_state(&self, cts: &[GLWE<Vec<u8>>]) -> Vec<i8> {
+    fn decrypt_hidden_state_at_precision(&self, cts: &[GLWE<Vec<u8>>], precision: u32) -> Vec<i8> {
         cts.iter()
             .map(|ct| {
                 let pt = chimera_decrypt(&self.module, &self.key, ct, &self.params);
-                let vals = decode_int8(&self.module, &self.params, &pt, 1);
-                vals[0]
+                let mut decoded = vec![0i64; self.module.n() as usize];
+                pt.decode_vec_i64(&mut decoded, poulpy_core::layouts::TorusPrecision(precision));
+                decoded[0].clamp(-128, 127) as i8
             })
             .collect()
     }
 
-    /// Runs the FHE forward pass: transformer layers + optional final norm.
+    /// Decrypts a vector of per-dimension ciphertexts to raw i64 values at the
+    /// INT8 encoding scale, without truncating to i8.
+    pub fn decrypt_hidden_state_raw(&self, cts: &[GLWE<Vec<u8>>]) -> Vec<i64> {
+        cts.iter()
+            .map(|ct| {
+                let pt = chimera_decrypt(&self.module, &self.key, ct, &self.params);
+                let mut decoded = vec![0i64; self.module.n() as usize];
+                pt.decode_vec_i64(&mut decoded, poulpy_core::layouts::TorusPrecision(VEC_EFFECTIVE_DECODE_SCALE));
+                decoded[0]
+            })
+            .collect()
+    }
+
+    /// Runs the legacy encrypted forward pass.
     ///
-    /// This is the provider-side computation. Returns encrypted hidden state.
+    /// This keeps final RMSNorm on the provider side when configured. The
+    /// refreshed production path instead leaves final RMSNorm to the client
+    /// after decryption.
     fn fhe_forward(&self, encrypted_input: &[GLWE<Vec<u8>>]) -> Vec<GLWE<Vec<u8>>> {
         let d = self.effective_dims.d_model;
         let block_config = TransformerBlockConfig {
@@ -580,11 +675,120 @@ impl InferencePipeline {
             eprintln!("[inference]   Layer {} done in {:.2?}", layer_idx, layer_start.elapsed());
         }
 
-        // Apply final RMSNorm if configured
+        // Apply final RMSNorm if configured.
         if let Some(ref gamma) = self.final_norm_gamma {
             eprintln!("[inference]   Applying final RMSNorm...");
             let norm_cfg = LayerNormConfig::rms_norm(d).with_gamma(gamma.clone());
             current = crate::layernorm::chimera_rms_norm_vec(&self.module, &self.eval_key, &current, &norm_cfg);
+        }
+
+        current
+    }
+
+    /// Production refreshed forward pass.
+    ///
+    /// This inserts decrypt/re-encrypt style refresh boundaries and uses a
+    /// LUT-based FFN gate activation. Final RMSNorm is intentionally left for
+    /// the client after decryption.
+    fn fhe_forward_refreshed(&self, encrypted_input: &[GLWE<Vec<u8>>]) -> Vec<GLWE<Vec<u8>>> {
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm_midrange(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let mut current = encrypted_input.to_vec();
+        for weights in self.layer_weights.iter() {
+            let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+                Some(gamma) => block_config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+                None => block_config.pre_attn_norm.clone(),
+            };
+            let normed_pre_attn = chimera_rms_norm_vec(&self.module, &self.eval_key, &current, &pre_attn_norm_cfg);
+            let attn_out = chimera_multi_head_attention_vec(
+                &self.module,
+                &self.eval_key,
+                &normed_pre_attn,
+                &weights.attention,
+                &block_config.attention,
+            );
+            let residual_1 = self.project_and_add_diag(&current, &attn_out);
+            let residual_1_refreshed = self.refresh_vec_at_effective_scale(&residual_1);
+
+            let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
+                Some(gamma) => block_config.pre_ffn_norm.clone().with_gamma(gamma.clone()),
+                None => block_config.pre_ffn_norm.clone(),
+            };
+            let normed_pre_ffn = chimera_rms_norm_vec(&self.module, &self.eval_key, &residual_1_refreshed, &pre_ffn_norm_cfg);
+
+            let d_in = normed_pre_ffn.len();
+            let d_ffn = weights.ffn.w1.len();
+            let w_up = weights.ffn.w3.as_ref().expect("SwiGLU requires w3");
+
+            let gate_fhe: Vec<GLWE<Vec<u8>>> = (0..d_ffn)
+                .map(|j| {
+                    let wg_vecs: Vec<Vec<i64>> = weights.ffn.w1[j][..d_in].iter().map(|&w| vec![w]).collect();
+                    crate::arithmetic::chimera_dot_product_scaled(
+                        &self.module,
+                        &normed_pre_ffn,
+                        &wg_vecs,
+                        crate::layernorm::RMS_OUTPUT_SCALE_SHIFT_BITS,
+                    )
+                })
+                .collect();
+            let gate_act_fhe = self.apply_silu_lut_vec(&gate_fhe);
+
+            let up_fhe: Vec<GLWE<Vec<u8>>> = (0..d_ffn)
+                .map(|j| {
+                    let wu_vecs: Vec<Vec<i64>> = w_up[j][..d_in].iter().map(|&w| vec![w]).collect();
+                    crate::arithmetic::chimera_dot_product_scaled(
+                        &self.module,
+                        &normed_pre_ffn,
+                        &wu_vecs,
+                        crate::layernorm::RMS_OUTPUT_SCALE_SHIFT_BITS,
+                    )
+                })
+                .collect();
+
+            let hidden_fhe: Vec<GLWE<Vec<u8>>> = gate_act_fhe
+                .iter()
+                .zip(up_fhe.iter())
+                .map(|(gate, up)| {
+                    let gate_layout = poulpy_core::layouts::GLWELayout {
+                        n: gate.n(),
+                        base2k: gate.base2k(),
+                        k: gate.k(),
+                        rank: gate.rank(),
+                    };
+                    let up_proj = if up.base2k() == gate.base2k() {
+                        up.clone()
+                    } else {
+                        crate::arithmetic::chimera_align_layout(&self.module, up, &gate_layout)
+                    };
+                    crate::activations::chimera_ct_mul(&self.module, &self.eval_key, gate, &up_proj)
+                })
+                .collect();
+            let hidden_fhe_refreshed = self.refresh_vec_at_effective_scale(&hidden_fhe);
+
+            let ffn_out: Vec<GLWE<Vec<u8>>> = weights
+                .ffn
+                .w2
+                .iter()
+                .map(|row| {
+                    let w2_vecs: Vec<Vec<i64>> = row.iter().map(|&w| vec![w]).collect();
+                    crate::arithmetic::chimera_dot_product(&self.module, &hidden_fhe_refreshed, &w2_vecs)
+                })
+                .collect();
+
+            current = self.project_and_add_diag(&residual_1_refreshed, &ffn_out);
         }
 
         current
@@ -712,6 +916,15 @@ impl InferencePipeline {
     ///
     /// A [`ThreeWayComparison`] with L-inf, L2, and MAE for each pair.
     pub fn compare_fhe_vs_plaintext(&self, fhe_hidden: &[i8], token_id: u32) -> crate::plaintext_forward::ThreeWayComparison {
+        if self.final_norm_gamma.is_some() {
+            let (linf, l2, mae) = self.compare_fhe_vs_plaintext_refreshed(fhe_hidden, token_id);
+            return crate::plaintext_forward::ThreeWayComparison {
+                fhe_vs_exact: (linf, l2, mae),
+                poly_vs_exact: (0.0, 0.0, 0.0),
+                fhe_vs_poly: (linf, l2, mae),
+            };
+        }
+
         let embedding = self.embed_token(token_id);
         let d = self.effective_dims.d_model;
 
@@ -729,14 +942,1577 @@ impl InferencePipeline {
             residual: true,
         };
 
-        crate::plaintext_forward::three_way_comparison(
+        crate::plaintext_forward::three_way_comparison_quantized(
             fhe_hidden,
             &embedding,
             &block_config,
             &self.layer_weights,
             self.final_norm_gamma.as_deref(),
             block_config.pre_attn_norm.epsilon,
+            VEC_EFFECTIVE_QUANT_SCALE,
         )
+    }
+
+    pub fn compare_fhe_vs_plaintext_refreshed(&self, fhe_hidden: &[i8], token_id: u32) -> (f64, f64, f64) {
+        let target = self.refreshed_plain_target(token_id);
+        let fhe: Vec<f64> = fhe_hidden.iter().map(|&v| v as f64).collect();
+        crate::plaintext_forward::error_metrics(&fhe, &target)
+    }
+
+    pub fn refreshed_plain_target(&self, token_id: u32) -> Vec<f64> {
+        let output_scale_divisor = 256.0;
+        let d = self.effective_dims.d_model;
+        let embedding = self.embed_token(token_id);
+        let x: Vec<f64> = embedding.iter().map(|&v| v as f64).collect();
+
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm_midrange(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let weights = &self.layer_weights[0];
+        let w_up = weights.ffn.w3.as_ref().expect("SwiGLU requires w3");
+
+        let pre_attn =
+            crate::plaintext_forward::rms_norm(&x, weights.pre_attn_norm_gamma.as_deref(), block_config.pre_attn_norm.epsilon);
+        let attn = crate::plaintext_forward::multi_head_attention(&pre_attn, &weights.attention, &block_config.attention);
+        let residual_1: Vec<f64> = x.iter().zip(attn.iter()).map(|(a, b)| a + b).collect();
+        let residual_1_refreshed: Vec<f64> = residual_1.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect();
+
+        let pre_ffn = crate::plaintext_forward::rms_norm(
+            &residual_1_refreshed,
+            weights.pre_ffn_norm_gamma.as_deref(),
+            block_config.pre_ffn_norm.epsilon,
+        );
+        let gate = crate::plaintext_forward::matvec(&weights.ffn.w1, &pre_ffn);
+        let gate_activated: Vec<f64> = gate.iter().map(|&v| crate::plaintext_forward::exact_silu(v)).collect();
+        let up = crate::plaintext_forward::matvec(w_up, &pre_ffn);
+        let hidden: Vec<f64> = gate_activated.iter().zip(up.iter()).map(|(a, b)| a * b).collect();
+        let hidden_refreshed: Vec<f64> = hidden.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect();
+        let down = crate::plaintext_forward::matvec(&weights.ffn.w2, &hidden_refreshed);
+        let block_out: Vec<f64> = residual_1_refreshed.iter().zip(down.iter()).map(|(a, b)| a + b).collect();
+        let block_out_refreshed: Vec<f64> = block_out.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect();
+        let final_plain: Vec<f64> = if let Some(gamma) = self.final_norm_gamma.as_deref() {
+            crate::plaintext_forward::rms_norm(&block_out_refreshed, Some(gamma), 1e-5)
+        } else {
+            block_out_refreshed
+        };
+
+        final_plain
+            .iter()
+            .map(|&v| {
+                let divisor = if self.final_norm_gamma.is_some() {
+                    1.0
+                } else {
+                    output_scale_divisor
+                };
+                (v / divisor).round().clamp(-128.0, 127.0)
+            })
+            .collect()
+    }
+
+    fn decode_refreshed_hidden_from_output(&self, encrypted_output: &[GLWE<Vec<u8>>], precision: u32) -> Vec<i8> {
+        if self.final_norm_gamma.is_some() {
+            let decoded = self.decode_ct_vec_at_precision(encrypted_output, precision);
+            self.apply_cleartext_final_norm_quantized(&decoded)
+        } else {
+            self.decrypt_hidden_state_at_precision(encrypted_output, precision)
+        }
+    }
+
+    pub fn step_refreshed(&self, token_id: u32) -> Result<InferenceStepResult, InferenceError> {
+        let step_start = Instant::now();
+
+        let embedding = self.embed_token(token_id);
+        let encrypted = self.encrypt_embedding(&embedding);
+
+        let fhe_start = Instant::now();
+        let encrypted_output = self.fhe_forward_refreshed(&encrypted);
+        let fhe_time = fhe_start.elapsed();
+
+        let hidden_state = self.decode_refreshed_hidden_from_output(&encrypted_output, REFRESHED_EFFECTIVE_DECODE_SCALE);
+        let logits = self.lm_head_forward(&hidden_state);
+
+        let mut indexed_logits: Vec<(u32, i64)> = logits.iter().enumerate().map(|(i, &l)| (i as u32, l)).collect();
+        indexed_logits.sort_by_key(|&(_, l)| std::cmp::Reverse(l));
+        let top_logits = indexed_logits.into_iter().take(5).collect::<Vec<_>>();
+
+        let predicted_token = top_logits[0].0;
+        let token_text = self
+            .tokenizer
+            .decode(&[predicted_token], true)
+            .unwrap_or_else(|_| format!("<tok:{}>", predicted_token));
+
+        Ok(InferenceStepResult {
+            token_id: predicted_token,
+            token_text,
+            hidden_state,
+            top_logits,
+            fhe_time,
+            total_time: step_start.elapsed(),
+        })
+    }
+
+    pub fn refreshed_hidden_range_at_precision(&self, token_id: u32, precision: u32) -> HiddenRangeStats {
+        let embedding = self.embed_token(token_id);
+        let encrypted = self.encrypt_embedding(&embedding);
+        let encrypted_output = self.fhe_forward_refreshed(&encrypted);
+        let raw_i64: Vec<i64> = self
+            .decode_refreshed_hidden_from_output(&encrypted_output, precision)
+            .iter()
+            .map(|&v| v as i64)
+            .collect();
+        HiddenRangeStats {
+            stage: format!("refreshed_final@{precision}"),
+            min: raw_i64.iter().copied().min().unwrap_or(0),
+            max: raw_i64.iter().copied().max().unwrap_or(0),
+            overflow_dims: raw_i64.iter().filter(|&&v| !(-128..=127).contains(&v)).count(),
+            total_dims: raw_i64.len(),
+        }
+    }
+
+    pub fn refreshed_hidden_at_precision(&self, token_id: u32, precision: u32) -> Vec<i8> {
+        let embedding = self.embed_token(token_id);
+        let encrypted = self.encrypt_embedding(&embedding);
+        let encrypted_output = self.fhe_forward_refreshed(&encrypted);
+        self.decode_refreshed_hidden_from_output(&encrypted_output, precision)
+    }
+
+    pub fn refreshed_decode_sweep(&self, token_id: u32, precisions: &[u32]) -> Vec<RefreshedDecodeEval> {
+        let embedding = self.embed_token(token_id);
+        let encrypted = self.encrypt_embedding(&embedding);
+        let encrypted_output = self.fhe_forward_refreshed(&encrypted);
+        let target = self.refreshed_plain_target(token_id);
+
+        precisions
+            .iter()
+            .copied()
+            .map(|precision| {
+                let hidden = self.decode_refreshed_hidden_from_output(&encrypted_output, precision);
+                let fhe: Vec<f64> = hidden.iter().map(|&v| v as f64).collect();
+                let (linf, l2, mae) = crate::plaintext_forward::error_metrics(&fhe, &target);
+                let raw_i64: Vec<i64> = fhe.iter().map(|&v| v as i64).collect();
+                let range = HiddenRangeStats {
+                    stage: format!("refreshed_final@{precision}"),
+                    min: raw_i64.iter().copied().min().unwrap_or(0),
+                    max: raw_i64.iter().copied().max().unwrap_or(0),
+                    overflow_dims: raw_i64.iter().filter(|&&v| !(-128..=127).contains(&v)).count(),
+                    total_dims: raw_i64.len(),
+                };
+                RefreshedDecodeEval {
+                    precision,
+                    range,
+                    linf,
+                    l2,
+                    mae,
+                }
+            })
+            .collect()
+    }
+
+    /// Runs the FHE forward path for one token and returns the decrypted hidden
+    /// state as raw i64 values before truncation to i8.
+    pub fn raw_hidden_state_for_token(&self, token_id: u32) -> Vec<i64> {
+        let embedding = self.embed_token(token_id);
+        let encrypted = self.encrypt_embedding(&embedding);
+        let encrypted_output = self.fhe_forward(&encrypted);
+        self.decrypt_hidden_state_raw(&encrypted_output)
+    }
+
+    pub fn diagnose_first_block_ranges_for_token(&self, token_id: u32) -> Vec<HiddenRangeStats> {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "diagnose_first_block_ranges_for_token: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let weights = &self.layer_weights[0];
+        let encrypted = self.encrypt_embedding(&self.embed_token(token_id));
+        let mut stats = vec![self.hidden_range_stats("input", &encrypted)];
+
+        let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+            Some(gamma) => block_config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+            None => block_config.pre_attn_norm.clone(),
+        };
+        let normed_pre_attn = chimera_rms_norm_vec(&self.module, &self.eval_key, &encrypted, &pre_attn_norm_cfg);
+        stats.push(self.hidden_range_stats("pre_attn_norm", &normed_pre_attn));
+
+        let attn_out = chimera_multi_head_attention_vec(
+            &self.module,
+            &self.eval_key,
+            &normed_pre_attn,
+            &weights.attention,
+            &block_config.attention,
+        );
+        stats.push(self.hidden_range_stats("attn_out", &attn_out));
+
+        let residual_1 = self.project_and_add_diag(&encrypted, &attn_out);
+        stats.push(self.hidden_range_stats("residual_1", &residual_1));
+
+        let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
+            Some(gamma) => LayerNormConfig::rms_norm_midrange(d).with_gamma(gamma.clone()),
+            None => LayerNormConfig::rms_norm_midrange(d),
+        };
+        let residual_1_for_norm: Vec<_> = residual_1
+            .iter()
+            .map(|ct| crate::arithmetic::chimera_mul_const_scaled(&self.module, ct, &[1], 1))
+            .collect();
+        let normed_pre_ffn = chimera_rms_norm_vec(&self.module, &self.eval_key, &residual_1_for_norm, &pre_ffn_norm_cfg);
+        stats.push(self.hidden_range_stats("pre_ffn_norm", &normed_pre_ffn));
+
+        let ffn_out = chimera_ffn_vec(&self.module, &self.eval_key, &normed_pre_ffn, &weights.ffn, &block_config.ffn);
+        stats.push(self.hidden_range_stats("ffn_out", &ffn_out));
+
+        let block_out = self.project_and_add_diag(&residual_1, &ffn_out);
+        stats.push(self.hidden_range_stats("block_out", &block_out));
+
+        stats
+    }
+
+    pub fn diagnose_first_block_stage_for_token_at_precision(
+        &self,
+        token_id: u32,
+        stage: &str,
+        precision: u32,
+    ) -> HiddenRangeStats {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "diagnose_first_block_stage_for_token_at_precision: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let weights = &self.layer_weights[0];
+        let encrypted = self.encrypt_embedding(&self.embed_token(token_id));
+
+        let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+            Some(gamma) => block_config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+            None => block_config.pre_attn_norm.clone(),
+        };
+        let normed_pre_attn = chimera_rms_norm_vec(&self.module, &self.eval_key, &encrypted, &pre_attn_norm_cfg);
+        if stage == "pre_attn_norm" {
+            return self.hidden_range_stats_at_precision(stage, &normed_pre_attn, precision);
+        }
+
+        let attn_out = chimera_multi_head_attention_vec(
+            &self.module,
+            &self.eval_key,
+            &normed_pre_attn,
+            &weights.attention,
+            &block_config.attention,
+        );
+        if stage == "attn_out" {
+            return self.hidden_range_stats_at_precision(stage, &attn_out, precision);
+        }
+
+        let residual_1 = self.project_and_add_diag(&encrypted, &attn_out);
+        if stage == "residual_1" {
+            return self.hidden_range_stats_at_precision(stage, &residual_1, precision);
+        }
+
+        let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
+            Some(gamma) => LayerNormConfig::rms_norm_midrange(d).with_gamma(gamma.clone()),
+            None => LayerNormConfig::rms_norm_midrange(d),
+        };
+        let normed_pre_ffn = chimera_rms_norm_vec(&self.module, &self.eval_key, &residual_1, &pre_ffn_norm_cfg);
+        if stage == "pre_ffn_norm" {
+            return self.hidden_range_stats_at_precision(stage, &normed_pre_ffn, precision);
+        }
+
+        let ffn_out = chimera_ffn_vec_scaled(
+            &self.module,
+            &self.eval_key,
+            &normed_pre_ffn,
+            &weights.ffn,
+            &block_config.ffn,
+            crate::layernorm::RMS_OUTPUT_SCALE_SHIFT_BITS,
+        );
+        if stage == "ffn_out" {
+            return self.hidden_range_stats_at_precision(stage, &ffn_out, precision);
+        }
+
+        let block_out = self.project_and_add_diag(&residual_1, &ffn_out);
+        if stage == "block_out" {
+            return self.hidden_range_stats_at_precision(stage, &block_out, precision);
+        }
+
+        panic!("unknown stage: {stage}");
+    }
+
+    pub fn diagnose_pre_attn_norm_range_for_token_at_precision(&self, token_id: u32, precision: u32) -> HiddenRangeStats {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "diagnose_pre_attn_norm_range_for_token_at_precision: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let weights = &self.layer_weights[0];
+        let encrypted = self.encrypt_embedding(&self.embed_token(token_id));
+        let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+            Some(gamma) => block_config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+            None => block_config.pre_attn_norm.clone(),
+        };
+        let normed_pre_attn = chimera_rms_norm_vec(&self.module, &self.eval_key, &encrypted, &pre_attn_norm_cfg);
+        self.hidden_range_stats_at_precision("pre_attn_norm", &normed_pre_attn, precision)
+    }
+
+    pub fn diagnose_pre_attn_rms_internals_for_token(&self, token_id: u32, precision: u32) -> Vec<ScalarStageValue> {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "diagnose_pre_attn_rms_internals_for_token: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let weights = &self.layer_weights[0];
+        let encrypted = self.encrypt_embedding(&self.embed_token(token_id));
+        let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+            Some(gamma) => block_config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+            None => block_config.pre_attn_norm.clone(),
+        };
+
+        let debug = chimera_rms_norm_vec_debug_stages(&self.module, &self.eval_key, &encrypted, &pre_attn_norm_cfg);
+        let decode_one = |ct: &GLWE<Vec<u8>>| -> i64 {
+            let pt = chimera_decrypt(&self.module, &self.key, ct, &self.params);
+            let mut decoded = vec![0i64; self.module.n() as usize];
+            pt.decode_vec_i64(&mut decoded, poulpy_core::layouts::TorusPrecision(precision));
+            decoded[0]
+        };
+
+        vec![
+            ScalarStageValue {
+                stage: format!("sum_sq@{precision}"),
+                value: decode_one(&debug.sum_sq),
+            },
+            ScalarStageValue {
+                stage: format!("mean_sq@{precision}"),
+                value: decode_one(&debug.mean_sq),
+            },
+            ScalarStageValue {
+                stage: format!("mean_sq_for_poly@{precision}"),
+                value: decode_one(&debug.mean_sq_for_poly),
+            },
+            ScalarStageValue {
+                stage: format!("inv_rms_pre@{precision}"),
+                value: decode_one(&debug.inv_rms_pre),
+            },
+            ScalarStageValue {
+                stage: format!("inv_rms@{precision}"),
+                value: decode_one(&debug.inv_rms),
+            },
+        ]
+    }
+
+    pub fn diagnose_pre_ffn_rms_internals_for_token(&self, token_id: u32, precision: u32) -> Vec<ScalarStageValue> {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "diagnose_pre_ffn_rms_internals_for_token: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let weights = &self.layer_weights[0];
+        let encrypted = self.encrypt_embedding(&self.embed_token(token_id));
+        let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+            Some(gamma) => block_config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+            None => block_config.pre_attn_norm.clone(),
+        };
+        let normed_pre_attn = chimera_rms_norm_vec(&self.module, &self.eval_key, &encrypted, &pre_attn_norm_cfg);
+        let attn_out = chimera_multi_head_attention_vec(
+            &self.module,
+            &self.eval_key,
+            &normed_pre_attn,
+            &weights.attention,
+            &block_config.attention,
+        );
+        let residual_1 = self.project_and_add_diag(&encrypted, &attn_out);
+
+        let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
+            Some(gamma) => LayerNormConfig::rms_norm_midrange(d).with_gamma(gamma.clone()),
+            None => LayerNormConfig::rms_norm_midrange(d),
+        };
+
+        let debug = chimera_rms_norm_vec_debug_stages(&self.module, &self.eval_key, &residual_1, &pre_ffn_norm_cfg);
+        let decode_one = |ct: &GLWE<Vec<u8>>| -> i64 {
+            let pt = chimera_decrypt(&self.module, &self.key, ct, &self.params);
+            let mut decoded = vec![0i64; self.module.n() as usize];
+            pt.decode_vec_i64(&mut decoded, poulpy_core::layouts::TorusPrecision(precision));
+            decoded[0]
+        };
+
+        vec![
+            ScalarStageValue {
+                stage: format!("pre_ffn_sum_sq@{precision}"),
+                value: decode_one(&debug.sum_sq),
+            },
+            ScalarStageValue {
+                stage: format!("pre_ffn_mean_sq@{precision}"),
+                value: decode_one(&debug.mean_sq),
+            },
+            ScalarStageValue {
+                stage: format!("pre_ffn_mean_sq_for_poly@{precision}"),
+                value: decode_one(&debug.mean_sq_for_poly),
+            },
+            ScalarStageValue {
+                stage: format!("pre_ffn_inv_rms_pre@{precision}"),
+                value: decode_one(&debug.inv_rms_pre),
+            },
+            ScalarStageValue {
+                stage: format!("pre_ffn_inv_rms@{precision}"),
+                value: decode_one(&debug.inv_rms),
+            },
+        ]
+    }
+
+    pub fn compare_first_block_stages_quantized(&self, token_id: u32) -> Vec<StageErrorStats> {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "compare_first_block_stages_quantized: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let embedding_i8 = self.embed_token(token_id);
+        let embedding_f64: Vec<f64> = embedding_i8.iter().map(|&v| v as f64).collect();
+        let weights = &self.layer_weights[0];
+
+        let pre_attn_plain = crate::plaintext_forward::rms_norm(
+            &embedding_f64,
+            weights.pre_attn_norm_gamma.as_deref(),
+            block_config.pre_attn_norm.epsilon,
+        );
+        let attn_plain =
+            crate::plaintext_forward::multi_head_attention(&pre_attn_plain, &weights.attention, &block_config.attention);
+        let residual_1_plain: Vec<f64> = embedding_f64.iter().zip(attn_plain.iter()).map(|(a, b)| a + b).collect();
+        let residual_1_plain_refreshed: Vec<f64> = residual_1_plain.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect();
+        let pre_ffn_plain = crate::plaintext_forward::rms_norm(
+            &residual_1_plain_refreshed,
+            weights.pre_ffn_norm_gamma.as_deref(),
+            block_config.pre_ffn_norm.epsilon,
+        );
+        let ffn_plain = crate::plaintext_forward::ffn(&pre_ffn_plain, &weights.ffn, &block_config.ffn);
+        let block_out_plain: Vec<f64> = residual_1_plain_refreshed
+            .iter()
+            .zip(ffn_plain.iter())
+            .map(|(a, b)| a + b)
+            .collect();
+
+        let quantize = |vals: &[f64]| -> Vec<f64> { vals.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect() };
+
+        let stage_names = [
+            "pre_attn_norm",
+            "attn_out",
+            "residual_1",
+            "pre_ffn_norm",
+            "ffn_out",
+            "block_out",
+        ];
+        let stage_plain = [
+            quantize(&pre_attn_plain),
+            quantize(&attn_plain),
+            quantize(&residual_1_plain_refreshed),
+            quantize(&pre_ffn_plain),
+            quantize(&ffn_plain),
+            quantize(&block_out_plain),
+        ];
+
+        stage_names
+            .iter()
+            .zip(stage_plain.iter())
+            .map(|(name, plain)| {
+                let fhe = self.diagnose_first_block_stage_for_token_at_precision(token_id, name, VEC_EFFECTIVE_DECODE_SCALE);
+                let fhe_vals = self.decode_first_block_stage_for_token(token_id, name, VEC_EFFECTIVE_DECODE_SCALE);
+                let (linf, l2, mae) = crate::plaintext_forward::error_metrics(&fhe_vals, plain);
+                let _ = fhe;
+                StageErrorStats {
+                    stage: (*name).to_string(),
+                    linf,
+                    l2,
+                    mae,
+                }
+            })
+            .collect()
+    }
+
+    pub fn compare_first_block_stages_quantized_with_residual_refresh(&self, token_id: u32) -> Vec<StageErrorStats> {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "compare_first_block_stages_quantized_with_residual_refresh: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let embedding_i8 = self.embed_token(token_id);
+        let embedding_f64: Vec<f64> = embedding_i8.iter().map(|&v| v as f64).collect();
+        let weights = &self.layer_weights[0];
+
+        let pre_attn_plain = crate::plaintext_forward::rms_norm(
+            &embedding_f64,
+            weights.pre_attn_norm_gamma.as_deref(),
+            block_config.pre_attn_norm.epsilon,
+        );
+        let attn_plain =
+            crate::plaintext_forward::multi_head_attention(&pre_attn_plain, &weights.attention, &block_config.attention);
+        let residual_1_plain: Vec<f64> = embedding_f64.iter().zip(attn_plain.iter()).map(|(a, b)| a + b).collect();
+        let residual_1_plain_refreshed: Vec<f64> = residual_1_plain.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect();
+        let pre_ffn_plain = crate::plaintext_forward::rms_norm(
+            &residual_1_plain_refreshed,
+            weights.pre_ffn_norm_gamma.as_deref(),
+            block_config.pre_ffn_norm.epsilon,
+        );
+        let ffn_plain = crate::plaintext_forward::ffn(&pre_ffn_plain, &weights.ffn, &block_config.ffn);
+        let block_out_plain: Vec<f64> = residual_1_plain.iter().zip(ffn_plain.iter()).map(|(a, b)| a + b).collect();
+
+        let quantize = |vals: &[f64]| -> Vec<f64> { vals.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect() };
+
+        let encrypted = self.encrypt_embedding(&embedding_i8);
+        let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+            Some(gamma) => block_config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+            None => block_config.pre_attn_norm.clone(),
+        };
+        let normed_pre_attn = chimera_rms_norm_vec(&self.module, &self.eval_key, &encrypted, &pre_attn_norm_cfg);
+        let attn_out = chimera_multi_head_attention_vec(
+            &self.module,
+            &self.eval_key,
+            &normed_pre_attn,
+            &weights.attention,
+            &block_config.attention,
+        );
+        let residual_1 = self.project_and_add_diag(&encrypted, &attn_out);
+        let residual_1_refreshed = self.refresh_vec_at_effective_scale(&residual_1);
+        let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
+            Some(gamma) => LayerNormConfig::rms_norm_midrange(d).with_gamma(gamma.clone()),
+            None => LayerNormConfig::rms_norm_midrange(d),
+        };
+        let normed_pre_ffn = chimera_rms_norm_vec(&self.module, &self.eval_key, &residual_1_refreshed, &pre_ffn_norm_cfg);
+        let ffn_out = chimera_ffn_vec_scaled(
+            &self.module,
+            &self.eval_key,
+            &normed_pre_ffn,
+            &weights.ffn,
+            &block_config.ffn,
+            crate::layernorm::RMS_OUTPUT_SCALE_SHIFT_BITS,
+        );
+        let block_out = self.project_and_add_diag(&residual_1_refreshed, &ffn_out);
+
+        let fhe_stage_vals = [
+            self.decode_ct_vec_at_effective_scale(&normed_pre_attn),
+            self.decode_ct_vec_at_effective_scale(&attn_out),
+            self.decode_ct_vec_at_effective_scale(&residual_1_refreshed),
+            self.decode_ct_vec_at_effective_scale(&normed_pre_ffn),
+            self.decode_ct_vec_at_effective_scale(&ffn_out),
+            self.decode_ct_vec_at_effective_scale(&block_out),
+        ];
+
+        let stage_names = [
+            "pre_attn_norm",
+            "attn_out",
+            "residual_1_refreshed",
+            "pre_ffn_norm",
+            "ffn_out",
+            "block_out",
+        ];
+        let stage_plain = [
+            quantize(&pre_attn_plain),
+            quantize(&attn_plain),
+            quantize(&residual_1_plain),
+            quantize(&pre_ffn_plain),
+            quantize(&ffn_plain),
+            quantize(&block_out_plain),
+        ];
+
+        stage_names
+            .iter()
+            .zip(fhe_stage_vals.iter())
+            .zip(stage_plain.iter())
+            .map(|((name, fhe), plain)| {
+                let (linf, l2, mae) = crate::plaintext_forward::error_metrics(fhe, plain);
+                StageErrorStats {
+                    stage: (*name).to_string(),
+                    linf,
+                    l2,
+                    mae,
+                }
+            })
+            .collect()
+    }
+
+    fn decode_ct_vec_at_effective_scale(&self, cts: &[GLWE<Vec<u8>>]) -> Vec<f64> {
+        self.decode_ct_vec_at_precision(cts, VEC_EFFECTIVE_DECODE_SCALE)
+    }
+
+    fn decode_ct_vec_at_precision(&self, cts: &[GLWE<Vec<u8>>], precision: u32) -> Vec<f64> {
+        cts.iter()
+            .map(|ct| {
+                let pt = chimera_decrypt(&self.module, &self.key, ct, &self.params);
+                let mut decoded = vec![0i64; self.module.n() as usize];
+                pt.decode_vec_i64(&mut decoded, poulpy_core::layouts::TorusPrecision(precision));
+                decoded[0] as f64
+            })
+            .collect()
+    }
+
+    fn apply_silu_lut_vec(&self, cts: &[GLWE<Vec<u8>>]) -> Vec<GLWE<Vec<u8>>> {
+        let bsk = self
+            .bsk_prepared
+            .as_ref()
+            .expect("apply_silu_lut_vec: bootstrap key not available");
+        let bp = &bsk.bootstrap_params;
+        let lut_entries = crate::lut::NonlinearLUT::silu_message_lut(bp.log_message_modulus);
+        cts.iter()
+            .map(|ct| {
+                let mut tracker = NoiseTracker::fresh();
+                crate::bootstrapping::chimera_bootstrap_with_lut(&self.module, ct, &mut tracker, bsk, &lut_entries)
+            })
+            .collect()
+    }
+
+    pub fn compare_ffn_substages_with_residual_refresh(&self, token_id: u32) -> Vec<StageErrorStats> {
+        self.compare_ffn_substages_with_residual_refresh_for_shift(token_id, crate::layernorm::RMS_OUTPUT_SCALE_SHIFT_BITS)
+    }
+
+    pub fn compare_ffn_substages_with_residual_refresh_for_shift(
+        &self,
+        token_id: u32,
+        input_scale_shift_bits: usize,
+    ) -> Vec<StageErrorStats> {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "compare_ffn_substages_with_residual_refresh: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let embedding_i8 = self.embed_token(token_id);
+        let embedding_f64: Vec<f64> = embedding_i8.iter().map(|&v| v as f64).collect();
+        let weights = &self.layer_weights[0];
+        let w_up = weights.ffn.w3.as_ref().expect("SwiGLU requires w3");
+
+        let pre_attn_plain = crate::plaintext_forward::rms_norm(
+            &embedding_f64,
+            weights.pre_attn_norm_gamma.as_deref(),
+            block_config.pre_attn_norm.epsilon,
+        );
+        let attn_plain =
+            crate::plaintext_forward::multi_head_attention(&pre_attn_plain, &weights.attention, &block_config.attention);
+        let residual_1_plain: Vec<f64> = embedding_f64.iter().zip(attn_plain.iter()).map(|(a, b)| a + b).collect();
+        let pre_ffn_plain = crate::plaintext_forward::rms_norm(
+            &residual_1_plain,
+            weights.pre_ffn_norm_gamma.as_deref(),
+            block_config.pre_ffn_norm.epsilon,
+        );
+        let gate_plain = crate::plaintext_forward::matvec(&weights.ffn.w1, &pre_ffn_plain);
+        let up_plain = crate::plaintext_forward::matvec(w_up, &pre_ffn_plain);
+        let gate_act_plain: Vec<f64> = gate_plain.iter().map(|&v| crate::plaintext_forward::poly_silu(v)).collect();
+        let hidden_plain: Vec<f64> = gate_act_plain.iter().zip(up_plain.iter()).map(|(a, b)| a * b).collect();
+        let down_plain = crate::plaintext_forward::matvec(&weights.ffn.w2, &hidden_plain);
+
+        let quantize = |vals: &[f64]| -> Vec<f64> { vals.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect() };
+
+        let encrypted = self.encrypt_embedding(&embedding_i8);
+        let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+            Some(gamma) => block_config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+            None => block_config.pre_attn_norm.clone(),
+        };
+        let normed_pre_attn = chimera_rms_norm_vec(&self.module, &self.eval_key, &encrypted, &pre_attn_norm_cfg);
+        let attn_out = chimera_multi_head_attention_vec(
+            &self.module,
+            &self.eval_key,
+            &normed_pre_attn,
+            &weights.attention,
+            &block_config.attention,
+        );
+        let residual_1 = self.project_and_add_diag(&encrypted, &attn_out);
+        let residual_1_refreshed = self.refresh_vec_at_effective_scale(&residual_1);
+        let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
+            Some(gamma) => LayerNormConfig::rms_norm_midrange(d).with_gamma(gamma.clone()),
+            None => LayerNormConfig::rms_norm_midrange(d),
+        };
+        let normed_pre_ffn = chimera_rms_norm_vec(&self.module, &self.eval_key, &residual_1_refreshed, &pre_ffn_norm_cfg);
+
+        let d_in = normed_pre_ffn.len();
+        let d_ffn = weights.ffn.w1.len();
+        let silu_approx = crate::activations::silu_poly_approx_narrow();
+
+        let gate_fhe: Vec<GLWE<Vec<u8>>> = (0..d_ffn)
+            .map(|j| {
+                let wg_vecs: Vec<Vec<i64>> = weights.ffn.w1[j][..d_in].iter().map(|&w| vec![w]).collect();
+                if input_scale_shift_bits == 0 {
+                    crate::arithmetic::chimera_dot_product(&self.module, &normed_pre_ffn, &wg_vecs)
+                } else {
+                    crate::arithmetic::chimera_dot_product_scaled(&self.module, &normed_pre_ffn, &wg_vecs, input_scale_shift_bits)
+                }
+            })
+            .collect();
+
+        let up_fhe: Vec<GLWE<Vec<u8>>> = (0..d_ffn)
+            .map(|j| {
+                let wu_vecs: Vec<Vec<i64>> = w_up[j][..d_in].iter().map(|&w| vec![w]).collect();
+                if input_scale_shift_bits == 0 {
+                    crate::arithmetic::chimera_dot_product(&self.module, &normed_pre_ffn, &wu_vecs)
+                } else {
+                    crate::arithmetic::chimera_dot_product_scaled(&self.module, &normed_pre_ffn, &wu_vecs, input_scale_shift_bits)
+                }
+            })
+            .collect();
+
+        let gate_act_fhe: Vec<GLWE<Vec<u8>>> = gate_fhe
+            .iter()
+            .map(|ct| crate::activations::apply_poly_activation(&self.module, &self.eval_key, ct, &silu_approx))
+            .collect();
+
+        let hidden_fhe: Vec<GLWE<Vec<u8>>> = gate_act_fhe
+            .iter()
+            .zip(up_fhe.iter())
+            .map(|(gate, up)| {
+                let gate_layout = poulpy_core::layouts::GLWELayout {
+                    n: gate.n(),
+                    base2k: gate.base2k(),
+                    k: gate.k(),
+                    rank: gate.rank(),
+                };
+                let up_proj = if up.base2k() == gate.base2k() {
+                    up.clone()
+                } else {
+                    crate::arithmetic::chimera_align_layout(&self.module, up, &gate_layout)
+                };
+                if input_scale_shift_bits == 0 {
+                    crate::activations::chimera_ct_mul(&self.module, &self.eval_key, gate, &up_proj)
+                } else {
+                    crate::activations::chimera_ct_mul_with_res_offset(
+                        &self.module,
+                        &self.eval_key,
+                        gate,
+                        &up_proj,
+                        self.eval_key.res_offset.saturating_sub(input_scale_shift_bits),
+                    )
+                }
+            })
+            .collect();
+
+        let down_fhe: Vec<GLWE<Vec<u8>>> = weights
+            .ffn
+            .w2
+            .iter()
+            .map(|row| {
+                let w2_vecs: Vec<Vec<i64>> = row.iter().map(|&w| vec![w]).collect();
+                crate::arithmetic::chimera_dot_product_scaled(
+                    &self.module,
+                    &hidden_fhe,
+                    &w2_vecs,
+                    crate::activations::COEFF_SCALE_BITS,
+                )
+            })
+            .collect();
+
+        let fhe_stage_vals = [
+            self.decode_ct_vec_at_effective_scale(&normed_pre_ffn),
+            self.decode_ct_vec_at_effective_scale(&gate_fhe),
+            self.decode_ct_vec_at_effective_scale(&gate_act_fhe),
+            self.decode_ct_vec_at_effective_scale(&up_fhe),
+            self.decode_ct_vec_at_effective_scale(&hidden_fhe),
+            self.decode_ct_vec_at_effective_scale(&down_fhe),
+        ];
+
+        let stage_names = ["pre_ffn_norm", "gate", "gate_activated", "up", "hidden", "down"];
+        let stage_plain = [
+            quantize(&pre_ffn_plain),
+            quantize(&gate_plain),
+            quantize(&gate_act_plain),
+            quantize(&up_plain),
+            quantize(&hidden_plain),
+            quantize(&down_plain),
+        ];
+
+        stage_names
+            .iter()
+            .zip(fhe_stage_vals.iter())
+            .zip(stage_plain.iter())
+            .map(|((name, fhe), plain)| {
+                let (linf, l2, mae) = crate::plaintext_forward::error_metrics(fhe, plain);
+                StageErrorStats {
+                    stage: (*name).to_string(),
+                    linf,
+                    l2,
+                    mae,
+                }
+            })
+            .collect()
+    }
+
+    pub fn compare_ffn_substages_with_residual_refresh_lut_gate(&self, token_id: u32) -> Vec<StageErrorStats> {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "compare_ffn_substages_with_residual_refresh_lut_gate: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let embedding_i8 = self.embed_token(token_id);
+        let embedding_f64: Vec<f64> = embedding_i8.iter().map(|&v| v as f64).collect();
+        let weights = &self.layer_weights[0];
+        let w_up = weights.ffn.w3.as_ref().expect("SwiGLU requires w3");
+
+        let pre_attn_plain = crate::plaintext_forward::rms_norm(
+            &embedding_f64,
+            weights.pre_attn_norm_gamma.as_deref(),
+            block_config.pre_attn_norm.epsilon,
+        );
+        let attn_plain =
+            crate::plaintext_forward::multi_head_attention(&pre_attn_plain, &weights.attention, &block_config.attention);
+        let residual_1_plain: Vec<f64> = embedding_f64.iter().zip(attn_plain.iter()).map(|(a, b)| a + b).collect();
+        let residual_1_plain_refreshed: Vec<f64> = residual_1_plain.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect();
+        let pre_ffn_plain = crate::plaintext_forward::rms_norm(
+            &residual_1_plain_refreshed,
+            weights.pre_ffn_norm_gamma.as_deref(),
+            block_config.pre_ffn_norm.epsilon,
+        );
+        let gate_plain = crate::plaintext_forward::matvec(&weights.ffn.w1, &pre_ffn_plain);
+        let up_plain = crate::plaintext_forward::matvec(w_up, &pre_ffn_plain);
+        let gate_act_plain: Vec<f64> = gate_plain.iter().map(|&v| crate::plaintext_forward::exact_silu(v)).collect();
+        let hidden_plain: Vec<f64> = gate_act_plain.iter().zip(up_plain.iter()).map(|(a, b)| a * b).collect();
+        let hidden_plain_refreshed: Vec<f64> = hidden_plain.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect();
+        let down_plain = crate::plaintext_forward::matvec(&weights.ffn.w2, &hidden_plain_refreshed);
+
+        let quantize = |vals: &[f64]| -> Vec<f64> { vals.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect() };
+
+        let encrypted = self.encrypt_embedding(&embedding_i8);
+        let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+            Some(gamma) => block_config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+            None => block_config.pre_attn_norm.clone(),
+        };
+        let normed_pre_attn = chimera_rms_norm_vec(&self.module, &self.eval_key, &encrypted, &pre_attn_norm_cfg);
+        let attn_out = chimera_multi_head_attention_vec(
+            &self.module,
+            &self.eval_key,
+            &normed_pre_attn,
+            &weights.attention,
+            &block_config.attention,
+        );
+        let residual_1 = self.project_and_add_diag(&encrypted, &attn_out);
+        let residual_1_refreshed = self.refresh_vec_at_effective_scale(&residual_1);
+        let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
+            Some(gamma) => LayerNormConfig::rms_norm_midrange(d).with_gamma(gamma.clone()),
+            None => LayerNormConfig::rms_norm_midrange(d),
+        };
+        let normed_pre_ffn = chimera_rms_norm_vec(&self.module, &self.eval_key, &residual_1_refreshed, &pre_ffn_norm_cfg);
+
+        let d_in = normed_pre_ffn.len();
+        let d_ffn = weights.ffn.w1.len();
+        let gate_fhe: Vec<GLWE<Vec<u8>>> = (0..d_ffn)
+            .map(|j| {
+                let wg_vecs: Vec<Vec<i64>> = weights.ffn.w1[j][..d_in].iter().map(|&w| vec![w]).collect();
+                crate::arithmetic::chimera_dot_product_scaled(
+                    &self.module,
+                    &normed_pre_ffn,
+                    &wg_vecs,
+                    crate::layernorm::RMS_OUTPUT_SCALE_SHIFT_BITS,
+                )
+            })
+            .collect();
+        let gate_act_fhe = self.apply_silu_lut_vec(&gate_fhe);
+
+        let up_fhe: Vec<GLWE<Vec<u8>>> = (0..d_ffn)
+            .map(|j| {
+                let wu_vecs: Vec<Vec<i64>> = w_up[j][..d_in].iter().map(|&w| vec![w]).collect();
+                crate::arithmetic::chimera_dot_product_scaled(
+                    &self.module,
+                    &normed_pre_ffn,
+                    &wu_vecs,
+                    crate::layernorm::RMS_OUTPUT_SCALE_SHIFT_BITS,
+                )
+            })
+            .collect();
+
+        let hidden_fhe: Vec<GLWE<Vec<u8>>> = gate_act_fhe
+            .iter()
+            .zip(up_fhe.iter())
+            .map(|(gate, up)| {
+                let gate_layout = poulpy_core::layouts::GLWELayout {
+                    n: gate.n(),
+                    base2k: gate.base2k(),
+                    k: gate.k(),
+                    rank: gate.rank(),
+                };
+                let up_proj = if up.base2k() == gate.base2k() {
+                    up.clone()
+                } else {
+                    crate::arithmetic::chimera_align_layout(&self.module, up, &gate_layout)
+                };
+                crate::activations::chimera_ct_mul(&self.module, &self.eval_key, gate, &up_proj)
+            })
+            .collect();
+
+        let hidden_fhe_refreshed = self.refresh_vec_at_effective_scale(&hidden_fhe);
+
+        let down_fhe: Vec<GLWE<Vec<u8>>> = weights
+            .ffn
+            .w2
+            .iter()
+            .map(|row| {
+                let w2_vecs: Vec<Vec<i64>> = row.iter().map(|&w| vec![w]).collect();
+                crate::arithmetic::chimera_dot_product(&self.module, &hidden_fhe_refreshed, &w2_vecs)
+            })
+            .collect();
+
+        let fhe_stage_vals = [
+            self.decode_ct_vec_at_effective_scale(&normed_pre_ffn),
+            self.decode_ct_vec_at_effective_scale(&gate_fhe),
+            self.decode_ct_vec_at_effective_scale(&gate_act_fhe),
+            self.decode_ct_vec_at_effective_scale(&up_fhe),
+            self.decode_ct_vec_at_effective_scale(&hidden_fhe_refreshed),
+            self.decode_ct_vec_at_effective_scale(&down_fhe),
+        ];
+
+        let stage_names = ["pre_ffn_norm", "gate", "gate_activated_lut", "up", "hidden", "down"];
+        let stage_plain = [
+            quantize(&pre_ffn_plain),
+            quantize(&gate_plain),
+            quantize(&gate_act_plain),
+            quantize(&up_plain),
+            quantize(&hidden_plain_refreshed),
+            quantize(&down_plain),
+        ];
+
+        stage_names
+            .iter()
+            .zip(fhe_stage_vals.iter())
+            .zip(stage_plain.iter())
+            .map(|((name, fhe), plain)| {
+                let (linf, l2, mae) = crate::plaintext_forward::error_metrics(fhe, plain);
+                StageErrorStats {
+                    stage: (*name).to_string(),
+                    linf,
+                    l2,
+                    mae,
+                }
+            })
+            .collect()
+    }
+
+    pub fn diagnose_pre_ffn_rms_internals_with_residual_refresh(&self, token_id: u32, precision: u32) -> Vec<ScalarStageValue> {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "diagnose_pre_ffn_rms_internals_with_residual_refresh: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let weights = &self.layer_weights[0];
+        let encrypted = self.encrypt_embedding(&self.embed_token(token_id));
+        let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+            Some(gamma) => block_config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+            None => block_config.pre_attn_norm.clone(),
+        };
+        let normed_pre_attn = chimera_rms_norm_vec(&self.module, &self.eval_key, &encrypted, &pre_attn_norm_cfg);
+        let attn_out = chimera_multi_head_attention_vec(
+            &self.module,
+            &self.eval_key,
+            &normed_pre_attn,
+            &weights.attention,
+            &block_config.attention,
+        );
+        let residual_1 = self.project_and_add_diag(&encrypted, &attn_out);
+        let residual_1_refreshed = self.refresh_vec_at_effective_scale(&residual_1);
+
+        let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
+            Some(gamma) => LayerNormConfig::rms_norm_midrange(d).with_gamma(gamma.clone()),
+            None => LayerNormConfig::rms_norm_midrange(d),
+        };
+
+        let debug = chimera_rms_norm_vec_debug_stages(&self.module, &self.eval_key, &residual_1_refreshed, &pre_ffn_norm_cfg);
+        let decode_one = |ct: &GLWE<Vec<u8>>| -> i64 {
+            let pt = chimera_decrypt(&self.module, &self.key, ct, &self.params);
+            let mut decoded = vec![0i64; self.module.n() as usize];
+            pt.decode_vec_i64(&mut decoded, poulpy_core::layouts::TorusPrecision(precision));
+            decoded[0]
+        };
+
+        vec![
+            ScalarStageValue {
+                stage: format!("refresh_pre_ffn_sum_sq@{precision}"),
+                value: decode_one(&debug.sum_sq),
+            },
+            ScalarStageValue {
+                stage: format!("refresh_pre_ffn_mean_sq@{precision}"),
+                value: decode_one(&debug.mean_sq),
+            },
+            ScalarStageValue {
+                stage: format!("refresh_pre_ffn_mean_sq_for_poly@{precision}"),
+                value: decode_one(&debug.mean_sq_for_poly),
+            },
+            ScalarStageValue {
+                stage: format!("refresh_pre_ffn_inv_rms_pre@{precision}"),
+                value: decode_one(&debug.inv_rms_pre),
+            },
+            ScalarStageValue {
+                stage: format!("refresh_pre_ffn_inv_rms@{precision}"),
+                value: decode_one(&debug.inv_rms),
+            },
+        ]
+    }
+
+    fn decode_first_block_stage_for_token(&self, token_id: u32, stage: &str, precision: u32) -> Vec<f64> {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "decode_first_block_stage_for_token: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let weights = &self.layer_weights[0];
+        let encrypted = self.encrypt_embedding(&self.embed_token(token_id));
+
+        let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+            Some(gamma) => block_config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+            None => block_config.pre_attn_norm.clone(),
+        };
+        let normed_pre_attn = chimera_rms_norm_vec(&self.module, &self.eval_key, &encrypted, &pre_attn_norm_cfg);
+        let target_cts = if stage == "pre_attn_norm" {
+            normed_pre_attn
+        } else {
+            let attn_out = chimera_multi_head_attention_vec(
+                &self.module,
+                &self.eval_key,
+                &normed_pre_attn,
+                &weights.attention,
+                &block_config.attention,
+            );
+            if stage == "attn_out" {
+                attn_out
+            } else {
+                let residual_1 = self.project_and_add_diag(&encrypted, &attn_out);
+                if stage == "residual_1" {
+                    residual_1
+                } else {
+                    let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
+                        Some(gamma) => block_config.pre_ffn_norm.clone().with_gamma(gamma.clone()),
+                        None => block_config.pre_ffn_norm.clone(),
+                    };
+                    let residual_1_for_norm: Vec<_> = residual_1
+                        .iter()
+                        .map(|ct| crate::arithmetic::chimera_mul_const_scaled(&self.module, ct, &[1], 1))
+                        .collect();
+                    let normed_pre_ffn =
+                        chimera_rms_norm_vec(&self.module, &self.eval_key, &residual_1_for_norm, &pre_ffn_norm_cfg);
+                    if stage == "pre_ffn_norm" {
+                        normed_pre_ffn
+                    } else {
+                        let ffn_out = chimera_ffn_vec_scaled(
+                            &self.module,
+                            &self.eval_key,
+                            &normed_pre_ffn,
+                            &weights.ffn,
+                            &block_config.ffn,
+                            crate::layernorm::RMS_OUTPUT_SCALE_SHIFT_BITS,
+                        );
+                        if stage == "ffn_out" {
+                            ffn_out
+                        } else if stage == "block_out" {
+                            self.project_and_add_diag(&residual_1, &ffn_out)
+                        } else {
+                            panic!("unknown stage: {stage}");
+                        }
+                    }
+                }
+            }
+        };
+
+        target_cts
+            .iter()
+            .map(|ct| {
+                let pt = chimera_decrypt(&self.module, &self.key, ct, &self.params);
+                let mut decoded = vec![0i64; self.module.n() as usize];
+                pt.decode_vec_i64(&mut decoded, poulpy_core::layouts::TorusPrecision(precision));
+                decoded[0] as f64
+            })
+            .collect()
+    }
+
+    pub fn diagnose_pre_attn_norm_variants_for_token(&self, token_id: u32) -> Vec<VariantRangeStats> {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "diagnose_pre_attn_norm_variants_for_token: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let weights = &self.layer_weights[0];
+        let encrypted = self.encrypt_embedding(&self.embed_token(token_id));
+        let pre_attn_norm_cfg = match &weights.pre_attn_norm_gamma {
+            Some(gamma) => block_config.pre_attn_norm.clone().with_gamma(gamma.clone()),
+            None => block_config.pre_attn_norm.clone(),
+        };
+        let debug = chimera_rms_norm_vec_debug_stages(&self.module, &self.eval_key, &encrypted, &pre_attn_norm_cfg);
+
+        let inv_layout = poulpy_core::layouts::GLWELayout {
+            n: debug.inv_rms_pre.n(),
+            base2k: debug.inv_rms_pre.base2k(),
+            k: debug.inv_rms_pre.k(),
+            rank: debug.inv_rms_pre.rank(),
+        };
+
+        let apply_variant = |label: &str, inv_ct: &GLWE<Vec<u8>>, res_offset: usize| -> Vec<GLWE<Vec<u8>>> {
+            let mut outputs = Vec::with_capacity(encrypted.len());
+            for (i, xi) in encrypted.iter().enumerate() {
+                let xi_proj = if xi.base2k() == inv_ct.base2k() && xi.k() == inv_ct.k() {
+                    xi.clone()
+                } else {
+                    chimera_align_layout(&self.module, xi, &inv_layout)
+                };
+                let mut out = crate::activations::chimera_ct_mul_with_res_offset(
+                    &self.module,
+                    &self.eval_key,
+                    &xi_proj,
+                    inv_ct,
+                    res_offset,
+                );
+                if let Some(gamma) = &pre_attn_norm_cfg.gamma {
+                    if i < gamma.len() {
+                        out = crate::arithmetic::chimera_mul_const_scaled(
+                            &self.module,
+                            &out,
+                            &[gamma[i]],
+                            crate::activations::COEFF_SCALE_BITS,
+                        );
+                    }
+                }
+                outputs.push(out);
+            }
+            let _ = label;
+            outputs
+        };
+
+        let variants = vec![
+            (
+                "current_inv_comp_res2",
+                apply_variant("current_inv_comp_res2", &debug.inv_rms, 2),
+            ),
+            (
+                "current_inv_comp_res10",
+                apply_variant("current_inv_comp_res10", &debug.inv_rms, 10),
+            ),
+            (
+                "current_inv_comp_res18",
+                apply_variant("current_inv_comp_res18", &debug.inv_rms, 18),
+            ),
+            (
+                "current_inv_comp_res26",
+                apply_variant("current_inv_comp_res26", &debug.inv_rms, 26),
+            ),
+            ("inv_pre_res2", apply_variant("inv_pre_res2", &debug.inv_rms_pre, 2)),
+            ("inv_pre_res10", apply_variant("inv_pre_res10", &debug.inv_rms_pre, 10)),
+            ("inv_pre_res18", apply_variant("inv_pre_res18", &debug.inv_rms_pre, 18)),
+        ];
+
+        let mut stats = Vec::new();
+        for (name, cts) in variants {
+            for precision in [26u32, 18u32, 10u32, 8u32, 4u32, 2u32] {
+                let raw: Vec<i64> = cts
+                    .iter()
+                    .map(|ct| {
+                        let pt = chimera_decrypt(&self.module, &self.key, ct, &self.params);
+                        let mut decoded = vec![0i64; self.module.n() as usize];
+                        pt.decode_vec_i64(&mut decoded, poulpy_core::layouts::TorusPrecision(precision));
+                        decoded[0]
+                    })
+                    .collect();
+                stats.push(VariantRangeStats {
+                    variant: name.to_string(),
+                    decode_precision: precision,
+                    min: raw.iter().copied().min().unwrap_or(0),
+                    max: raw.iter().copied().max().unwrap_or(0),
+                    overflow_dims: raw.iter().filter(|&&v| !(-128..=127).contains(&v)).count(),
+                    total_dims: raw.len(),
+                });
+            }
+        }
+
+        stats
+    }
+
+    pub fn diagnose_plaintext_rms_ranges_for_token(&self, token_id: u32) -> Vec<PlaintextRmsStats> {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "diagnose_plaintext_rms_ranges_for_token: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let x_i8 = self.embed_token(token_id);
+        let x: Vec<f64> = x_i8.iter().map(|&v| v as f64).collect();
+        let weights = &self.layer_weights[0];
+
+        let mean_sq = |vals: &[f64]| -> f64 { vals.iter().map(|v| v * v).sum::<f64>() / vals.len() as f64 };
+
+        let mut stats = vec![PlaintextRmsStats {
+            stage: "input".to_string(),
+            mean_sq: mean_sq(&x),
+        }];
+
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let normed_pre_attn =
+            crate::plaintext_forward::rms_norm(&x, weights.pre_attn_norm_gamma.as_deref(), block_config.pre_attn_norm.epsilon);
+        stats.push(PlaintextRmsStats {
+            stage: "pre_attn_norm".to_string(),
+            mean_sq: mean_sq(&normed_pre_attn),
+        });
+
+        let attn_out =
+            crate::plaintext_forward::multi_head_attention(&normed_pre_attn, &weights.attention, &block_config.attention);
+        let residual_1: Vec<f64> = x.iter().zip(attn_out.iter()).map(|(a, b)| a + b).collect();
+        stats.push(PlaintextRmsStats {
+            stage: "residual_1".to_string(),
+            mean_sq: mean_sq(&residual_1),
+        });
+
+        let normed_pre_ffn = crate::plaintext_forward::rms_norm(
+            &residual_1,
+            weights.pre_ffn_norm_gamma.as_deref(),
+            block_config.pre_ffn_norm.epsilon,
+        );
+        stats.push(PlaintextRmsStats {
+            stage: "pre_ffn_norm".to_string(),
+            mean_sq: mean_sq(&normed_pre_ffn),
+        });
+
+        stats
+    }
+
+    pub fn diagnose_refreshed_plaintext_rms_ranges_for_token(&self, token_id: u32) -> Vec<PlaintextRmsStats> {
+        assert!(
+            !self.layer_weights.is_empty(),
+            "diagnose_refreshed_plaintext_rms_ranges_for_token: no layers loaded"
+        );
+
+        let d = self.effective_dims.d_model;
+        let x_i8 = self.embed_token(token_id);
+        let x: Vec<f64> = x_i8.iter().map(|&v| v as f64).collect();
+        let weights = &self.layer_weights[0];
+        let mean_sq = |vals: &[f64]| -> f64 { vals.iter().map(|v| v * v).sum::<f64>() / vals.len() as f64 };
+
+        let mut stats = vec![PlaintextRmsStats {
+            stage: "input".to_string(),
+            mean_sq: mean_sq(&x),
+        }];
+
+        let block_config = TransformerBlockConfig {
+            attention: AttentionConfig {
+                dims: self.effective_dims.clone(),
+                params: self.params.clone(),
+                softmax_approx: self.config.softmax_strategy.clone(),
+                causal: true,
+                rope: None,
+            },
+            pre_attn_norm: LayerNormConfig::rms_norm(d),
+            pre_ffn_norm: LayerNormConfig::rms_norm_midrange(d),
+            ffn: FFNConfig::SwiGLU,
+            residual: true,
+        };
+
+        let normed_pre_attn =
+            crate::plaintext_forward::rms_norm(&x, weights.pre_attn_norm_gamma.as_deref(), block_config.pre_attn_norm.epsilon);
+        stats.push(PlaintextRmsStats {
+            stage: "pre_attn_norm".to_string(),
+            mean_sq: mean_sq(&normed_pre_attn),
+        });
+
+        let attn_out =
+            crate::plaintext_forward::multi_head_attention(&normed_pre_attn, &weights.attention, &block_config.attention);
+        let residual_1: Vec<f64> = x.iter().zip(attn_out.iter()).map(|(a, b)| a + b).collect();
+        let residual_1_refreshed: Vec<f64> = residual_1.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect();
+        stats.push(PlaintextRmsStats {
+            stage: "residual_1_refreshed".to_string(),
+            mean_sq: mean_sq(&residual_1_refreshed),
+        });
+
+        let normed_pre_ffn = crate::plaintext_forward::rms_norm(
+            &residual_1_refreshed,
+            weights.pre_ffn_norm_gamma.as_deref(),
+            block_config.pre_ffn_norm.epsilon,
+        );
+        stats.push(PlaintextRmsStats {
+            stage: "pre_ffn_norm_refreshed".to_string(),
+            mean_sq: mean_sq(&normed_pre_ffn),
+        });
+
+        let w_up = weights.ffn.w3.as_ref().expect("SwiGLU requires w3");
+        let gate = crate::plaintext_forward::matvec(&weights.ffn.w1, &normed_pre_ffn);
+        let gate_activated: Vec<f64> = gate.iter().map(|&v| crate::plaintext_forward::exact_silu(v)).collect();
+        let up = crate::plaintext_forward::matvec(w_up, &normed_pre_ffn);
+        let hidden: Vec<f64> = gate_activated.iter().zip(up.iter()).map(|(a, b)| a * b).collect();
+        let hidden_refreshed: Vec<f64> = hidden.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect();
+        stats.push(PlaintextRmsStats {
+            stage: "hidden_refreshed".to_string(),
+            mean_sq: mean_sq(&hidden_refreshed),
+        });
+
+        let down = crate::plaintext_forward::matvec(&weights.ffn.w2, &hidden_refreshed);
+        let block_out: Vec<f64> = residual_1_refreshed.iter().zip(down.iter()).map(|(a, b)| a + b).collect();
+        let block_out_refreshed: Vec<f64> = block_out.iter().map(|&v| v.round().clamp(-128.0, 127.0)).collect();
+        stats.push(PlaintextRmsStats {
+            stage: "block_out_refreshed".to_string(),
+            mean_sq: mean_sq(&block_out_refreshed),
+        });
+
+        if let Some(gamma) = self.final_norm_gamma.as_deref() {
+            let final_plain = crate::plaintext_forward::rms_norm(&block_out_refreshed, Some(gamma), 1e-5);
+            stats.push(PlaintextRmsStats {
+                stage: "final_norm_refreshed".to_string(),
+                mean_sq: mean_sq(&final_plain),
+            });
+        }
+
+        stats
+    }
+
+    fn hidden_range_stats(&self, stage: &str, cts: &[GLWE<Vec<u8>>]) -> HiddenRangeStats {
+        let raw = self.decrypt_hidden_state_raw(cts);
+        HiddenRangeStats {
+            stage: stage.to_string(),
+            min: raw.iter().copied().min().unwrap_or(0),
+            max: raw.iter().copied().max().unwrap_or(0),
+            overflow_dims: raw.iter().filter(|&&v| !(-128..=127).contains(&v)).count(),
+            total_dims: raw.len(),
+        }
+    }
+
+    pub fn hidden_range_stats_at_precision(&self, stage: &str, cts: &[GLWE<Vec<u8>>], precision: u32) -> HiddenRangeStats {
+        let raw: Vec<i64> = cts
+            .iter()
+            .map(|ct| {
+                let pt = chimera_decrypt(&self.module, &self.key, ct, &self.params);
+                let mut decoded = vec![0i64; self.module.n() as usize];
+                pt.decode_vec_i64(&mut decoded, poulpy_core::layouts::TorusPrecision(precision));
+                decoded[0]
+            })
+            .collect();
+
+        HiddenRangeStats {
+            stage: format!("{stage}@{precision}"),
+            min: raw.iter().copied().min().unwrap_or(0),
+            max: raw.iter().copied().max().unwrap_or(0),
+            overflow_dims: raw.iter().filter(|&&v| !(-128..=127).contains(&v)).count(),
+            total_dims: raw.len(),
+        }
+    }
+
+    fn project_and_add_diag(&self, a: &[GLWE<Vec<u8>>], b: &[GLWE<Vec<u8>>]) -> Vec<GLWE<Vec<u8>>> {
+        assert_eq!(a.len(), b.len(), "project_and_add_diag: length mismatch");
+        let mut result = Vec::with_capacity(a.len());
+
+        for i in 0..a.len() {
+            let ai_proj = if a[i].base2k() == b[i].base2k() && a[i].k() == b[i].k() {
+                a[i].clone()
+            } else {
+                let target = poulpy_core::layouts::GLWELayout {
+                    n: b[i].n(),
+                    base2k: b[i].base2k(),
+                    k: b[i].k(),
+                    rank: b[i].rank(),
+                };
+                chimera_align_layout(&self.module, &a[i], &target)
+            };
+            result.push(chimera_add(&self.module, &ai_proj, &b[i]));
+        }
+
+        result
+    }
+
+    fn refresh_vec_at_effective_scale(&self, cts: &[GLWE<Vec<u8>>]) -> Vec<GLWE<Vec<u8>>> {
+        self.refresh_vec_at_precision(cts, VEC_EFFECTIVE_DECODE_SCALE)
+    }
+
+    fn refresh_vec_at_precision(&self, cts: &[GLWE<Vec<u8>>], precision: u32) -> Vec<GLWE<Vec<u8>>> {
+        let vals: Vec<i8> = cts
+            .iter()
+            .map(|ct| {
+                let pt = chimera_decrypt(&self.module, &self.key, ct, &self.params);
+                let mut decoded = vec![0i64; self.module.n() as usize];
+                pt.decode_vec_i64(&mut decoded, poulpy_core::layouts::TorusPrecision(precision));
+                decoded[0].clamp(-128, 127) as i8
+            })
+            .collect();
+        self.encrypt_embedding(&vals)
     }
 
     /// Applies the LM head to a decrypted hidden state and returns logits.
@@ -756,6 +2532,17 @@ impl InferencePipeline {
                 .collect()
         } else {
             self.lm_head.forward(&hidden_i64)
+        }
+    }
+
+    fn apply_cleartext_final_norm_quantized(&self, hidden: &[f64]) -> Vec<i8> {
+        if let Some(gamma) = self.final_norm_gamma.as_deref() {
+            crate::plaintext_forward::rms_norm(hidden, Some(gamma), 1e-5)
+                .iter()
+                .map(|&v| v.round().clamp(-128.0, 127.0) as i8)
+                .collect()
+        } else {
+            hidden.iter().map(|&v| v.round().clamp(-128.0, 127.0) as i8).collect()
         }
     }
 
@@ -798,13 +2585,13 @@ impl InferencePipeline {
 
         // 3. FHE forward pass (provider-side)
         let fhe_start = Instant::now();
-        let encrypted_output = self.fhe_forward(&encrypted);
+        let encrypted_output = self.fhe_forward_refreshed(&encrypted);
         let fhe_time = fhe_start.elapsed();
         eprintln!("[inference] FHE forward pass done in {:.2?}", fhe_time);
 
         // 4. Decrypt hidden state (user-side)
         let decrypt_start = Instant::now();
-        let hidden = self.decrypt_hidden_state(&encrypted_output);
+        let hidden = self.decode_refreshed_hidden_from_output(&encrypted_output, REFRESHED_EFFECTIVE_DECODE_SCALE);
         eprintln!("[inference] Decrypted in {:.2?}", decrypt_start.elapsed());
 
         // 5. LM head + argmax (cleartext, user-side)

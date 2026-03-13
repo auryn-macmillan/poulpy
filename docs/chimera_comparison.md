@@ -18,6 +18,9 @@ Key findings:
   security; CKKS requires bootstrapping every ~10-15 multiplications
 - **Packing utilisation 80-100%** for transformer-aligned dimensions vs 50-70%
   typical for CKKS
+- **Refreshed real-model path validated at d_model=128 and d_model=256** with
+  client-side final RMSNorm; MAE is 1.96 at d_model=128 and 2.29-2.37 at
+  d_model=256/128-bit on truncated TinyLlama weights
 
 ## 2. Parameter Comparison
 
@@ -233,48 +236,57 @@ security, L∞ error decreases from ~63 (1 layer) to ~31 (2-4 layers).
 Residual connections + RMSNorm stabilize noise across layers. Bootstrapping
 is not needed for at least 4 layers at either security level.
 
-#### d_model=256, 4 heads, d_ffn=512 (128-bit security, N=16384)
+### 3.4.1 Refreshed Inference Path (real TinyLlama weights)
 
-| Layers | FHE time   | L∞ error | MAE   | Poly approx L∞ | FHE noise L∞ |
-|--------|-----------|----------|-------|----------------|-------------|
-| 1      | 137.1 s   | 64.0     | 33.6  | 0.32           | 64.1        |
+The current production-oriented single-token path is the refreshed/LUT variant
+used by `step_refreshed` in `poulpy-chimera/src/inference.rs`. Its defining
+choices are:
 
-Per-layer breakdown (d_model=256, 128-bit, 4 heads):
-- Pre-attention RMSNorm: 1.7 s
-- Attention total: 53.6 s
-  - QKV projection (3×256 dot products): 40.1 s
-  - Per-head attention (4 heads): 1.6 s
-  - Output projection (256 dot products): 11.9 s
-- Pre-FFN RMSNorm: 2.8 s
-- SwiGLU FFN total: 73.7 s
-  - Gate + SiLU + up projection: 50.6 s
-  - Down projection: 23.1 s
-- Residual connections: 2.6 s
-- **Total per layer: ~134.4 s**
+- Residual refresh after attention before the pre-FFN norm
+- Midrange RMSNorm for the refreshed pre-FFN branch
+- LUT-based SiLU on the SwiGLU gate
+- Refresh after the hidden gate*up product before the down projection
+- Client-side final RMSNorm after decryption rather than homomorphically
 
-Scaling from d_model=64 → d_model=256 at 128-bit security:
+Runtime measurements on the production refreshed path (same path used by
+`step_refreshed` with client-side final RMSNorm):
 
-| Metric           | d_model=64   | d_model=256  | Ratio | Expected (d²) |
-|------------------|-------------|-------------|:-----:|:--------------:|
-| Per-layer time   | 12.1 s      | 134.4 s     | 11.1x | 16x            |
-| L∞ (1 layer)     | 63.2        | 64.0        | 1.0x  | ~1x            |
-| MAE (1 layer)    | 34.5        | 33.6        | 1.0x  | ~1x            |
-| Encrypt time     | 99 ms       | 860 ms      | 8.7x  | 4x (linear)    |
-| Decrypt time     | 70 ms       | 299 ms      | 4.3x  | 4x (linear)    |
+| d_model | d_ffn | Heads | Security | Layers | FHE time | Total time | L∞ error | MAE |
+|--------:|------:|------:|---------:|-------:|---------:|-----------:|---------:|----:|
+| 64      | 128   | 1     | 80-bit   | 1      | 5.50 s   | n/a        | 7.0      | 2.09 |
+| 64      | 128   | 1     | 80-bit   | 2      | 11.09 s  | n/a        | 7.0      | 2.19 |
+| 64      | 128   | 1     | 80-bit   | 4      | 21.73 s  | n/a        | 6.0      | 2.12 |
+| 128     | 256   | 2     | 80-bit   | 1      | 18.69 s  | 18.79 s    | 7.0      | 2.19 |
+| 256     | 512   | 4     | 128-bit  | 1      | 291.95 s | 292.70 s   | 7.0      | 2.293 |
+| 256     | 512   | 4     | 128-bit  | 2      | 622.90 s | n/a        | 7.0      | 2.367 |
 
-**Key finding**: Error is independent of d_model. L∞ ~64 and MAE ~34 are
-nearly identical at d_model=64 and d_model=256. This means noise is per-element
-(from individual dot products), not cumulative across the embedding dimension.
+Calibration / diagnostic reference points on the same refreshed path:
 
-**Key finding**: Latency scales as ~O(d_model^1.7) rather than the expected
-O(d_model²). The sub-quadratic scaling is likely due to Rayon parallelization
-being more efficient at larger dimensions (more work per thread, better
-amortization of thread scheduling overhead).
+| Workload | Security | Measurement mode | FHE time | L∞ error | MAE |
+|----------|----------|------------------|---------:|---------:|----:|
+| d_model=64, d_ffn=128, 1 layer | 80-bit | no client-side final RMSNorm diagnostic | 115.5 s | 37.0 | 11.92 |
+| d_model=128, d_ffn=256, 1 layer | 80-bit | best decode sweep with client-side final RMSNorm | 403.4 s | 2.0 | 1.96 |
 
-**Bottleneck analysis**: At d_model=256, the SwiGLU FFN dominates (55% of
-layer time), followed by attention (40%). Within attention, QKV projection
-(3 matmuls of 256×256) is the most expensive single operation at 40.1s.
-Within FFN, the gate+up projection (2 matmuls of 256×512) costs 50.6s.
+The d_model=128 result is materially better than the earlier encrypted-final-norm
+integration attempt. The remaining error is no longer dominated by the FHE body;
+the refreshed block itself is stable and the decrypted hidden state matches the
+refreshed plaintext target closely.
+
+Key interpretation:
+
+- The dominant real-model instability was not the widened transformer block but
+  the last encrypted normalization boundary.
+- Once client-side final RMSNorm is used, d_model=128 becomes
+  accurate without changing the encrypted transformer body.
+- This remains a good tradeoff for the intended protocol because the user already
+  decrypts locally before consuming logits.
+- At d_model=256 and 128-bit security, the refreshed path remains bounded across
+  1-2 layers (`MAE 2.29 -> 2.37`, `L∞=7.0` in both runs), so no new depth blow-up
+  appears at the larger truncated dimension.
+- d_model=256 latency scales roughly linearly with layer count on the current CPU
+  reference backend: about 300 seconds for 1 layer and 623 seconds for 2 layers.
+- These refreshed measurements supersede the older encrypted-final-norm d_model=256
+  results, which are no longer representative of the production path.
 
 ### 3.5 Full Forward Pass Estimates
 

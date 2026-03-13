@@ -88,6 +88,27 @@ impl NonlinearLUT {
         Self::from_fn("silu", |x| x / (1.0 + (-x).exp()), -8.0, 8.0, 256, output_bits)
     }
 
+    /// Creates integer LUT entries for SiLU over a symmetric signed message domain.
+    ///
+    /// The returned vector has length `2^log_message_modulus`, where index `i`
+    /// is interpreted as the signed integer `(i as i64)` for the positive half
+    /// and `(i as i64 - 2^log_message_modulus)` for the negative half.
+    pub fn silu_message_lut(log_message_modulus: usize) -> Vec<i64> {
+        let message_modulus = 1usize << log_message_modulus;
+        let half_mod = message_modulus / 2;
+        (0..message_modulus)
+            .map(|i| {
+                let signed = if i < half_mod {
+                    i as i64
+                } else {
+                    i as i64 - message_modulus as i64
+                };
+                let x = signed as f64;
+                (x / (1.0 + (-x).exp())).round() as i64
+            })
+            .collect()
+    }
+
     /// Creates an exp(x) LUT for the range [-8, 0] with 256 entries.
     ///
     /// Used for softmax computation.

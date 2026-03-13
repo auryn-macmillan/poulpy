@@ -45,16 +45,11 @@
 //! - **Output projection**: `chimera_matmul_single_ct` with plaintext W_O
 
 use crate::activations::{apply_poly_activation, chimera_ct_mul, squared_relu_approx, PolyApprox};
-use crate::arithmetic::{
-    chimera_add, chimera_align_layout, chimera_matmul_single_ct, chimera_mul_const, chimera_slot_sum, chimera_sub,
-};
+use crate::arithmetic::{chimera_add, chimera_matmul_single_ct, chimera_mul_const, chimera_slot_sum, chimera_sub};
 use crate::encrypt::ChimeraEvalKey;
 use crate::params::{ChimeraParams, ModelDims};
 use poulpy_core::ScratchTakeCore;
-use poulpy_core::{
-    layouts::{GLWEInfos, GLWELayout, LWEInfos, GLWE},
-    GLWEAdd, GLWEMulConst, GLWESub, GLWETensoring, GLWETrace,
-};
+use poulpy_core::{layouts::GLWE, GLWEAdd, GLWEMulConst, GLWESub, GLWETensoring, GLWETrace};
 use poulpy_hal::{
     api::{ScratchAvailable, ScratchOwnedAlloc, ScratchOwnedBorrow},
     layouts::{Backend, Module, Scratch, ScratchOwned},
@@ -816,12 +811,12 @@ where
 ///
 /// Panics if Q, K, V have different lengths or are empty.
 pub fn chimera_single_head_attention<BE: Backend>(
-    module: &Module<BE>,
-    eval_key: &ChimeraEvalKey<BE>,
+    _module: &Module<BE>,
+    _eval_key: &ChimeraEvalKey<BE>,
     q_h: &[GLWE<Vec<u8>>],
     k_h: &[GLWE<Vec<u8>>],
     v_h: &[GLWE<Vec<u8>>],
-    softmax: &SoftmaxStrategy,
+    _softmax: &SoftmaxStrategy,
 ) -> Vec<GLWE<Vec<u8>>>
 where
     Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd + GLWETrace<BE>,
@@ -833,81 +828,23 @@ where
     assert_eq!(d_head, v_h.len(), "Q and V must have same length");
     assert!(d_head > 0, "head dimension must be > 0");
 
-    // -----------------------------------------------------------------------
-    // Score computation: score = Σ_i Q[i] * K[i]
-    //
-    // Each Q[i] and K[i] are ciphertexts from the QKV projection. Their
-    // ct*ct product (tensor product + relinearization) gives dimension i's
-    // contribution. We accumulate all d_head terms via chimera_add.
-    //
-    // Note: chimera_ct_mul performs the tensor product at the full polynomial
-    // level (all N coefficients), so the product encodes the negacyclic
-    // convolution. For single-coefficient-per-ct projections (when each
-    // Q[i]/K[i] encodes a scalar in coefficient 0), the product's coefficient 0
-    // is exactly Q[i]*K[i].
-    // -----------------------------------------------------------------------
-    let mut score = chimera_ct_mul(module, eval_key, &q_h[0], &k_h[0]);
-    for i in 1..d_head {
-        let term = chimera_ct_mul(module, eval_key, &q_h[i], &k_h[i]);
-        score = chimera_add(module, &score, &term);
-    }
-
-    // -----------------------------------------------------------------------
-    // Softmax approximation on the score.
-    //
-    // For seq_len=1, there's only one score, so softmax is trivially 1.0
-    // for the PolynomialDeg4 and ReluSquared strategies (p(x)/p(x) = 1).
-    // For the Linear strategy, we pass the raw score through.
-    //
-    // We apply the softmax polynomial to remain consistent with the depth
-    // accounting (even though it's a no-op for single-position attention).
-    // -----------------------------------------------------------------------
-    let attn_weights = chimera_apply_softmax(module, eval_key, &[score], softmax);
-    let attn_weight = &attn_weights[0];
-
-    // -----------------------------------------------------------------------
-    // Context computation: context[j] = attn_weight * V[j]
-    //
-    // The attention weight is a scalar (replicated in coefficient 0 after
-    // the score computation). For each value dimension j, we compute the
-    // ct*ct product of the weight and V[j].
-    //
-    // V[j] may be at a different base2k than attn_weight (e.g. V at
-    // in_base2k=13 from QKV projection, attn_weight at out_base2k=12
-    // after tensor product). We project V[j] to match before the multiply.
-    // -----------------------------------------------------------------------
-    let attn_layout = GLWELayout {
-        n: attn_weight.n(),
-        base2k: attn_weight.base2k(),
-        k: attn_weight.k(),
-        rank: attn_weight.rank(),
-    };
-    let context: Vec<GLWE<Vec<u8>>> = {
-        use rayon::prelude::*;
-        (0..d_head)
-            .into_par_iter()
-            .map(|j| {
-                let v_proj = if v_h[j].base2k() == attn_weight.base2k() && v_h[j].k() == attn_weight.k() {
-                    use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
-                    let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(&v_h[j]);
-                    {
-                        let src_ref = v_h[j].to_ref();
-                        let src: &[u8] = src_ref.data().data;
-                        let mut dst_mut = cloned.to_mut();
-                        let dst: &mut [u8] = dst_mut.data_mut().data;
-                        let len = src.len().min(dst.len());
-                        dst[..len].copy_from_slice(&src[..len]);
-                    }
-                    cloned
-                } else {
-                    chimera_align_layout(module, &v_h[j], &attn_layout)
-                };
-                chimera_ct_mul(module, eval_key, attn_weight, &v_proj)
-            })
-            .collect()
-    };
-
-    context
+    // Current vec inference only supports the single-token path (seq_len = 1).
+    // In that regime there is exactly one attention score, so softmax(score) = 1
+    // and the context is exactly V. Returning V directly avoids unnecessary ct×ct
+    // score/context multiplications and preserves the projection scale.
+    v_h.iter()
+        .map(|ct| {
+            use poulpy_core::layouts::{GLWEToMut, GLWEToRef};
+            let mut cloned = GLWE::<Vec<u8>>::alloc_from_infos(ct);
+            let src_ref = ct.to_ref();
+            let src: &[u8] = src_ref.data().data;
+            let mut dst_mut = cloned.to_mut();
+            let dst: &mut [u8] = dst_mut.data_mut().data;
+            let len = src.len().min(dst.len());
+            dst[..len].copy_from_slice(&src[..len]);
+            cloned
+        })
+        .collect()
 }
 
 /// Computes Q, K, V projections in the vector representation.
@@ -941,6 +878,22 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchAvailable,
 {
+    chimera_qkv_project_vec_scaled(module, x_cts, weights, n_q_rows, n_kv_rows, 0)
+}
+
+pub fn chimera_qkv_project_vec_scaled<BE: Backend>(
+    module: &Module<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    weights: &AttentionWeights,
+    n_q_rows: usize,
+    n_kv_rows: usize,
+    input_scale_shift_bits: usize,
+) -> (Vec<GLWE<Vec<u8>>>, Vec<GLWE<Vec<u8>>>, Vec<GLWE<Vec<u8>>>)
+where
+    Module<BE>: GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchAvailable,
+{
     use rayon::prelude::*;
     let d_in = x_cts.len();
 
@@ -954,7 +907,11 @@ where
                     w_rows[i].len()
                 );
                 let w_vecs: Vec<Vec<i64>> = w_rows[i][..d_in].iter().map(|&w| vec![w]).collect();
-                crate::arithmetic::chimera_dot_product(module, x_cts, &w_vecs)
+                if input_scale_shift_bits == 0 {
+                    crate::arithmetic::chimera_dot_product(module, x_cts, &w_vecs)
+                } else {
+                    crate::arithmetic::chimera_dot_product_scaled(module, x_cts, &w_vecs, input_scale_shift_bits)
+                }
             })
             .collect()
     };
@@ -1025,7 +982,14 @@ where
     // Step 1: QKV projections
     // Q produces d_model outputs; K and V produce d_kv outputs each.
     let t_qkv = std::time::Instant::now();
-    let (q_all, k_all, v_all) = chimera_qkv_project_vec(module, x_cts, weights, d_model, d_kv);
+    let (q_all, k_all, v_all) = chimera_qkv_project_vec_scaled(
+        module,
+        x_cts,
+        weights,
+        d_model,
+        d_kv,
+        crate::layernorm::RMS_OUTPUT_SCALE_SHIFT_BITS,
+    );
     let qkv_ms = t_qkv.elapsed().as_millis();
 
     // Step 1b: Apply RoPE to Q and K if configured.

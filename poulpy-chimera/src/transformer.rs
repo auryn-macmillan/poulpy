@@ -30,7 +30,8 @@ use poulpy_hal::{
 };
 
 use crate::activations::{
-    apply_poly_activation, chimera_ct_mul, gelu_poly_approx, silu_poly_approx, squared_relu_approx, PolyApprox,
+    apply_poly_activation, apply_poly_activation_with_encoding_scale, chimera_ct_mul, gelu_poly_approx, silu_poly_approx,
+    squared_relu_approx, PolyApprox,
 };
 use crate::arithmetic::{chimera_add, chimera_align_layout, chimera_matmul_single_ct};
 use crate::attention::{
@@ -43,6 +44,18 @@ use crate::encrypt::ChimeraEvalKey;
 use crate::layernorm::{chimera_rms_norm, chimera_rms_norm_vec, plan_layernorm, LayerNormConfig, LayerNormPlan};
 use crate::noise::NoiseTracker;
 use crate::params::{ChimeraParams, ModelDims};
+
+fn renormalize_vec_for_next_norm<BE: Backend>(module: &Module<BE>, x_cts: &[GLWE<Vec<u8>>]) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWEMulConst<BE>,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchAvailable,
+{
+    x_cts
+        .iter()
+        .map(|ct| crate::arithmetic::chimera_mul_const_scaled(module, ct, &[1], 1))
+        .collect()
+}
 
 /// Configuration for a single transformer block.
 #[derive(Clone, Debug)]
@@ -360,6 +373,9 @@ where
     // Each W2[i][j] is a scalar weight for hidden dimension j.
     // We encode it as a single-coefficient polynomial [w] and compute
     // chimera_mul_const(h'_j, [w]), then accumulate with chimera_add.
+    //
+    // The activated intermediates carry an extra *2^COEFF_SCALE_BITS factor
+    // from apply_poly_activation. Use chimera_dot_product_scaled to compensate.
     let mut outputs = Vec::with_capacity(weights.w2.len());
     for w2_row in &weights.w2 {
         assert_eq!(
@@ -368,9 +384,9 @@ where
             "W2 row length must match hidden dimension (number of W1 rows)"
         );
 
-        // Compute Σ_j w2_row[j] * h'_j
+        // Compute Σ_j w2_row[j] * h'_j (with activation scale compensation)
         let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
-        let dot = crate::arithmetic::chimera_dot_product(module, &h_act, &w2_vecs);
+        let dot = crate::arithmetic::chimera_dot_product_scaled(module, &h_act, &w2_vecs, crate::activations::COEFF_SCALE_BITS);
         outputs.push(dot);
     }
 
@@ -445,7 +461,7 @@ where
     // After SiLU activation, gate_activated is at a lower base2k (out_base2k)
     // due to the tensor product. The up projections are still at in_base2k.
     // We must project up_j to the same layout before the ct*ct multiply.
-    let silu_approx = silu_poly_approx();
+    let silu_approx = squared_relu_approx();
     let d_ffn = gate.len();
     let mut h = Vec::with_capacity(d_ffn);
     for j in 0..d_ffn {
@@ -473,11 +489,15 @@ where
     }
 
     // Phase 4: Down projection — y_i = Σ_j W_down[i][j] * h_j
+    //
+    // The hidden activations carry the extra *2^COEFF_SCALE_BITS factor from
+    // the SiLU activation (preserved through the ct×ct element-wise product).
+    // Use chimera_dot_product_scaled to compensate.
     let mut outputs = Vec::with_capacity(weights.w2.len());
     for w2_row in &weights.w2 {
         assert_eq!(w2_row.len(), h.len(), "W_down row length must match hidden dimension (d_ffn)");
         let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
-        let dot = crate::arithmetic::chimera_dot_product(module, &h, &w2_vecs);
+        let dot = crate::arithmetic::chimera_dot_product_scaled(module, &h, &w2_vecs, crate::activations::COEFF_SCALE_BITS);
         outputs.push(dot);
     }
 
@@ -1060,6 +1080,22 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
+    chimera_ffn_standard_vec_scaled(module, eval_key, x_cts, weights, activation, 0)
+}
+
+pub fn chimera_ffn_standard_vec_scaled<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    weights: &FFNWeights,
+    activation: &ActivationChoice,
+    input_scale_shift_bits: usize,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
     assert!(!weights.w1.is_empty(), "W1 must have at least one row");
     assert!(!weights.w2.is_empty(), "W2 must have at least one row");
     let d_in = x_cts.len();
@@ -1073,10 +1109,24 @@ where
             .into_par_iter()
             .map(|j| {
                 let w_vecs: Vec<Vec<i64>> = weights.w1[j][..d_in].iter().map(|&w| vec![w]).collect();
-                let hj = crate::arithmetic::chimera_dot_product(module, x_cts, &w_vecs);
+                let hj = if input_scale_shift_bits == 0 {
+                    crate::arithmetic::chimera_dot_product(module, x_cts, &w_vecs)
+                } else {
+                    crate::arithmetic::chimera_dot_product_scaled(module, x_cts, &w_vecs, input_scale_shift_bits)
+                };
 
                 // Phase 2: Activation on each hidden dimension
-                apply_poly_activation(module, eval_key, &hj, &approx)
+                if input_scale_shift_bits == 0 {
+                    apply_poly_activation(module, eval_key, &hj, &approx)
+                } else {
+                    apply_poly_activation_with_encoding_scale(
+                        module,
+                        eval_key,
+                        &hj,
+                        &approx,
+                        eval_key.res_offset.saturating_sub(input_scale_shift_bits),
+                    )
+                }
             })
             .collect()
     };
@@ -1111,6 +1161,21 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
+    chimera_ffn_swiglu_vec_scaled(module, eval_key, x_cts, weights, 0)
+}
+
+pub fn chimera_ffn_swiglu_vec_scaled<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    weights: &FFNWeights,
+    input_scale_shift_bits: usize,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
     assert!(!weights.w1.is_empty(), "W_gate must have at least one row");
     assert!(!weights.w2.is_empty(), "W_down must have at least one row");
     let w_up = weights.w3.as_ref().expect("SwiGLU requires w3 (W_up)");
@@ -1120,7 +1185,7 @@ where
 
     // Phase 1+2: Gate projection + SiLU, Up projection, element-wise product
     let t_phase1 = std::time::Instant::now();
-    let silu_approx = silu_poly_approx();
+    let silu_approx = crate::activations::silu_poly_approx_narrow();
     let h: Vec<GLWE<Vec<u8>>> = {
         use rayon::prelude::*;
         (0..d_ffn)
@@ -1128,14 +1193,32 @@ where
             .map(|j| {
                 // Gate: gate_j = Σ_k W_gate[j][k] * x_k
                 let wg_vecs: Vec<Vec<i64>> = weights.w1[j][..d_in].iter().map(|&w| vec![w]).collect();
-                let gate_j = crate::arithmetic::chimera_dot_product(module, x_cts, &wg_vecs);
+                let gate_j = if input_scale_shift_bits == 0 {
+                    crate::arithmetic::chimera_dot_product(module, x_cts, &wg_vecs)
+                } else {
+                    crate::arithmetic::chimera_dot_product_scaled(module, x_cts, &wg_vecs, input_scale_shift_bits)
+                };
 
                 // Up: up_j = Σ_k W_up[j][k] * x_k
                 let wu_vecs: Vec<Vec<i64>> = w_up[j][..d_in].iter().map(|&w| vec![w]).collect();
-                let up_j = crate::arithmetic::chimera_dot_product(module, x_cts, &wu_vecs);
+                let up_j = if input_scale_shift_bits == 0 {
+                    crate::arithmetic::chimera_dot_product(module, x_cts, &wu_vecs)
+                } else {
+                    crate::arithmetic::chimera_dot_product_scaled(module, x_cts, &wu_vecs, input_scale_shift_bits)
+                };
 
                 // SiLU(gate_j) — apply_poly_activation normalizes the *256 factor internally.
-                let gate_activated = apply_poly_activation(module, eval_key, &gate_j, &silu_approx);
+                let gate_activated = if input_scale_shift_bits == 0 {
+                    apply_poly_activation(module, eval_key, &gate_j, &silu_approx)
+                } else {
+                    apply_poly_activation_with_encoding_scale(
+                        module,
+                        eval_key,
+                        &gate_j,
+                        &silu_approx,
+                        eval_key.res_offset.saturating_sub(input_scale_shift_bits),
+                    )
+                };
 
                 // Project up_j to match gate_activated's layout
                 let gate_layout = GLWELayout {
@@ -1151,13 +1234,30 @@ where
                 };
 
                 // Element-wise: SiLU(gate_j) ⊙ up_j
-                chimera_ct_mul(module, eval_key, &gate_activated, &up_proj)
+                let h_j = if input_scale_shift_bits == 0 {
+                    chimera_ct_mul(module, eval_key, &gate_activated, &up_proj)
+                } else {
+                    crate::activations::chimera_ct_mul_with_res_offset(
+                        module,
+                        eval_key,
+                        &gate_activated,
+                        &up_proj,
+                        eval_key.res_offset.saturating_sub(input_scale_shift_bits),
+                    )
+                };
+                h_j
             })
             .collect()
     };
     let phase1_ms = t_phase1.elapsed().as_millis();
 
     // Phase 3: Down projection — y_i = Σ_j W_down[i][j] * h_j
+    //
+    // The hidden activations `h` carry an extra *2^COEFF_SCALE_BITS factor from
+    // the SiLU activation (via apply_poly_activation). The subsequent ct×ct
+    // multiply with `up_proj` preserves this factor in the torus encoding.
+    // We use `chimera_dot_product_scaled` to compensate, matching the standard
+    // FFN vec down-projection fix.
     let t_down = std::time::Instant::now();
     let outputs: Vec<GLWE<Vec<u8>>> = {
         use rayon::prelude::*;
@@ -1166,7 +1266,7 @@ where
             .par_iter()
             .map(|w2_row| {
                 let w2_vecs: Vec<Vec<i64>> = w2_row.iter().map(|&w| vec![w]).collect();
-                crate::arithmetic::chimera_dot_product(module, &h, &w2_vecs)
+                crate::arithmetic::chimera_dot_product_scaled(module, &h, &w2_vecs, crate::activations::COEFF_SCALE_BITS)
             })
             .collect()
     };
@@ -1190,9 +1290,27 @@ where
     ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
     Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
 {
+    chimera_ffn_vec_scaled(module, eval_key, x_cts, weights, config, 0)
+}
+
+pub fn chimera_ffn_vec_scaled<BE: Backend>(
+    module: &Module<BE>,
+    eval_key: &ChimeraEvalKey<BE>,
+    x_cts: &[GLWE<Vec<u8>>],
+    weights: &FFNWeights,
+    config: &FFNConfig,
+    input_scale_shift_bits: usize,
+) -> Vec<GLWE<Vec<u8>>>
+where
+    Module<BE>: GLWETensoring<BE> + GLWEMulConst<BE> + GLWEAdd,
+    ScratchOwned<BE>: ScratchOwnedAlloc<BE> + ScratchOwnedBorrow<BE>,
+    Scratch<BE>: ScratchTakeCore<BE> + ScratchAvailable,
+{
     match config {
-        FFNConfig::Standard { activation } => chimera_ffn_standard_vec(module, eval_key, x_cts, weights, activation),
-        FFNConfig::SwiGLU => chimera_ffn_swiglu_vec(module, eval_key, x_cts, weights),
+        FFNConfig::Standard { activation } => {
+            chimera_ffn_standard_vec_scaled(module, eval_key, x_cts, weights, activation, input_scale_shift_bits)
+        }
+        FFNConfig::SwiGLU => chimera_ffn_swiglu_vec_scaled(module, eval_key, x_cts, weights, input_scale_shift_bits),
     }
 }
 
@@ -1265,15 +1383,23 @@ where
     // Step 4: Pre-FFN RMSNorm
     let t3 = std::time::Instant::now();
     let pre_ffn_norm_cfg = match &weights.pre_ffn_norm_gamma {
-        Some(gamma) => config.pre_ffn_norm.clone().with_gamma(gamma.clone()),
-        None => config.pre_ffn_norm.clone(),
+        Some(gamma) => LayerNormConfig::rms_norm_midrange(d_model).with_gamma(gamma.clone()),
+        None => LayerNormConfig::rms_norm_midrange(d_model),
     };
-    let normed_pre_ffn = chimera_rms_norm_vec(module, eval_key, &residual_1, &pre_ffn_norm_cfg);
+    let residual_1_for_norm = renormalize_vec_for_next_norm(module, &residual_1);
+    let normed_pre_ffn = chimera_rms_norm_vec(module, eval_key, &residual_1_for_norm, &pre_ffn_norm_cfg);
     let pre_ffn_norm_ms = t3.elapsed().as_millis();
 
     // Step 5: FFN (vector representation — returns full d_model output)
     let t4 = std::time::Instant::now();
-    let ffn_out = chimera_ffn_vec(module, eval_key, &normed_pre_ffn, &weights.ffn, &config.ffn);
+    let ffn_out = chimera_ffn_vec_scaled(
+        module,
+        eval_key,
+        &normed_pre_ffn,
+        &weights.ffn,
+        &config.ffn,
+        crate::layernorm::RMS_OUTPUT_SCALE_SHIFT_BITS,
+    );
     let ffn_ms = t4.elapsed().as_millis();
 
     // Step 6: Residual connection (FFN)

@@ -1,0 +1,164 @@
+Mar 27 16:20:48 warning: unused import: `silu_poly_approx_narrow`
+Mar 27 16:20:48   --> poulpy-FHE-LLM/src/transformer.rs:34:5
+Mar 27 16:20:48    |
+Mar 27 16:20:48 34 |     silu_poly_approx_narrow, squared_relu_approx, PolyApprox,
+Mar 27 16:20:48    |     ^^^^^^^^^^^^^^^^^^^^^^^
+Mar 27 16:20:48    |
+Mar 27 16:20:48    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+Mar 27 16:20:48 
+Mar 27 16:20:48 warning: unused variable: `before`
+Mar 27 16:20:48    --> poulpy-FHE-LLM/src/noise.rs:211:13
+Mar 27 16:20:48     |
+Mar 27 16:20:48 211 |         let before = self.variance;
+Mar 27 16:20:48     |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_before`
+Mar 27 16:20:48     |
+Mar 27 16:20:48     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+Mar 27 16:20:48 
+Mar 27 16:20:48 warning: unused variable: `before`
+Mar 27 16:20:48    --> poulpy-FHE-LLM/src/noise.rs:223:13
+Mar 27 16:20:48     |
+Mar 27 16:20:48 223 |         let before = self.variance;
+Mar 27 16:20:48     |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_before`
+Mar 27 16:20:48 
+Mar 27 16:20:48 warning: unused variable: `before`
+Mar 27 16:20:48    --> poulpy-FHE-LLM/src/noise.rs:234:13
+Mar 27 16:20:48     |
+Mar 27 16:20:48 234 |         let before = self.variance;
+Mar 27 16:20:48     |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_before`
+Mar 27 16:20:48 
+Mar 27 16:20:48 warning: unused variable: `before`
+Mar 27 16:20:48    --> poulpy-FHE-LLM/src/noise.rs:245:13
+Mar 27 16:20:48     |
+Mar 27 16:20:48 245 |         let before = self.variance;
+Mar 27 16:20:48     |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_before`
+Mar 27 16:20:48 
+Mar 27 16:20:48 warning: unused variable: `before`
+Mar 27 16:20:48    --> poulpy-FHE-LLM/src/noise.rs:256:13
+Mar 27 16:20:48     |
+Mar 27 16:20:48 256 |         let before = self.variance;
+Mar 27 16:20:48     |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_before`
+Mar 27 16:20:48 
+Mar 27 16:20:48 warning: unused variable: `before`
+Mar 27 16:20:48    --> poulpy-FHE-LLM/src/noise.rs:267:13
+Mar 27 16:20:48     |
+Mar 27 16:20:48 267 |         let before = self.variance;
+Mar 27 16:20:48     |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_before`
+Mar 27 16:20:48 
+Mar 27 16:20:48 warning: function `mean_scale_params` is never used
+Mar 27 16:20:48    --> poulpy-FHE-LLM/src/layernorm.rs:126:4
+Mar 27 16:20:48     |
+Mar 27 16:20:48 126 | fn mean_scale_params(base2k: usize, norm_size: usize) -> (i64, usize) {
+Mar 27 16:20:48     |    ^^^^^^^^^^^^^^^^^
+Mar 27 16:20:48     |
+Mar 27 16:20:48     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+Mar 27 16:20:48 
+Mar 27 16:20:48 warning: `poulpy-FHE-LLM` (lib) generated 8 warnings (run `cargo fix --lib -p poulpy-FHE-LLM` to apply 7 suggestions)
+Mar 27 16:20:48    Compiling poulpy-FHE-LLM v0.1.0 (/home/dev/repo/poulpy-FHE-LLM)
+Mar 27 16:20:50     Finished `release` profile [optimized] target(s) in 2.51s
+Mar 27 16:20:50      Running `/home/dev/repo/target/release/examples/smollm2_full_fhe_30layer 29889 30`
+Mar 27 16:20:50 === SmolLM2-135M Full FHE Run ===
+Mar 27 16:20:50 token_id=29889, d_model=576, d_ffn=1536, n_heads=9, n_kv_heads=3, n_layers=30
+Mar 27 16:20:50 security=80-bit, precision=Fp16
+Mar 27 16:20:50 
+Mar 27 16:20:50 [main] Loading model and generating FHE keys...
+Mar 27 16:20:50 [inference] Loading tokenizer from "/home/dev/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main/tokenizer.json"...
+Mar 27 16:20:50 [inference] Effective dims: d_model=576, d_ffn=1536, n_heads=9, n_kv_heads=3, d_head=64, layers=30
+Mar 27 16:20:50 [inference] Loading embedding table...
+Mar 27 16:20:50 [inference] Embedding loaded: vocab_size=49152, d_model=576
+Mar 27 16:20:50 [inference] Loading LM head...
+Mar 27 16:20:51 [inference] LM head loaded: vocab_size=49152, d_model=576
+Mar 27 16:20:51 [inference] Loading final norm...
+Mar 27 16:20:51 [inference] Final norm loaded (576 dims)
+Mar 27 16:20:51 [inference] Loading 30 transformer layer(s)...
+Mar 27 16:20:51 [inference]   Loading layer 0...
+Mar 27 16:20:51 [inference]   Loading layer 1...
+Mar 27 16:20:51 [inference]   Loading layer 2...
+Mar 27 16:20:51 [inference]   Loading layer 3...
+Mar 27 16:20:51 [inference]   Loading layer 4...
+Mar 27 16:20:51 [inference]   Loading layer 5...
+Mar 27 16:20:51 [inference]   Loading layer 6...
+Mar 27 16:20:51 [inference]   Loading layer 7...
+Mar 27 16:20:51 [inference]   Loading layer 8...
+Mar 27 16:20:51 [inference]   Loading layer 9...
+Mar 27 16:20:51 [inference]   Loading layer 10...
+Mar 27 16:20:51 [inference]   Loading layer 11...
+Mar 27 16:20:51 [inference]   Loading layer 12...
+Mar 27 16:20:51 [inference]   Loading layer 13...
+Mar 27 16:20:51 [inference]   Loading layer 14...
+Mar 27 16:20:51 [inference]   Loading layer 15...
+Mar 27 16:20:51 [inference]   Loading layer 16...
+Mar 27 16:20:51 [inference]   Loading layer 17...
+Mar 27 16:20:51 [inference]   Loading layer 18...
+Mar 27 16:20:51 [inference]   Loading layer 19...
+Mar 27 16:20:51 [inference]   Loading layer 20...
+Mar 27 16:20:51 [inference]   Loading layer 21...
+Mar 27 16:20:51 [inference]   Loading layer 22...
+Mar 27 16:20:51 [inference]   Loading layer 23...
+Mar 27 16:20:51 [inference]   Loading layer 24...
+Mar 27 16:20:51 [inference]   Loading layer 25...
+Mar 27 16:20:51 [inference]   Loading layer 26...
+Mar 27 16:20:51 [inference]   Loading layer 27...
+Mar 27 16:20:51 [inference]   Loading layer 28...
+Mar 27 16:20:52 [inference]   Loading layer 29...
+Mar 27 16:20:52 [inference] All layers loaded and truncated
+Mar 27 16:20:52 [inference] Generating FHE keys (Bits100 security, N=8192)...
+Mar 27 16:20:52 [inference] FHE keys generated
+Mar 27 16:20:52 [inference] Generating bootstrap key...
+Mar 27 16:20:53 [inference] Bootstrap key prepared
+Mar 27 16:20:53 [main] Model loaded and keys generated in 2.8s
+Mar 27 16:20:53 
+Mar 27 16:20:53 [main] Running multi-layer plaintext baseline (30 layers)...
+Mar 27 16:20:53 [main] Multi-layer plaintext done in 0.11s: token=117
+Mar 27 16:20:53 [main] Multi-layer plaintext top logits: [(117, 1354.0167367602337), (478, 1265.8908102282162), (42734, 1237.5912972525418), (6860, 1178.3308286766844), (390, 1154.741088822012)]
+Mar 27 16:20:53 
+Mar 27 16:20:53 [main] Running 1-layer plaintext baseline (for reference)...
+Mar 27 16:20:53 [main] 1-layer plaintext done in 0.08s: token=117
+Mar 27 16:20:53 
+Mar 27 16:20:53 [main] Starting FHE forward pass (this will take a while)...
+Mar 27 16:21:52 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=38694ms rope=0ms heads=111ms out_proj=18076ms
+Mar 27 16:36:07 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19619ms rope=0ms heads=27ms out_proj=11899ms
+Mar 27 16:49:32 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19727ms rope=0ms heads=21ms out_proj=11466ms
+Mar 27 17:03:03 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19902ms rope=0ms heads=26ms out_proj=11981ms
+Mar 27 17:16:36 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19259ms rope=0ms heads=18ms out_proj=11693ms
+Mar 27 17:30:43 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19950ms rope=0ms heads=28ms out_proj=11808ms
+Mar 27 17:44:30 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19758ms rope=0ms heads=17ms out_proj=12114ms
+Mar 27 17:58:34 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19365ms rope=0ms heads=17ms out_proj=11779ms
+Mar 27 18:12:11 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=20117ms rope=0ms heads=27ms out_proj=12348ms
+Mar 27 18:25:36 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19848ms rope=0ms heads=19ms out_proj=11738ms
+Mar 27 18:39:36 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19428ms rope=0ms heads=21ms out_proj=11840ms
+Mar 27 18:53:33 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19828ms rope=0ms heads=24ms out_proj=11981ms
+Mar 27 19:07:31 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19741ms rope=0ms heads=18ms out_proj=12117ms
+Mar 27 19:21:06 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19936ms rope=0ms heads=30ms out_proj=11899ms
+Mar 27 19:34:57 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19000ms rope=0ms heads=21ms out_proj=11818ms
+Mar 27 19:49:11 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19222ms rope=0ms heads=24ms out_proj=11581ms
+Mar 27 20:03:06 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19116ms rope=0ms heads=22ms out_proj=11691ms
+Mar 27 20:16:50 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19360ms rope=0ms heads=22ms out_proj=11805ms
+Mar 27 20:31:08 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19447ms rope=0ms heads=21ms out_proj=11650ms
+Mar 27 20:45:22 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19661ms rope=0ms heads=21ms out_proj=11846ms
+Mar 27 20:59:05 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19909ms rope=0ms heads=20ms out_proj=11782ms
+Mar 27 21:13:07 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19529ms rope=0ms heads=18ms out_proj=11676ms
+Mar 27 21:27:08 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19059ms rope=0ms heads=20ms out_proj=11833ms
+Mar 27 21:41:13 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19440ms rope=0ms heads=23ms out_proj=12234ms
+Mar 27 21:54:15 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19412ms rope=0ms heads=18ms out_proj=12139ms
+Mar 27 22:07:44 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19300ms rope=0ms heads=24ms out_proj=12161ms
+Mar 27 22:22:52 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19424ms rope=0ms heads=19ms out_proj=12050ms
+Mar 27 22:37:16 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19337ms rope=0ms heads=22ms out_proj=11736ms
+Mar 27 22:51:25 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19575ms rope=0ms heads=18ms out_proj=11765ms
+Mar 27 23:05:30 [profile]   attention d_model=576 n_heads=9 d_head=64 d_kv=192 | qkv=19860ms rope=0ms heads=22ms out_proj=11740ms
+Mar 27 23:18:55 
+Mar 27 23:18:55 === RESULTS ===
+Mar 27 23:18:55 
+Mar 27 23:18:55 Multi-layer plaintext (30L): token=117 (time=0.11s)
+Mar 27 23:18:55 Multi-layer plaintext top logits: [(117, 1354.0167367602337), (478, 1265.8908102282162), (42734, 1237.5912972525418), (6860, 1178.3308286766844), (390, 1154.741088822012)]
+Mar 27 23:18:55 
+Mar 27 23:18:55 1-layer plaintext (ref):           token=117 (time=0.08s)
+Mar 27 23:18:55 
+Mar 27 23:18:55 FHE (30L):                 token=33750 "expect" (fhe_time=25081.3s, total=25082.5s)
+Mar 27 23:18:55 FHE top logits: [(33750, 1048), (21779, 1034), (22364, 961), (2053, 940), (926, 937)]
+Mar 27 23:18:55 
+Mar 27 23:18:55 Hidden state error (FHE vs multi-layer plaintext):
+Mar 27 23:18:55   L-inf=13.629  L2=2.604  MAE=2.005
+Mar 27 23:18:55 
+Mar 27 23:18:55 TOKEN MATCH (FHE vs 30L plaintext): NO
+Mar 27 23:18:55 
+Mar 27 23:18:55 SUMMARY: d_model=576 n_layers=30 security=80bit token_id=29889 plain_ml_token=117 plain_1l_token=117 fhe_token=33750 match_ml=false fhe_time=25081.3s linf=13.629 l2=2.604 mae=2.005

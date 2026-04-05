@@ -1,0 +1,69 @@
+   Compiling poulpy-FHE-LLM v0.1.0 (/home/dev/repo/poulpy-FHE-LLM)
+warning: unused import: `silu_poly_approx_narrow`
+  --> poulpy-FHE-LLM/src/transformer.rs:34:5
+   |
+34 |     silu_poly_approx_narrow, squared_relu_approx, PolyApprox,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `before`
+   --> poulpy-FHE-LLM/src/noise.rs:211:13
+    |
+211 |         let before = self.variance;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_before`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `before`
+   --> poulpy-FHE-LLM/src/noise.rs:223:13
+    |
+223 |         let before = self.variance;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_before`
+
+warning: unused variable: `before`
+   --> poulpy-FHE-LLM/src/noise.rs:234:13
+    |
+234 |         let before = self.variance;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_before`
+
+warning: unused variable: `before`
+   --> poulpy-FHE-LLM/src/noise.rs:245:13
+    |
+245 |         let before = self.variance;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_before`
+
+warning: unused variable: `before`
+   --> poulpy-FHE-LLM/src/noise.rs:256:13
+    |
+256 |         let before = self.variance;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_before`
+
+warning: unused variable: `before`
+   --> poulpy-FHE-LLM/src/noise.rs:267:13
+    |
+267 |         let before = self.variance;
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_before`
+
+warning: function `mean_scale_params` is never used
+   --> poulpy-FHE-LLM/src/layernorm.rs:126:4
+    |
+126 | fn mean_scale_params(base2k: usize, norm_size: usize) -> (i64, usize) {
+    |    ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `poulpy-FHE-LLM` (lib) generated 8 warnings (run `cargo fix --lib -p poulpy-FHE-LLM` to apply 7 suggestions)
+    Finished `release` profile [optimized] target(s) in 8.35s
+     Running `/home/dev/repo/target/release/examples/smollm2_full_fhe_30layer`
+=== SmolLM2-135M Full FHE Run ===
+token_id=29889, d_model=576, d_ffn=1536, n_heads=9, n_kv_heads=3, n_layers=30
+security=80-bit, precision=INT8
+
+[main] Loading model and generating FHE keys...
+[inference] Loading tokenizer from "/home/dev/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main/tokenizer.json"...
+[inference] Effective dims: d_model=576, d_ffn=1536, n_heads=9, n_kv_heads=3, d_head=64, layers=30
+[inference] Loading embedding table...
+[inference] Embedding loaded: vocab_size=49152, d_model=576
+[inference] Loading LM head...
+error: model load error: missing tensor: lm_head.weight

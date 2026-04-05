@@ -10,6 +10,7 @@ documentation = "https://docs.rs/poulpy"
 
 [features]
 enable-avx = ["dep:poulpy-cpu-avx"]
+cpu-ref = ["dep:poulpy-cpu-ref"]
 default = ["dep:poulpy-cpu-ref"]
 
 [dependencies]

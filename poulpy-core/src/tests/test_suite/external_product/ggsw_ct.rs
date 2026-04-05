@@ -6,13 +6,13 @@ use poulpy_hal::{
 };
 
 use crate::{
-    GGSWEncryptSk, GGSWExternalProduct, GGSWNoise, ScratchTakeCore,
     encryption::SIGMA,
     layouts::{
-        GGSW, GGSWInfos, GGSWLayout, GGSWPreparedFactory, GLWEInfos, GLWESecret, GLWESecretPreparedFactory,
         prepared::{GGSWPrepared, GLWESecretPrepared},
+        GGSWInfos, GGSWLayout, GGSWPreparedFactory, GLWEInfos, GLWESecret, GLWESecretPreparedFactory, GGSW,
     },
     noise::noise_ggsw_product,
+    GGSWEncryptSk, GGSWExternalProduct, GGSWNoise, ScratchTakeCore,
 };
 
 #[allow(clippy::too_many_arguments)]

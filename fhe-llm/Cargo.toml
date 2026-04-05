@@ -1,0 +1,38 @@
+[package]
+name = "fhe-llm"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+readme = "README.md"
+description = "FHE_LLM: inference-optimised FHE scheme for transformer neural networks, built on poulpy"
+repository = "https://github.com/phantomzone-org/poulpy"
+homepage = "https://github.com/phantomzone-org/poulpy"
+documentation = "https://docs.rs/fhe-llm"
+
+[features]
+enable-avx = []
+
+[dependencies]
+poulpy-cpu-avx = {workspace = true}
+poulpy-cpu-ref = {workspace = true}
+poulpy-hal = {workspace = true}
+poulpy-core = {workspace = true}
+poulpy-schemes = {workspace = true}
+rand = {workspace = true}
+itertools = {workspace = true}
+byteorder = {workspace = true}
+bytemuck = {workspace = true}
+paste = {workspace = true}
+safetensors = {workspace = true}
+memmap2 = {workspace = true}
+half = {workspace = true}
+tokenizers = {workspace = true}
+rayon = {workspace = true}
+serde_json = {workspace = true}
+
+[dev-dependencies]
+criterion = {workspace = true}
+
+[[bench]]
+name = "FHE_LLM_ops"
+harness = false

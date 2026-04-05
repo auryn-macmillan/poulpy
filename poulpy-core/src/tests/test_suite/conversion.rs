@@ -7,14 +7,14 @@ use poulpy_hal::{
 use rug::Float;
 
 use crate::{
-    GLWEDecrypt, GLWEEncryptSk, GLWEFromLWE, GLWENoise, GLWENormalize, GLWEToLWESwitchingKeyEncryptSk, LWEDecrypt, LWEEncryptSk,
-    LWEFromGLWE, LWEToGLWESwitchingKeyEncryptSk, SIGMA, ScratchTakeCore,
     layouts::{
-        Base2K, Degree, Dnum, GLWE, GLWELayout, GLWEPlaintext, GLWESecret, GLWESecretPreparedFactory, GLWEToLWEKey,
-        GLWEToLWEKeyLayout, GLWEToLWEKeyPrepared, GLWEToLWEKeyPreparedFactory, LWE, LWEInfos, LWELayout, LWEPlaintext, LWESecret,
-        LWEToGLWEKey, LWEToGLWEKeyLayout, LWEToGLWEKeyPrepared, LWEToGLWEKeyPreparedFactory, Rank, TorusPrecision,
-        prepared::GLWESecretPrepared,
+        prepared::GLWESecretPrepared, Base2K, Degree, Dnum, GLWELayout, GLWEPlaintext, GLWESecret, GLWESecretPreparedFactory,
+        GLWEToLWEKey, GLWEToLWEKeyLayout, GLWEToLWEKeyPrepared, GLWEToLWEKeyPreparedFactory, LWEInfos, LWELayout, LWEPlaintext,
+        LWESecret, LWEToGLWEKey, LWEToGLWEKeyLayout, LWEToGLWEKeyPrepared, LWEToGLWEKeyPreparedFactory, Rank, TorusPrecision,
+        GLWE, LWE,
     },
+    GLWEDecrypt, GLWEEncryptSk, GLWEFromLWE, GLWENoise, GLWENormalize, GLWEToLWESwitchingKeyEncryptSk, LWEDecrypt, LWEEncryptSk,
+    LWEFromGLWE, LWEToGLWESwitchingKeyEncryptSk, ScratchTakeCore, SIGMA,
 };
 
 pub fn test_glwe_base2k_conversion<BE: Backend>(params: &TestParams, module: &Module<BE>)

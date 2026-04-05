@@ -1,8 +1,8 @@
-# CHIMERA: Ciphertext Homomorphic Inference with Minimised Encryption for Robust AI
+# FHE_LLM: Ciphertext Homomorphic Inference with Minimised Encryption for Robust AI
 
 ## 1. Overview
 
-CHIMERA is an RLWE-based approximate-arithmetic FHE scheme purpose-built for
+FHE_LLM is an RLWE-based approximate-arithmetic FHE scheme purpose-built for
 transformer neural network inference. It is implemented as a specialisation on top
 of [Poulpy](https://github.com/phantomzone-org/poulpy)'s hardware abstraction
 layer and cryptographic core, inheriting its bivariate polynomial representation,
@@ -11,7 +11,7 @@ backend portability, and scratch-based allocation model.
 ### Design Philosophy
 
 Where CKKS was designed as a general-purpose approximate arithmetic scheme and then
-adapted to ML, CHIMERA is co-designed with the specific arithmetic of quantised
+adapted to ML, FHE_LLM is co-designed with the specific arithmetic of quantised
 transformer inference:
 
 - **Native low-precision fields.** Prime field and noise parameters sized for INT8
@@ -27,7 +27,7 @@ transformer inference:
 
 ### 2.1 Ring and Field Parameters
 
-CHIMERA operates over the polynomial ring R_q = Z_q[X]/(X^N + 1) where:
+FHE_LLM operates over the polynomial ring R_q = Z_q[X]/(X^N + 1) where:
 
 - **N** (ring degree): power of two, selected per security level and circuit depth
 - **q** (ciphertext modulus): product of small primes in the RNS chain, or
@@ -52,7 +52,7 @@ depth for a complete forward pass without bootstrapping.
 
 ### 2.2 Plaintext Encoding
 
-CHIMERA supports two encoding modes:
+FHE_LLM supports two encoding modes:
 
 1. **INT8 coefficient encoding**: Each polynomial coefficient encodes an 8-bit signed
    integer scaled to the upper bits of the torus. N slots per ciphertext, packed to
@@ -139,7 +139,7 @@ is achievable with the 128-bit parameter set.
 
 ### 2.6 Nonlinearity Evaluation
 
-CHIMERA provides two mechanisms for evaluating nonlinear functions:
+FHE_LLM provides two mechanisms for evaluating nonlinear functions:
 
 #### Polynomial Approximation
 
@@ -158,7 +158,7 @@ This requires degree-4 polynomial evaluation plus a reciprocal approximation
 
 #### LUT-Based Evaluation
 
-For higher accuracy, CHIMERA can use Poulpy's blind rotation infrastructure
+For higher accuracy, FHE_LLM can use Poulpy's blind rotation infrastructure
 to evaluate nonlinearities via lookup tables. This is more expensive but exact
 for the discretised input range:
 
@@ -176,7 +176,7 @@ while the rest of the block remains polynomial/linear.
 ### 2.7 LayerNorm Approximation
 
 LayerNorm requires computing mean and inverse square root, both problematic
-under FHE. CHIMERA uses:
+under FHE. FHE_LLM uses:
 
 1. **Mean computation**: Sum all slots via rotation-and-add (log₂(N) rotations),
    divide by N (multiply by 1/N constant).
@@ -187,7 +187,7 @@ under FHE. CHIMERA uses:
 Alternative: Replace LayerNorm with RMSNorm (no mean subtraction needed),
 reducing the computation by ~30%.
 
-The deployed CHIMERA inference path uses RMSNorm throughout. The first block
+The deployed FHE_LLM inference path uses RMSNorm throughout. The first block
 norm uses the narrow-range approximation, while the refreshed pre-FFN norm uses
 a wider midrange inverse-sqrt fit after the residual is re-encoded into the
 effective INT8 domain.
@@ -261,23 +261,23 @@ For MoE layers, the routing is:
 
 ### 4.1 Hardness Assumption
 
-CHIMERA's security reduces to the Ring-LWE (RLWE) problem over the cyclotomic
+FHE_LLM's security reduces to the Ring-LWE (RLWE) problem over the cyclotomic
 ring Z[X]/(X^N + 1), the same assumption underlying CKKS, BGV, and BFV.
 
 ### 4.2 Security Levels
 
 | Parameter Set | N     | log₂(q) | Security (classical) | Security (quantum) |
 |---------------|-------|----------|----------------------|--------------------|
-| CHIMERA-80    | 4096  | 54       | ~97 bits             | ~80 bits           |
-| CHIMERA-100   | 8192  | 54       | ~139 bits            | ~100 bits          |
-| CHIMERA-128   | 16384 | 54       | ~173 bits            | ~128 bits          |
+| FHE_LLM-80    | 4096  | 54       | ~97 bits             | ~80 bits           |
+| FHE_LLM-100   | 8192  | 54       | ~139 bits            | ~100 bits          |
+| FHE_LLM-128   | 16384 | 54       | ~173 bits            | ~128 bits          |
 
 Security estimates follow the Homomorphic Encryption Standard (2018) methodology,
 using the lattice estimator with BKZ-β block size analysis.
 
 ### 4.3 Approximate FHE Error Model
 
-CHIMERA intentionally introduces bounded rounding errors during rescaling.
+FHE_LLM intentionally introduces bounded rounding errors during rescaling.
 These errors are:
 - Bounded by 2^(-p) where p is the plaintext precision (8-16 bits)
 - Statistically indistinguishable from quantisation noise already present in
@@ -289,17 +289,17 @@ affects the correctness guarantee, which is acceptable for inference.
 
 ### 4.4 Recommendation
 
-For the target inference use case, **CHIMERA-128** (128-bit post-quantum security)
-is recommended. The performance overhead vs CHIMERA-100 is moderate (~2x for
+For the target inference use case, **FHE_LLM-128** (128-bit post-quantum security)
+is recommended. The performance overhead vs FHE_LLM-100 is moderate (~2x for
 ciphertext operations due to doubled N), and 128-bit security provides a
 comfortable margin against future cryptanalytic advances.
 
 For latency-critical applications where the threat model does not include
-quantum adversaries, CHIMERA-100 offers a good balance.
+quantum adversaries, FHE_LLM-100 offers a good balance.
 
 ## 5. Comparison with CKKS
 
-| Property                  | CKKS (HEaaN/SEAL)       | CHIMERA                      |
+| Property                  | CKKS (HEaaN/SEAL)       | FHE_LLM                      |
 |---------------------------|--------------------------|------------------------------|
 | Coefficient precision     | 50-60 bits               | 14-27 bits (co-designed)     |
 | Rescaling                 | RNS prime drop           | Bit-shift (Poulpy bivariate) |
@@ -366,7 +366,7 @@ The polynomial variant is preferred for FHE as it avoids branching.
 ### Q4: Packing granularity?
 
 Head-level packing is optimal for attention computation. Embedding-level
-packing is optimal for FFN layers. CHIMERA switches between packing modes
+packing is optimal for FFN layers. FHE_LLM switches between packing modes
 at layer boundaries using rotation keys, amortising the cost.
 
 ### Q5: Fixed architecture optimisations?
@@ -380,7 +380,7 @@ Yes, significantly. Knowing the exact depth allows:
 ### Q6: MoE FHE optimisations?
 
 The sparse activation pattern means only k out of E experts are evaluated.
-Under CHIMERA's expert-aligned packing, inactive experts are simply not
+Under FHE_LLM's expert-aligned packing, inactive experts are simply not
 computed, giving a direct k/E cost reduction. The effective circuit depth
 is that of a single expert path, not the full MoE block.
 

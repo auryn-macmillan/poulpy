@@ -6,14 +6,14 @@ use poulpy_hal::{
 };
 
 use crate::{
-    GGLWEExternalProduct, GGLWENoise, GGSWEncryptSk, GLWESwitchingKeyEncryptSk, ScratchTakeCore,
     encryption::SIGMA,
     layouts::{
-        GGLWEInfos, GGSW, GGSWLayout, GGSWPreparedFactory, GLWESecret, GLWESecretPreparedFactory, GLWESwitchingKey,
-        GLWESwitchingKeyLayout,
         prepared::{GGSWPrepared, GLWESecretPrepared},
+        GGLWEInfos, GGSWLayout, GGSWPreparedFactory, GLWESecret, GLWESecretPreparedFactory, GLWESwitchingKey,
+        GLWESwitchingKeyLayout, GGSW,
     },
     noise::noise_ggsw_product,
+    GGLWEExternalProduct, GGLWENoise, GGSWEncryptSk, GLWESwitchingKeyEncryptSk, ScratchTakeCore,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -126,7 +126,8 @@ where
                 ct_gglwe_out.external_product(module, &ct_gglwe_in, &ct_rgsw_prepared, scratch.borrow());
 
                 (0..rank_in).for_each(|i| {
-                    module.vec_znx_rotate_inplace(r as i64, &mut sk_in.data.as_vec_znx_mut(), i, scratch.borrow()); // * X^{r}
+                    module.vec_znx_rotate_inplace(r as i64, &mut sk_in.data.as_vec_znx_mut(), i, scratch.borrow());
+                    // * X^{r}
                 });
 
                 let var_gct_err_lhs: f64 = SIGMA * SIGMA;
@@ -263,7 +264,8 @@ where
                 ct_gglwe.external_product_inplace(module, &ct_rgsw_prepared, scratch.borrow());
 
                 (0..rank_in).for_each(|i| {
-                    module.vec_znx_rotate_inplace(r as i64, &mut sk_in.data.as_vec_znx_mut(), i, scratch.borrow()); // * X^{r}
+                    module.vec_znx_rotate_inplace(r as i64, &mut sk_in.data.as_vec_znx_mut(), i, scratch.borrow());
+                    // * X^{r}
                 });
 
                 let var_gct_err_lhs: f64 = SIGMA * SIGMA;

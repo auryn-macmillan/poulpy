@@ -6,14 +6,14 @@ use poulpy_hal::{
 };
 
 use crate::{
-    GLWEEncryptSk, GLWEKeyswitch, GLWENoise, GLWENormalize, GLWESwitchingKeyEncryptSk, ScratchTakeCore,
     encryption::SIGMA,
     layouts::{
-        GLWE, GLWELayout, GLWEPlaintext, GLWESecret, GLWESecretPreparedFactory, GLWESwitchingKey, GLWESwitchingKeyLayout,
-        GLWESwitchingKeyPreparedFactory, LWEInfos,
         prepared::{GLWESecretPrepared, GLWESwitchingKeyPrepared},
+        GLWELayout, GLWEPlaintext, GLWESecret, GLWESecretPreparedFactory, GLWESwitchingKey, GLWESwitchingKeyLayout,
+        GLWESwitchingKeyPreparedFactory, LWEInfos, GLWE,
     },
-    var_noise_gglwe_product_v2,
+    var_noise_gglwe_product_v2, GLWEEncryptSk, GLWEKeyswitch, GLWENoise, GLWENormalize, GLWESwitchingKeyEncryptSk,
+    ScratchTakeCore,
 };
 
 #[allow(clippy::too_many_arguments)]

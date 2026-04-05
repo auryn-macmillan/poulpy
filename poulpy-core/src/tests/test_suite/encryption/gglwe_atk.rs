@@ -6,15 +6,15 @@ use poulpy_hal::{
 };
 
 use crate::{
-    GGLWEKeyswitch, GLWEAutomorphismKeyCompressedEncryptSk, GLWEAutomorphismKeyEncryptSk, GLWESwitchingKeyCompressedEncryptSk,
-    GLWESwitchingKeyEncryptSk, ScratchTakeCore,
     encryption::SIGMA,
     layouts::{
-        GGLWEInfos, GLWEAutomorphismKey, GLWEAutomorphismKeyDecompress, GLWEAutomorphismKeyLayout, GLWEInfos, GLWESecret,
-        GLWESecretPreparedFactory, GLWESwitchingKeyDecompress, LWEInfos, compressed::GLWEAutomorphismKeyCompressed,
-        prepared::GLWESecretPrepared,
+        compressed::GLWEAutomorphismKeyCompressed, prepared::GLWESecretPrepared, GGLWEInfos, GLWEAutomorphismKey,
+        GLWEAutomorphismKeyDecompress, GLWEAutomorphismKeyLayout, GLWEInfos, GLWESecret, GLWESecretPreparedFactory,
+        GLWESwitchingKeyDecompress, LWEInfos,
     },
     noise::GGLWENoise,
+    GGLWEKeyswitch, GLWEAutomorphismKeyCompressedEncryptSk, GLWEAutomorphismKeyEncryptSk, GLWESwitchingKeyCompressedEncryptSk,
+    GLWESwitchingKeyEncryptSk, ScratchTakeCore,
 };
 
 pub fn test_gglwe_automorphism_key_encrypt_sk<BE: Backend>(params: &TestParams, module: &Module<BE>)

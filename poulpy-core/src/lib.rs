@@ -64,6 +64,7 @@
 //! | scratch | Arena-style scratch allocation for ciphertext temporaries |
 
 mod automorphism;
+mod backend;
 mod conversion;
 mod decryption;
 mod dist;

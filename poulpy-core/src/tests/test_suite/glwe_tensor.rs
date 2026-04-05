@@ -5,19 +5,19 @@ use poulpy_hal::{
     },
     layouts::{Backend, FillUniform, Module, Scratch, ScratchOwned, VecZnx, ZnxViewMut},
     source::Source,
-    test_suite::TestParams,
     test_suite::convolution::bivariate_convolution_naive,
+    test_suite::TestParams,
 };
 use rand::Rng;
 use std::f64::consts::SQRT_2;
 
 use crate::{
-    GLWEDecrypt, GLWEEncryptSk, GLWEMulConst, GLWEMulPlain, GLWESub, GLWETensorKeyEncryptSk, GLWETensoring, ScratchTakeCore,
     layouts::{
-        Dsize, GLWE, GLWELayout, GLWEPlaintext, GLWESecret, GLWESecretPreparedFactory, GLWESecretTensor, GLWESecretTensorFactory,
-        GLWESecretTensorPrepared, GLWETensor, GLWETensorKey, GLWETensorKeyLayout, GLWETensorKeyPrepared,
-        GLWETensorKeyPreparedFactory, LWEInfos, TorusPrecision, prepared::GLWESecretPrepared,
+        prepared::GLWESecretPrepared, Dsize, GLWELayout, GLWEPlaintext, GLWESecret, GLWESecretPreparedFactory, GLWESecretTensor,
+        GLWESecretTensorFactory, GLWESecretTensorPrepared, GLWETensor, GLWETensorKey, GLWETensorKeyLayout, GLWETensorKeyPrepared,
+        GLWETensorKeyPreparedFactory, LWEInfos, TorusPrecision, GLWE,
     },
+    GLWEDecrypt, GLWEEncryptSk, GLWEMulConst, GLWEMulPlain, GLWESub, GLWETensorKeyEncryptSk, GLWETensoring, ScratchTakeCore,
 };
 
 pub fn test_glwe_tensoring<BE: Backend>(params: &TestParams, module: &Module<BE>)

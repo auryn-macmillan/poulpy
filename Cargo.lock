@@ -380,6 +380,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 
 [[package]]
+name = "fhe-llm"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "byteorder",
+ "criterion",
+ "half",
+ "itertools 0.14.0",
+ "memmap2",
+ "paste",
+ "poulpy-core",
+ "poulpy-cpu-avx",
+ "poulpy-cpu-ref",
+ "poulpy-hal",
+ "poulpy-schemes",
+ "rand 0.10.0",
+ "rayon",
+ "safetensors",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -701,28 +724,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
 dependencies = [
  "plotters-backend",
-]
-
-[[package]]
-name = "poulpy-chimera"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "byteorder",
- "criterion",
- "half",
- "itertools 0.14.0",
- "memmap2",
- "paste",
- "poulpy-core",
- "poulpy-cpu-avx",
- "poulpy-cpu-ref",
- "poulpy-hal",
- "poulpy-schemes",
- "rand 0.10.0",
- "rayon",
- "safetensors",
- "tokenizers",
 ]
 
 [[package]]

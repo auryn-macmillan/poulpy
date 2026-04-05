@@ -6,14 +6,13 @@ use poulpy_hal::{
 };
 
 use crate::{
-    GGLWENoise, GLWEAutomorphismKeyAutomorphism, GLWEAutomorphismKeyEncryptSk, ScratchTakeCore,
     encryption::SIGMA,
     layouts::{
+        prepared::{GLWEAutomorphismKeyPrepared, GLWESecretPrepared},
         GGLWEInfos, GLWEAutomorphismKey, GLWEAutomorphismKeyLayout, GLWEAutomorphismKeyPreparedFactory, GLWEInfos, GLWESecret,
         GLWESecretPreparedFactory,
-        prepared::{GLWEAutomorphismKeyPrepared, GLWESecretPrepared},
     },
-    var_noise_gglwe_product_v2,
+    var_noise_gglwe_product_v2, GGLWENoise, GLWEAutomorphismKeyAutomorphism, GLWEAutomorphismKeyEncryptSk, ScratchTakeCore,
 };
 
 #[allow(clippy::too_many_arguments)]

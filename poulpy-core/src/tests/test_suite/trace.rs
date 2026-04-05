@@ -8,15 +8,15 @@ use poulpy_hal::{
 };
 
 use crate::{
-    GLWEAutomorphismKeyEncryptSk, GLWEDecrypt, GLWEEncryptSk, ScratchTakeCore,
     encryption::SIGMA,
     glwe_trace::GLWETrace,
     layouts::{
-        GLWE, GLWEAutomorphismKey, GLWEAutomorphismKeyLayout, GLWEAutomorphismKeyPreparedFactory, GLWELayout, GLWEPlaintext,
-        GLWESecret, GLWESecretPreparedFactory, LWEInfos,
         prepared::{GLWEAutomorphismKeyPrepared, GLWESecretPrepared},
+        GLWEAutomorphismKey, GLWEAutomorphismKeyLayout, GLWEAutomorphismKeyPreparedFactory, GLWELayout, GLWEPlaintext,
+        GLWESecret, GLWESecretPreparedFactory, LWEInfos, GLWE,
     },
     noise::var_noise_gglwe_product,
+    GLWEAutomorphismKeyEncryptSk, GLWEDecrypt, GLWEEncryptSk, ScratchTakeCore,
 };
 
 pub fn test_glwe_trace_inplace<BE: Backend>(params: &TestParams, module: &Module<BE>)

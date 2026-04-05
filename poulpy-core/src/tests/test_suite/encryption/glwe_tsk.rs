@@ -6,13 +6,13 @@ use poulpy_hal::{
 };
 
 use crate::{
-    GGLWENoise, GLWETensorKeyCompressedEncryptSk, GLWETensorKeyEncryptSk, ScratchTakeCore,
     decryption::GLWEDecrypt,
     encryption::SIGMA,
     layouts::{
-        Dsize, GGLWEDecompress, GGLWEInfos, GLWESecret, GLWESecretPreparedFactory, GLWESecretTensor, GLWESecretTensorFactory,
-        GLWETensorKey, GLWETensorKeyCompressed, GLWETensorKeyLayout, LWEInfos, prepared::GLWESecretPrepared,
+        prepared::GLWESecretPrepared, Dsize, GGLWEDecompress, GGLWEInfos, GLWESecret, GLWESecretPreparedFactory,
+        GLWESecretTensor, GLWESecretTensorFactory, GLWETensorKey, GLWETensorKeyCompressed, GLWETensorKeyLayout, LWEInfos,
     },
+    GGLWENoise, GLWETensorKeyCompressedEncryptSk, GLWETensorKeyEncryptSk, ScratchTakeCore,
 };
 
 pub fn test_gglwe_tensor_key_encrypt_sk<BE: Backend>(params: &TestParams, module: &Module<BE>)

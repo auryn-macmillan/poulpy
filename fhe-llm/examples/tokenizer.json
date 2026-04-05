@@ -1,0 +1,19 @@
+{
+  "model_type": "gpt2",
+  "vocab": {
+    "<token_0>": 0,
+    "<token_1>": 1,
+    "<token_2>": 2,
+    "<token_3>": 3,
+    "<token_4>": 4,
+    "<token_5>": 5,
+    "<token_6>": 6,
+    "<token_7>": 7,
+    "<token_8>": 8,
+    "<token_9>": 9
+  },
+  "merges": [],
+  "bos_token": "<token_0>",
+  "eos_token": "<token_1>",
+  "unk_token": "<token_2>"
+}

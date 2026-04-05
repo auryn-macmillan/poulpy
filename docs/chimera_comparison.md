@@ -1,8 +1,8 @@
-# CHIMERA vs CKKS: Quantitative Comparison Report
+# FHE_LLM vs CKKS: Quantitative Comparison Report
 
 ## 1. Executive Summary
 
-CHIMERA is a specialised RLWE-based FHE scheme targeting quantised transformer
+FHE_LLM is a specialised RLWE-based FHE scheme targeting quantised transformer
 inference (INT8 weights, FP16 activations). This report compares it quantitatively
 against CKKS — the current standard for approximate-arithmetic FHE — on the target
 workload defined in the project specification: a 20B-40B parameter transformer
@@ -26,7 +26,7 @@ Key findings:
 
 ### 2.1 Ring and Modulus Parameters
 
-| Property                 | CKKS (HEaaN/SEAL)       | CHIMERA-128              |
+| Property                 | CKKS (HEaaN/SEAL)       | FHE_LLM-128              |
 |--------------------------|--------------------------|--------------------------|
 | Ring degree N            | 65536 (typical)          | 16384                    |
 | Ciphertext modulus log₂q | 800-1600 bits (RNS)     | 54 bits (torus)          |
@@ -37,7 +37,7 @@ Key findings:
 | Rescaling mechanism      | RNS prime drop           | Bit-shift on limbs       |
 
 CKKS requires large N (typically 2^16) and wide modulus chains (800+ bit total
-modulus) to support bootstrapping at 128-bit security. CHIMERA targets the same
+modulus) to support bootstrapping at 128-bit security. FHE_LLM targets the same
 security level with N=16384 and a 54-bit torus precision because it assumes
 fixed-depth circuits (known transformer architecture) and INT8/FP16 arithmetic
 rather than general 50-bit approximate computation.
@@ -48,21 +48,21 @@ rather than general 50-bit approximate computation.
 |--------------|-------|-------------|-------------------------|
 | CKKS (SEAL)  | 65536 | 1600        | ~2,621,440 (2.5 MB)    |
 | CKKS (HEaaN) | 65536 | 800         | ~1,310,720 (1.25 MB)   |
-| CHIMERA-128  | 16384 | 54          | ~1,048,576 (1.0 MB)    |
-| CHIMERA-100  | 8192  | 54          | ~524,288 (512 KB)      |
-| CHIMERA-80   | 4096  | 54          | ~262,144 (256 KB)      |
+| FHE_LLM-128  | 16384 | 54          | ~1,048,576 (1.0 MB)    |
+| FHE_LLM-100  | 8192  | 54          | ~524,288 (512 KB)      |
+| FHE_LLM-80   | 4096  | 54          | ~262,144 (256 KB)      |
 
-CHIMERA-128 ciphertext formula: `2 cols * 4 limbs * 16384 coefficients * 8 bytes
+FHE_LLM-128 ciphertext formula: `2 cols * 4 limbs * 16384 coefficients * 8 bytes
 = 1,048,576 bytes`.
 
-At 128-bit security, CHIMERA ciphertexts are **2.5x smaller** than HEaaN and
+At 128-bit security, FHE_LLM ciphertexts are **2.5x smaller** than HEaaN and
 **~1.2x smaller** than the most aggressively parameterised CKKS configurations.
 At 100-bit security (acceptable for non-quantum threat models), ciphertexts
 shrink to 512 KB — **5x smaller** than typical CKKS.
 
 ### 2.3 Key Sizes
 
-| Key type              | CKKS (typical)  | CHIMERA-128        |
+| Key type              | CKKS (typical)  | FHE_LLM-128        |
 |-----------------------|-----------------|--------------------|
 | Secret key            | ~512 KB         | ~128 KB            |
 | Evaluation key (relin)| ~50-100 MB      | ~8-16 MB           |
@@ -70,12 +70,12 @@ shrink to 512 KB — **5x smaller** than typical CKKS.
 | Tensor key            | N/A             | ~16 MB             |
 | Automorphism keys     | (in rotation)   | ~30 MB (14 keys)   |
 
-CHIMERA's key material is 5-10x smaller due to the smaller ring degree and
+FHE_LLM's key material is 5-10x smaller due to the smaller ring degree and
 torus precision.
 
 ## 3. Operation Latency Comparison
 
-### 3.1 CHIMERA Benchmark Results
+### 3.1 FHE_LLM Benchmark Results
 
 Measured on a single-threaded reference backend (poulpy-cpu-ref, FFT64Ref),
 N=4096 (80-bit security). All timings are median of 100 iterations via
@@ -83,7 +83,7 @@ Criterion.
 
 #### Plaintext-domain operations
 
-| Operation              | CHIMERA (μs) | Notes                              |
+| Operation              | FHE_LLM (μs) | Notes                              |
 |------------------------|-------------|--------------------------------------|
 | Encode INT8 (N=4096)   | 1.45        | Direct limb placement               |
 | Encode FP16 (N=4096)   | 7.46        | Quantise + limb placement            |
@@ -96,7 +96,7 @@ Criterion.
 
 #### FHE-domain operations (toy dimension, d_model=1)
 
-| Operation                 | CHIMERA (μs)   | Notes                              |
+| Operation                 | FHE_LLM (μs)   | Notes                              |
 |---------------------------|---------------|--------------------------------------|
 | Encrypt (N=4096)          | 387           | RLWE encryption via poulpy-core      |
 | Decrypt (N=4096)          | 259           | Phase computation + decode           |
@@ -106,12 +106,12 @@ Criterion.
 | ct×ct mul (N=4096)        | 1,991         | Tensor product + relinearization     |
 | Activation SqReLU (FHE)   | 2,101         | Degree-2, 1 ct×ct mul               |
 | Activation GELU (FHE)     | 2,311         | Degree-3 (effective 2), 1 ct×ct mul  |
-| Matmul 4 rows (scalar)    | 457           | 4× chimera_mul_const                |
+| Matmul 4 rows (scalar)    | 457           | 4× FHE_LLM_mul_const                |
 | FFN d1 h2 (full pipeline) | 4,694         | up-project → activation → down-proj  |
 
 #### FHE-domain operations (realistic dimension, d_model=128)
 
-| Operation                  | CHIMERA (ms)  | Notes                              |
+| Operation                  | FHE_LLM (ms)  | Notes                              |
 |----------------------------|--------------|--------------------------------------|
 | Mul_const 128-coeff (N=4096)| 0.202       | 128-coefficient polynomial weight    |
 | ct×ct mul (N=4096)          | 1.96        | Same cost regardless of data dim     |
@@ -131,7 +131,7 @@ Criterion.
 
 #### Multi-security-level comparison (measured, Criterion optimized build)
 
-| Operation    | CHIMERA-80 (N=4096) | CHIMERA-100 (N=8192) | CHIMERA-128 (N=16384) |
+| Operation    | FHE_LLM-80 (N=4096) | FHE_LLM-100 (N=8192) | FHE_LLM-128 (N=16384) |
 |-------------|--------------------:|---------------------:|----------------------:|
 | Encrypt     | 375 μs              | 705 μs               | 1.44 ms               |
 | Decrypt     | 250 μs              | 449 μs               | 938 μs                |
@@ -179,7 +179,7 @@ From the d_model=128 benchmarks, we derive per-operation costs:
 Extrapolating to a 7B transformer layer (d_model=4096, 32 heads, d_head=128,
 d_ffn=11008):
 
-| Component              | Ops                      | CHIMERA (est.) | CKKS (est.)  |
+| Component              | Ops                      | FHE_LLM (est.) | CKKS (est.)  |
 |------------------------|--------------------------|--------------:|-------------:|
 | QKV projection (×3)   | 3 × 4096-row matmul      | ~2.4 s        | 5-15 s       |
 | Attention per head (×32)| 32 × (score + softmax + ctx) | ~0.5 s   | 2-8 s        |
@@ -191,7 +191,7 @@ d_ffn=11008):
 | Bootstrapping          | —                         | 0 (deferred)  | 5-30 s       |
 | **Layer total**        |                           | **~28.5 s**   | **72-233 s** |
 
-*Note: CHIMERA estimates are extrapolated from measured per-op costs at N=4096
+*Note: FHE_LLM estimates are extrapolated from measured per-op costs at N=4096
 (80-bit security) on a single-threaded reference backend. Production implementations
 with AVX2/AVX-512, multi-threading, and N=16384 (128-bit security) would have
 different absolute numbers but similar relative speedups.*
@@ -219,7 +219,7 @@ Per-layer breakdown (d_model=64, 128-bit):
 
 Comparison with 80-bit security (d_model=64, same workload):
 
-| Metric           | CHIMERA-80 (N=4096) | CHIMERA-128 (N=16384) | Ratio |
+| Metric           | FHE_LLM-80 (N=4096) | FHE_LLM-128 (N=16384) | Ratio |
 |------------------|--------------------:|----------------------:|:-----:|
 | Per-layer time   | 2.5 s              | 12.1 s                | 4.8x  |
 | L∞ (1 layer)     | 63                  | 63.2                  | 1.0x  |
@@ -239,7 +239,7 @@ is not needed for at least 4 layers at either security level.
 ### 3.4.1 Refreshed Inference Path (real TinyLlama weights)
 
 The current production-oriented single-token path is the refreshed/LUT variant
-used by `step_refreshed` in `poulpy-chimera/src/inference.rs`. Its defining
+used by `step_refreshed` in `poulpy-FHE_LLM/src/inference.rs`. Its defining
 choices are:
 
 - Residual refresh after attention before the pre-FFN norm
@@ -292,7 +292,7 @@ Key interpretation:
 
 Based on measured per-layer extrapolation:
 
-| Model              | CHIMERA (est.)     | CKKS (est.)        | Speedup   |
+| Model              | FHE_LLM (est.)     | CKKS (est.)        | Speedup   |
 |--------------------|--------------------|--------------------|-----------|
 | 7B dense (32L)     | ~15 min            | 38-124 min         | 2.5-8x   |
 | 20B dense (48L)    | ~23 min            | 58-186 min         | 2.5-8x   |
@@ -303,7 +303,7 @@ activation evaluation (11008 ct×ct multiplies per layer). Batching activations,
 multi-threading, and hardware acceleration would reduce absolute times
 significantly.*
 
-For the 40B MoE model, CHIMERA's sparse-aware packing means only 2 of 8
+For the 40B MoE model, FHE_LLM's sparse-aware packing means only 2 of 8
 expert FFN paths are computed, reducing the effective FFN cost by 4x compared
 to the dense equivalent.
 
@@ -311,14 +311,14 @@ to the dense equivalent.
 
 ### 4.1 Numerical Precision
 
-| Property                    | CKKS              | CHIMERA              |
+| Property                    | CKKS              | FHE_LLM              |
 |-----------------------------|--------------------|-----------------------|
 | Coefficient precision       | ~50-60 bits        | ~14 bits (base2k)    |
 | Effective plaintext bits    | ~20-40 after noise | 8-14 (by design)     |
 | Rescaling error             | ~2^(-40) per op    | ~2^(-14) per op      |
 | Cumulative error (32 layers)| ~2^(-20)           | ~2^(-6)              |
 
-CHIMERA's per-operation error is larger, but this is acceptable because:
+FHE_LLM's per-operation error is larger, but this is acceptable because:
 
 1. **The target workload uses INT8 weights**: 8-bit precision means errors
    below 2^(-8) are below the quantisation floor
@@ -333,12 +333,12 @@ CHIMERA's per-operation error is larger, but this is acceptable because:
 
 Based on published literature on FHE-friendly neural networks:
 
-| Metric                   | FP32 baseline | CKKS inference | CHIMERA inference |
+| Metric                   | FP32 baseline | CKKS inference | FHE_LLM inference |
 |--------------------------|---------------|----------------|-------------------|
 | Perplexity (WikiText-2)  | 5.68          | 5.72 (+0.7%)   | 5.85 (+3.0%)      |
 | MMLU accuracy            | 69.8%         | 69.5% (-0.4%)  | 68.9% (-1.3%)     |
 
-The additional quality degradation from CHIMERA vs CKKS (~1-2%) is within
+The additional quality degradation from FHE_LLM vs CKKS (~1-2%) is within
 the tolerance specified for governance use cases, where inference quality
 requirements may be lower than general-purpose LLM serving.
 
@@ -346,14 +346,14 @@ requirements may be lower than general-purpose LLM serving.
 
 ### 5.1 When Is Bootstrapping Needed?
 
-| Scenario                          | CKKS             | CHIMERA-128           |
+| Scenario                          | CKKS             | FHE_LLM-128           |
 |-----------------------------------|------------------|-----------------------|
 | 7B model, 32 layers              | ~3 bootstraps    | 0 bootstraps          |
 | 20B model, 48 layers             | ~5 bootstraps    | 1 bootstrap (deferred)|
 | 40B MoE, 32 layers (2/8 active)  | ~3 bootstraps    | 0 bootstraps          |
 | 40B dense, 96 layers             | ~10 bootstraps   | 2-3 bootstraps        |
 
-CHIMERA's bootstrapping advantage comes from two factors:
+FHE_LLM's bootstrapping advantage comes from two factors:
 1. **Lower noise growth rate**: Smaller coefficients and aggressive rescaling
    keep noise tighter
 2. **Fixed-depth optimisation**: Knowing the exact circuit depth eliminates
@@ -361,27 +361,27 @@ CHIMERA's bootstrapping advantage comes from two factors:
 
 ### 5.2 Bootstrapping Cost When Required
 
-| Property                  | CKKS               | CHIMERA (est.)        |
+| Property                  | CKKS               | FHE_LLM (est.)        |
 |---------------------------|--------------------|-----------------------|
 | Bootstrap latency         | 5-30 seconds       | 1-5 seconds           |
 | Key material for bootstrap| 100-500 MB         | 20-50 MB              |
 | Noise consumed            | ~30-50 bits        | ~15-25 bits           |
 
-CHIMERA's bootstrapping is cheaper because N is smaller and the modulus
+FHE_LLM's bootstrapping is cheaper because N is smaller and the modulus
 chain is shorter, reducing the polynomial evaluation cost proportionally.
 
 ## 6. Memory Footprint
 
 ### 6.1 Per-Ciphertext Memory
 
-| Security level | CKKS           | CHIMERA          | Reduction |
+| Security level | CKKS           | FHE_LLM          | Reduction |
 |----------------|----------------|------------------|-----------|
 | 128-bit PQ     | 2.5 MB         | 1.0 MB           | 2.5x      |
 | 100-bit PQ     | 1.25 MB        | 0.5 MB           | 2.5x      |
 
 ### 6.2 Working Set for 7B Model Inference
 
-| Component                | CKKS (est.)    | CHIMERA (est.)   |
+| Component                | CKKS (est.)    | FHE_LLM (est.)   |
 |--------------------------|----------------|------------------|
 | Model weights (encrypted)| ~14 GB         | ~7 GB            |
 | Intermediate activations | ~5 GB          | ~2 GB            |
@@ -389,7 +389,7 @@ chain is shorter, reducing the polynomial evaluation cost proportionally.
 | Scratch memory           | ~2 GB          | ~500 MB          |
 | **Total working set**    | **~22 GB**     | **~9.6 GB**      |
 
-CHIMERA's 2.3x smaller working set means the target workload fits
+FHE_LLM's 2.3x smaller working set means the target workload fits
 comfortably in a single GPU's memory (e.g. A100 80GB) or a commodity
 server's RAM, whereas CKKS may require multi-GPU or host-device
 transfers.
@@ -398,16 +398,16 @@ transfers.
 
 ### 7.1 Slot Utilisation
 
-| Packing mode      | CKKS              | CHIMERA                 |
+| Packing mode      | CKKS              | FHE_LLM                 |
 |--------------------|--------------------|-----------------------|
 | Head-aligned (128) | 128/32768 = 0.4%  | 128/16384 = 0.8%      |
 | Embed-aligned (4096)| 4096/32768 = 12.5%| 4096/16384 = 25%     |
 | Expert-aligned     | Not specialised    | d_expert/N, skip inactive|
 | Batch packing      | 32768 slots avail  | 16384 slots available |
 
-CHIMERA's smaller N reduces wasted slots when packing small vectors
+FHE_LLM's smaller N reduces wasted slots when packing small vectors
 (attention heads). For larger vectors (embeddings), multiple ciphertexts
-are needed in both schemes, but CHIMERA's smaller ciphertext size
+are needed in both schemes, but FHE_LLM's smaller ciphertext size
 partially compensates.
 
 ### 7.2 MoE-Specific Advantage
@@ -417,14 +417,14 @@ For a Mixtral-style 8-expert, top-2 model:
 - **CKKS**: Must evaluate all 8 expert paths or use expensive encrypted
   branching to select experts. Typical implementations evaluate all experts
   and multiply by 0/1 masks.
-- **CHIMERA**: Expert-aligned packing assigns each expert to separate
+- **FHE_LLM**: Expert-aligned packing assigns each expert to separate
   ciphertexts. The router selects 2 experts, and only those 2 FFN paths
   are evaluated. The remaining 6 experts incur zero computation cost.
   Effective cost reduction: **4x** for the FFN portion of each MoE layer.
 
 ## 8. Tradeoffs Accepted
 
-CHIMERA's advantages come with explicit tradeoffs:
+FHE_LLM's advantages come with explicit tradeoffs:
 
 | Tradeoff                      | Impact                              |
 |-------------------------------|-------------------------------------|
@@ -440,7 +440,7 @@ for participatory governance) as specified in the project requirements.
 
 ## 9. Summary
 
-CHIMERA achieves a **5-8x end-to-end speedup** over CKKS for transformer
+FHE_LLM achieves a **5-8x end-to-end speedup** over CKKS for transformer
 inference at 128-bit post-quantum security, with **2.5x smaller ciphertexts**
 and **2.3x smaller working set**. The primary sources of advantage are:
 

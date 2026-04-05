@@ -1,12 +1,12 @@
-# CHIMERA Security Analysis
+# FHE_LLM Security Analysis
 
 ## 1. Hardness Assumption
 
-CHIMERA's semantic security (IND-CPA) reduces to the **Ring Learning With Errors
+FHE_LLM's semantic security (IND-CPA) reduces to the **Ring Learning With Errors
 (RLWE)** problem over the cyclotomic polynomial ring R = Z[X]/(X^N + 1), where
 N is a power of two.
 
-Specifically, CHIMERA assumes that distinguishing the distribution
+Specifically, FHE_LLM assumes that distinguishing the distribution
 
     (a, a·s + e)  from  (a, u)
 
@@ -49,11 +49,11 @@ succeed. The cost model used is:
 
 | Parameter set | N     | log₂q | σ   | Secret dist. | λ_classical | λ_quantum |
 |---------------|-------|-------|-----|-------------|-------------|-----------|
-| CHIMERA-80    | 4096  | 54    | 3.2 | Ternary     | ~97 bits    | ~80 bits  |
-| CHIMERA-100   | 8192  | 54    | 3.2 | Ternary     | ~139 bits   | ~100 bits |
-| CHIMERA-128   | 16384 | 54    | 3.2 | Ternary     | ~173 bits   | ~128 bits |
+| FHE_LLM-80    | 4096  | 54    | 3.2 | Ternary     | ~97 bits    | ~80 bits  |
+| FHE_LLM-100   | 8192  | 54    | 3.2 | Ternary     | ~139 bits   | ~100 bits |
+| FHE_LLM-128   | 16384 | 54    | 3.2 | Ternary     | ~173 bits   | ~128 bits |
 
-#### Derivation for CHIMERA-128 (N=16384, log₂q=54)
+#### Derivation for FHE_LLM-128 (N=16384, log₂q=54)
 
 The lattice dimension is d = 2N = 32768 (for the RLWE-to-LWE reduction). The
 Hermite factor required to solve the BKZ instance is:
@@ -76,21 +76,21 @@ The conservative estimate of ~128-bit post-quantum security accounts for
 potential improvements in lattice reduction algorithms and uses the core-sieve
 model rather than the more optimistic enumeration model.
 
-#### Derivation for CHIMERA-100 (N=8192, log₂q=54)
+#### Derivation for FHE_LLM-100 (N=8192, log₂q=54)
 
     d = 16384
     β ≈ 378
     λ_classical ≈ 0.292 · 378 ≈ 110
     λ_quantum ≈ 0.265 · 378 ≈ 100
 
-#### Derivation for CHIMERA-80 (N=4096, log₂q=54)
+#### Derivation for FHE_LLM-80 (N=4096, log₂q=54)
 
     d = 8192
     β ≈ 275
     λ_classical ≈ 0.292 · 275 ≈ 80
     λ_quantum ≈ 0.265 · 275 ≈ 73
 
-Note: CHIMERA-80 provides 80-bit classical security but only ~73-bit
+Note: FHE_LLM-80 provides 80-bit classical security but only ~73-bit
 post-quantum security. This parameter set is suitable for development
 and testing, and for applications where quantum adversaries are not
 in the threat model.
@@ -106,7 +106,7 @@ scale=26); only the polynomial degree N differs.
 
 **Latency per operation (Criterion, optimized build):**
 
-| Operation    | CHIMERA-80 (N=4096) | CHIMERA-100 (N=8192) | CHIMERA-128 (N=16384) | Ratio 80→128 |
+| Operation    | FHE_LLM-80 (N=4096) | FHE_LLM-100 (N=8192) | FHE_LLM-128 (N=16384) | Ratio 80→128 |
 |-------------|--------------------:|---------------------:|----------------------:|:------------:|
 | Encrypt     | 375 μs              | 705 μs               | 1.44 ms               | 3.8x         |
 | Decrypt     | 250 μs              | 449 μs               | 938 μs                | 3.8x         |
@@ -126,7 +126,7 @@ scale=26); only the polynomial degree N differs.
 
 **Structural parameters:**
 
-| Parameter        | CHIMERA-80  | CHIMERA-100 | CHIMERA-128  |
+| Parameter        | FHE_LLM-80  | FHE_LLM-100 | FHE_LLM-128  |
 |-----------------|:----------:|:-----------:|:------------:|
 | Polynomial N     | 4096       | 8192        | 16384        |
 | SIMD slots       | 4096       | 8192        | 16384        |
@@ -149,13 +149,13 @@ scale=26); only the polynomial degree N differs.
    security level based purely on latency/size tradeoffs without worrying
    about accuracy regression.
 
-3. **4x overhead for 128-bit security**: Moving from CHIMERA-80 to CHIMERA-128
+3. **4x overhead for 128-bit security**: Moving from FHE_LLM-80 to FHE_LLM-128
    costs approximately 4-5x in latency and 4x in ciphertext size. This is the
    standard quadratic scaling in lattice dimension.
 
-4. **Max depth doubles with N**: CHIMERA-128 supports 48 levels of
+4. **Max depth doubles with N**: FHE_LLM-128 supports 48 levels of
    multiplicative depth (4 transformer layers without bootstrapping), while
-   CHIMERA-80 supports only 12 levels (1 layer). For models with >4 layers,
+   FHE_LLM-80 supports only 12 levels (1 layer). For models with >4 layers,
    bootstrapping is required regardless of security level.
 
 5. **Inference-level validation confirms primitive-level findings**:
@@ -189,7 +189,7 @@ Security consequence of this design choice:
 
 ### 3.1 Relaxed Correctness Does Not Weaken Security
 
-CHIMERA intentionally introduces bounded rounding errors during rescaling
+FHE_LLM intentionally introduces bounded rounding errors during rescaling
 operations. A natural question is whether these errors leak information about
 the plaintext.
 
@@ -233,7 +233,7 @@ is statistically indistinguishable from additional quantisation noise.
 
 ### 4.1 Secret Key Distribution
 
-CHIMERA uses a ternary secret distribution s ∈ {-1, 0, 1}^N. This is standard
+FHE_LLM uses a ternary secret distribution s ∈ {-1, 0, 1}^N. This is standard
 for RLWE-based FHE and is the same distribution used by CKKS, TFHE, and BGV
 implementations in SEAL, OpenFHE, and Concrete.
 
@@ -243,30 +243,30 @@ security estimates account for this attack.
 
 ### 4.2 Key-Dependent Messages (KDM Security)
 
-CHIMERA does not claim KDM security. The scheme should not be used to encrypt
+FHE_LLM does not claim KDM security. The scheme should not be used to encrypt
 messages that depend on the secret key. For the target application (inference
 on user data with provider-held model weights), this restriction is naturally
 satisfied — the user's input data is independent of the secret key.
 
 ### 4.3 IND-CPA vs IND-CPA^D (Decryption Oracle)
 
-Like CKKS, CHIMERA provides IND-CPA security but NOT IND-CPA^D (security
+Like CKKS, FHE_LLM provides IND-CPA security but NOT IND-CPA^D (security
 against chosen-ciphertext attacks with a decryption oracle). The Li-Micciancio
 attack (2021) showed that CKKS is vulnerable to IND-CPA^D attacks because
 the approximate decryption leaks information about the noise.
 
-This is **not a concern for CHIMERA's target use case** because:
+This is **not a concern for FHE_LLM's target use case** because:
 1. The user decrypts locally — no decryption oracle is exposed to the provider
 2. The provider performs homomorphic evaluation and returns encrypted results
 3. The user never sends decrypted results back to the provider
 
-If CHIMERA were to be used in an interactive protocol where decryption results
+If FHE_LLM were to be used in an interactive protocol where decryption results
 are shared, additional countermeasures would be needed (e.g. noise flooding
 before decryption).
 
 ### 4.4 Side-Channel Resistance
 
-CHIMERA inherits Poulpy's implementation characteristics:
+FHE_LLM inherits Poulpy's implementation characteristics:
 
 - **Scratch-based allocation**: No heap allocations on the hot path, reducing
   timing side-channel surface from memory allocation
@@ -283,10 +283,10 @@ and hardware platform.
 
 ## 5. Deviations from Standard Assumptions
 
-CHIMERA does **not** deviate from standard cryptographic hardness assumptions.
+FHE_LLM does **not** deviate from standard cryptographic hardness assumptions.
 The following aspects are non-standard but do not affect security:
 
-| Aspect                    | Standard practice    | CHIMERA              | Security impact |
+| Aspect                    | Standard practice    | FHE_LLM              | Security impact |
 |---------------------------|---------------------|----------------------|-----------------|
 | Coefficient size          | 50-60 bits          | 14 bits (base2k)     | None (q is fixed) |
 | Rescaling                 | RNS prime drop      | Bit-shift            | None            |
@@ -302,7 +302,7 @@ error. This is an implementation risk, not a security risk.
 
 ### 6.1 New Scheme, Limited Cryptanalysis
 
-CHIMERA is a new specialisation that has not undergone the extensive
+FHE_LLM is a new specialisation that has not undergone the extensive
 cryptanalytic scrutiny that CKKS has received since 2017. While the underlying
 RLWE assumption is well-studied, the specific parameter choices and the
 interaction between approximate arithmetic and the bivariate representation
@@ -314,14 +314,14 @@ lattice-based cryptography.
 
 ### 6.2 Fixed Architecture Assumption
 
-CHIMERA's parameters are pre-computed for a specific transformer architecture.
+FHE_LLM's parameters are pre-computed for a specific transformer architecture.
 If the model architecture changes (e.g. different depth or different activation
 functions), parameters must be recomputed and keys regenerated. This is a
 deployment constraint, not a security weakness.
 
 ### 6.3 No Threshold or Multi-Party Support
 
-CHIMERA is a single-key scheme. It does not support threshold decryption or
+FHE_LLM is a single-key scheme. It does not support threshold decryption or
 multi-party computation. The aggregation phase (Phase 2) is handled by a
 separate system (Enclave) after local decryption.
 
@@ -329,7 +329,7 @@ separate system (Enclave) after local decryption.
 
 ### 7.1 Recommended Parameter Set
 
-For the target inference application: **CHIMERA-128** (N=16384, 128-bit
+For the target inference application: **FHE_LLM-128** (N=16384, 128-bit
 post-quantum security).
 
 Rationale:
@@ -338,15 +338,15 @@ Rationale:
 - Encrypted inference results may retain value for years (user preferences,
   governance votes)
 - Post-quantum security provides protection against future quantum computers
-- The performance overhead vs CHIMERA-100 (~2-3x) is acceptable given the
+- The performance overhead vs FHE_LLM-100 (~2-3x) is acceptable given the
   security margin
 
 ### 7.2 When to Use Lower Security
 
-- **CHIMERA-100**: Suitable for latency-critical applications where the
+- **FHE_LLM-100**: Suitable for latency-critical applications where the
   threat model excludes quantum adversaries and the data has limited
   long-term sensitivity
-- **CHIMERA-80**: Development and testing only. Should not be used in
+- **FHE_LLM-80**: Development and testing only. Should not be used in
   production for sensitive data.
 
 ### 7.3 Pre-Deployment Checklist

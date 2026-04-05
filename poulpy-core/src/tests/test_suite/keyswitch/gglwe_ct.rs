@@ -6,15 +6,14 @@ use poulpy_hal::{
 };
 
 use crate::{
-    GGLWEKeyswitch, GGLWENoise, GLWESwitchingKeyEncryptSk, ScratchTakeCore,
     encryption::SIGMA,
     layouts::{
+        prepared::{GLWESecretPrepared, GLWESwitchingKeyPrepared},
         GGLWEInfos, GLWESecret, GLWESecretPreparedFactory, GLWESwitchingKey, GLWESwitchingKeyLayout,
         GLWESwitchingKeyPreparedFactory,
-        prepared::{GLWESecretPrepared, GLWESwitchingKeyPrepared},
     },
     noise::log2_std_noise_gglwe_product,
-    var_noise_gglwe_product_v2,
+    var_noise_gglwe_product_v2, GGLWEKeyswitch, GGLWENoise, GLWESwitchingKeyEncryptSk, ScratchTakeCore,
 };
 
 pub fn test_gglwe_switching_key_keyswitch<BE: Backend>(params: &TestParams, module: &Module<BE>)

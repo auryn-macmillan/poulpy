@@ -1,8 +1,8 @@
-# CHIMERA Verification Analysis
+# FHE_LLM Verification Analysis
 
 ## 1. Problem Statement
 
-In CHIMERA's deployment model, a user sends encrypted input to a remote inference
+In FHE_LLM's deployment model, a user sends encrypted input to a remote inference
 provider, who evaluates a transformer model homomorphically and returns an
 encrypted result. The user decrypts locally.
 
@@ -42,7 +42,7 @@ by correctly applying the homomorphic evaluation circuit to the encrypted input.
 
 **Prior art**: ezkl, zkCNN (Liu et al., 2021), zkML (various).
 
-**Cost analysis for CHIMERA**:
+**Cost analysis for FHE_LLM**:
 
 | Component          | Estimate                          |
 |--------------------|-----------------------------------|
@@ -162,7 +162,7 @@ because the provider knows every ciphertext is the user's real input.
 
 ### 2.5 Hybrid: MAC + Architecture Attestation
 
-The most practical verification system for CHIMERA combines:
+The most practical verification system for FHE_LLM combines:
 
 1. **MAC-based computation integrity** (Section 2.3): Proves the provider
    applied the agreed circuit correctly
@@ -177,7 +177,7 @@ This provides:
 
 ## 3. Recommended Design
 
-### 3.1 For CHIMERA v1 (Current Implementation)
+### 3.1 For FHE_LLM v1 (Current Implementation)
 
 **Prototype MAC verification for linear operations only**.
 
@@ -187,14 +187,14 @@ This provides:
 > activations, layernorm) remain trusted. The FHE encryption guarantees data
 > privacy; integrity is partial and prototype-grade.
 
-### 3.2 For CHIMERA v2 (Future Work)
+### 3.2 For FHE_LLM v2 (Future Work)
 
 Implement **MAC-based verification** (Section 2.3):
 
-1. Extend `ChimeraKey` to include a MAC key α
-2. Extend `chimera_encrypt` to produce both ct and tag = α · ct
+1. Extend `FHE_LLMKey` to include a MAC key α
+2. Extend `FHE_LLM_encrypt` to produce both ct and tag = α · ct
 3. Extend the evaluation API to accept paired (ct, tag) inputs
-4. Add `chimera_verify(key, ct_out, tag_out) -> bool`
+4. Add `FHE_LLM_verify(key, ct_out, tag_out) -> bool`
 
 **Estimated implementation effort**: 2-4 weeks for a senior cryptography
 engineer. The main complexity is ensuring the MAC propagation is correct
@@ -204,7 +204,7 @@ rotation).
 **Performance impact**: 2x provider computation, 2x communication, ~0
 user-side verification cost.
 
-### 3.3 For CHIMERA v3 (Aspirational)
+### 3.3 For FHE_LLM v3 (Aspirational)
 
 Combine MAC verification with a lightweight ZK proof that the evaluation
 circuit matches a committed model hash. This could use:
@@ -266,14 +266,14 @@ but is feasible with existing ZK proof systems.
 ## 7. Prototype Implementation
 
 A working MAC-based verification prototype is implemented in
-`poulpy-chimera/src/verification.rs` (11 tests, all passing).
+`poulpy-FHE_LLM/src/verification.rs` (11 tests, all passing).
 
 ### API
 
 ```rust
 // User-side: key generation and tagging
 let mac = MacKey::new(7);                         // or MacKey::from_seed(seed)
-let tagged = chimera_mac_tag(&module, &mac, &ct); // produces TaggedCiphertext
+let tagged = FHE_LLM_mac_tag(&module, &mac, &ct); // produces TaggedCiphertext
 
 // Provider-side: homomorphic operations on tagged ciphertexts
 let tagged_sum   = tagged_add(&module, &tagged_a, &tagged_b);
@@ -282,7 +282,7 @@ let tagged_dot   = tagged_dot_product(&module, &tagged_vec, &weights);
 let tagged_matmul = tagged_matmul_single_ct(&module, &tagged, &weight_rows);
 
 // User-side: verification after receiving results
-let result = chimera_mac_verify(&module, &key, &params, &mac, &tagged_out, n_slots, tolerance);
+let result = FHE_LLM_mac_verify(&module, &key, &params, &mac, &tagged_out, n_slots, tolerance);
 assert!(result.passed);
 ```
 

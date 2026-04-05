@@ -268,7 +268,7 @@ where
     Scratch<BE>: TakeSlice,
 {
     fn lookup_table_set(&self, res: &mut LookupTable, f: &[i64], k: usize) {
-        assert!(f.len() <= self.n());
+        assert!(f.len() <= res.domain_size());
 
         let base2k: usize = res.base2k.into();
 

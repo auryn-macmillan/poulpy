@@ -6,14 +6,14 @@ use poulpy_hal::{
 };
 
 use crate::{
-    GLWEAutomorphism, GLWEAutomorphismKeyEncryptSk, GLWEDecrypt, GLWEEncryptSk, GLWENoise, GLWENormalize, ScratchTakeCore,
     encryption::SIGMA,
     layouts::{
-        GLWE, GLWEAutomorphismKey, GLWEAutomorphismKeyLayout, GLWEAutomorphismKeyPreparedFactory, GLWELayout, GLWEPlaintext,
-        GLWESecret, GLWESecretPreparedFactory,
         prepared::{GLWEAutomorphismKeyPrepared, GLWESecretPrepared},
+        GLWEAutomorphismKey, GLWEAutomorphismKeyLayout, GLWEAutomorphismKeyPreparedFactory, GLWELayout, GLWEPlaintext,
+        GLWESecret, GLWESecretPreparedFactory, GLWE,
     },
-    var_noise_gglwe_product_v2,
+    var_noise_gglwe_product_v2, GLWEAutomorphism, GLWEAutomorphismKeyEncryptSk, GLWEDecrypt, GLWEEncryptSk, GLWENoise,
+    GLWENormalize, ScratchTakeCore,
 };
 
 pub fn test_glwe_automorphism<BE: Backend>(params: &TestParams, module: &Module<BE>)

@@ -1,0 +1,13 @@
+[Unit]
+Description=128-bit SMOLLM2 1-layer FHE Stress Test
+After=network.target
+
+[Service]
+User=dev
+Group=dev
+WorkingDirectory=/home/dev/repo/poulpy-chimera
+ExecStart=/home/dev/repo/target/debug/examples/smollm2_full_fhe_30layer 29889 1
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -6,12 +6,12 @@ use poulpy_hal::{
 };
 
 use crate::{
-    GGSWCompressedEncryptSk, GGSWEncryptSk, GGSWNoise, ScratchTakeCore,
     encryption::SIGMA,
     layouts::{
-        GGSW, GGSWDecompress, GGSWInfos, GGSWLayout, GLWEInfos, GLWESecret, GLWESecretPreparedFactory,
-        compressed::GGSWCompressed, prepared::GLWESecretPrepared,
+        compressed::GGSWCompressed, prepared::GLWESecretPrepared, GGSWDecompress, GGSWInfos, GGSWLayout, GLWEInfos, GLWESecret,
+        GLWESecretPreparedFactory, GGSW,
     },
+    GGSWCompressedEncryptSk, GGSWEncryptSk, GGSWNoise, ScratchTakeCore,
 };
 
 pub fn test_ggsw_encrypt_sk<BE: Backend>(params: &TestParams, module: &Module<BE>)
